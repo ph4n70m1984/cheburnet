@@ -1,0 +1,182 @@
+name: Build and Release Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            goarch: arm64
+            goarm: ""
+            gomips: ""
+            opkg_arch: aarch64_cortex-a53
+            apk_arch: aarch64
+            use_upx: true
+
+          - arch: arm_cortex-a7
+            goarch: arm
+            goarm: "7"
+            gomips: ""
+            opkg_arch: arm_cortex-a7_neon-vfpv4
+            apk_arch: armhf
+            use_upx: true
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx
+
+      - name: Extract Version
+        id: vars
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.1-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Compile cheburnetd
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+        run: |
+          go build -ldflags="-s -w -X main.version=${{ steps.vars.outputs.version }}" \
+                   -trimpath \
+                   -o bin/cheburnetd ./cmd/cheburnetd
+
+      - name: Compress binary with UPX
+        if: ${{ matrix.use_upx }}
+        run: |
+          echo "Размер до сжатия:"
+          ls -lh bin/cheburnetd
+          upx --best --lzma bin/cheburnetd
+          echo "Размер после сжатия:"
+          ls -lh bin/cheburnetd
+
+      - name: Pack .ipk Package
+        run: |
+          PKG_DIR="ipk_pkg"
+          mkdir -p "$PKG_DIR/control" "$PKG_DIR/data/usr/bin" "$PKG_DIR/data/etc/init.d" \
+                   "$PKG_DIR/data/etc/config" "$PKG_DIR/data/www/luci-static/resources/view/cheburnet" \
+                   "$PKG_DIR/data/usr/share/luci/menu.d"
+
+          cp bin/cheburnetd "$PKG_DIR/data/usr/bin/cheburnetd"
+          chmod 755 "$PKG_DIR/data/usr/bin/cheburnetd"
+
+          cp openwrt/files/etc/init.d/cheburnet "$PKG_DIR/data/etc/init.d/cheburnet"
+          chmod 755 "$PKG_DIR/data/etc/init.d/cheburnet"
+
+          cp openwrt/files/etc/config/cheburnet "$PKG_DIR/data/etc/config/cheburnet"
+          chmod 644 "$PKG_DIR/data/etc/config/cheburnet"
+
+          cp openwrt/files/www/luci-static/resources/view/cheburnet/dashboard.js "$PKG_DIR/data/www/luci-static/resources/view/cheburnet/dashboard.js"
+          cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/luci/menu.d/luci-app-cheburnet.json"
+
+          cat <<EOF > "$PKG_DIR/control/control"
+          Package: luci-app-cheburnet
+          Version: ${{ steps.vars.outputs.version }}-1
+          Depends: sing-box, nftables, ip-full, ca-bundle
+          Section: luci
+          Architecture: ${{ matrix.opkg_arch }}
+          Maintainer: Developer <dev@example.com>
+          Description: Transparent proxy and routing daemon on top of sing-box/xray
+          EOF
+
+          echo "2.0" > "$PKG_DIR/debian-binary"
+
+          tar --numeric-owner --owner=0 --group=0 -czf "$PKG_DIR/data.tar.gz" -C "$PKG_DIR/data" .
+          tar --numeric-owner --owner=0 --group=0 -czf "$PKG_DIR/control.tar.gz" -C "$PKG_DIR/control" .
+
+          IPK_NAME="luci-app-cheburnet_${{ steps.vars.outputs.version }}-1_${{ matrix.opkg_arch }}.ipk"
+          tar --numeric-owner --owner=0 --group=0 -czf "$IPK_NAME" \
+              -C "$PKG_DIR" debian-binary control.tar.gz data.tar.gz
+
+          mkdir -p dist
+          mv "$IPK_NAME" dist/
+
+      - name: Pack .apk Package
+        run: |
+          APK_DIR="apk_pkg"
+          mkdir -p "$APK_DIR/usr/bin" "$APK_DIR/etc/init.d" "$APK_DIR/etc/config" \
+                   "$APK_DIR/www/luci-static/resources/view/cheburnet" \
+                   "$APK_DIR/usr/share/luci/menu.d"
+
+          cp bin/cheburnetd "$APK_DIR/usr/bin/cheburnetd"
+          chmod 755 "$APK_DIR/usr/bin/cheburnetd"
+
+          cp openwrt/files/etc/init.d/cheburnet "$APK_DIR/etc/init.d/cheburnet"
+          chmod 755 "$APK_DIR/etc/init.d/cheburnet"
+
+          cp openwrt/files/etc/config/cheburnet "$APK_DIR/etc/config/cheburnet"
+          cp openwrt/files/www/luci-static/resources/view/cheburnet/dashboard.js "$APK_DIR/www/luci-static/resources/view/cheburnet/dashboard.js"
+          cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_DIR/usr/share/luci/menu.d/luci-app-cheburnet.json"
+
+          cat <<EOF > "$APK_DIR/.PKGINFO"
+          pkgname = luci-app-cheburnet
+          pkgver = ${{ steps.vars.outputs.version }}-r1
+          pkgdesc = Transparent proxy and routing daemon on top of sing-box/xray
+          url = https://github.com/${{ github.repository }}
+          builddate = $(date +%s)
+          packager = GitHub Actions
+          size = $(du -sb "$APK_DIR" | awk '{print $1}')
+          arch = ${{ matrix.apk_arch }}
+          depend = sing-box
+          depend = nftables
+          depend = ip-full
+          EOF
+
+          APK_NAME="luci-app-cheburnet-${{ steps.vars.outputs.version }}-r1.${{ matrix.apk_arch }}.apk"
+          tar --numeric-owner --owner=0 --group=0 -czf "dist/$APK_NAME" -C "$APK_DIR" .
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
