@@ -1,0 +1,12 @@
+{
+	"admin/services/cheburnet": {
+		"title": "Chebur.NET",
+		"action": {
+			"type": "view",
+			"path": "cheburnet/dashboard"
+		},
+		"depends": {
+			"uci": { "cheburnet": true }
+		}
+	}
+}

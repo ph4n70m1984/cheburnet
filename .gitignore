@@ -1,0 +1,50 @@
+# Скомпилированные бинарники и артефакты Go
+bin/
+dist/
+release-assets/
+cheburnetd
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Временные директории сборки пакетов
+ipk_pkg/
+apk_pkg/
+/tmp/ipk_build/
+/tmp/apk_build/
+*.ipk
+*.apk
+*.tar.gz
+debian-binary
+
+# Локальные базы кэша и состояние ядер
+*.db
+/tmp/sing-box-cache.db
+cache.db
+*.log
+
+# Временные системные файлы и дампы
+*.tmp
+*.temp
+*.swp
+*~
+
+# Файлы операционных систем
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Конфигурации IDE и редакторов
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Тестовые данные и локальные дампы подписок
+*.local.json
+local_test/
+sub_cache.txt
+
+build-packages.yml
