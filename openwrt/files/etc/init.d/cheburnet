@@ -24,7 +24,7 @@ start_service() {
     cleanup_children
 
     procd_open_instance "main"
-    procd_set_param command "$PROG"
+    procd_set_param command "$PROG" "start"
     procd_set_param respawn 3600 5 5
     procd_set_param file "$CONF"
     procd_set_param stdout 1
