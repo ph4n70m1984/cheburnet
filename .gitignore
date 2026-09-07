@@ -2,7 +2,7 @@
 bin/
 dist/
 release-assets/
-cheburnetd
+/cheburnetd
 *.exe
 *.exe~
 *.dll
