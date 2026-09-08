@@ -390,12 +390,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			// Явный перехват голосовых UDP портов Discord (WebRTC & Handshake)
 			if hasDiscord {
 				routeRules = append(routeRules, map[string]interface{}{
-					"action":     "route",
-					"inbound":    []string{"tproxy-in"},
-					"network":    "udp",
-					"port":       []int{443},
-					"port_range": []string{"50000:65535"},
-					"outbound":   activeOutboundTag,
+					"action":   "route",
+					"inbound":  []string{"tproxy-in"},
+					"network":  "udp",
+					"port":     []string{"50000:65535"},
+					"outbound": activeOutboundTag,
 				})
 			}
 
