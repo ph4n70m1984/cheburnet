@@ -347,6 +347,15 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 			rules = append(rules, rule)
 		} else {
+			// Проверяем наличие discord в списке наборов правил
+			hasDiscord := false
+			for _, rs := range cfg.RuleSets {
+				if rs == "discord" {
+					hasDiscord = true
+					break
+				}
+			}
+
 			// РЕЖИМ RULES: роутинг по спискам подсетей и доменов
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			for _, rs := range cfg.RuleSets {
@@ -368,6 +377,22 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					rule["outboundTag"] = primaryProxyTag
 				}
 				rules = append(rules, rule)
+			}
+
+			// Явный перехват голосовых портов Discord UDP (WebRTC & Handshake)
+			if hasDiscord {
+				discordUdpRule := map[string]interface{}{
+					"type":       "field",
+					"inboundTag": []string{"tproxy-in"},
+					"network":    "udp",
+					"port":       "443,50000-65535",
+				}
+				if len(balancers) > 0 {
+					discordUdpRule["balancerTag"] = primaryProxyTag
+				} else {
+					discordUdpRule["outboundTag"] = primaryProxyTag
+				}
+				rules = append(rules, discordUdpRule)
 			}
 
 			var totalDomains []string

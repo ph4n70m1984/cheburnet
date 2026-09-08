@@ -201,7 +201,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			{
 				"type":          "tproxy",
 				"tag":           "tproxy-in",
-				"listen":        "0.0.0.0", // Обязательно для TProxy
+				"listen":        "0.0.0.0",
 				"listen_port":   tproxyPort,
 				"tcp_fast_open": true,
 				"udp_fragment":  true,
@@ -315,7 +315,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// Клиентские политики
+	// 1. Клиентские политики (Client Policy)
 	var directClients []string
 	var fullProxyClients []string
 
@@ -354,20 +354,24 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
+	// 2. Общие правила маршрутизации
 	if activeOutboundTag != "direct-out" {
 		if isGlobal {
-			// В режиме Global весь остальной входящий трафик направляется в прокси
+			// В режиме Global весь трафик уходит в прокси
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},
 				"outbound": activeOutboundTag,
 			})
 		} else {
-			// Режим Rules
-			totalSubnets := make([]string, 0, len(cfg.CustomSubnets))
-			totalSubnets = append(totalSubnets, cfg.CustomSubnets...)
+			// Режим Rules: динамические подсети из архивов и пользовательских списков
+			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 
+			hasDiscord := false
 			for _, rs := range cfg.RuleSets {
+				if rs == "discord" {
+					hasDiscord = true
+				}
 				subnets, err := b.rulesLoader.GetSubnets(rs)
 				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
@@ -380,6 +384,18 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					"inbound":  []string{"tproxy-in"},
 					"ip_cidr":  totalSubnets,
 					"outbound": activeOutboundTag,
+				})
+			}
+
+			// Явный перехват голосовых UDP портов Discord (WebRTC & Handshake)
+			if hasDiscord {
+				routeRules = append(routeRules, map[string]interface{}{
+					"action":     "route",
+					"inbound":    []string{"tproxy-in"},
+					"network":    "udp",
+					"port":       []int{443},
+					"port_range": []string{"50000:65535"},
+					"outbound":   activeOutboundTag,
 				})
 			}
 
