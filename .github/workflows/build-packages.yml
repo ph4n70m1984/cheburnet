@@ -112,6 +112,9 @@ jobs:
           Description: Transparent proxy and routing daemon on top of sing-box/xray
           EOF
 
+          # OPKG: conffiles блокирует перезапись существующего UCI файла конфигурации
+          echo "/etc/config/cheburnet" > "$PKG_DIR/control/conffiles"
+
           echo "2.0" > "$PKG_DIR/debian-binary"
 
           tar --numeric-owner --owner=0 --group=0 -czf "$PKG_DIR/data.tar.gz" -C "$PKG_DIR/data" .
@@ -154,8 +157,32 @@ jobs:
           depend = ip-full
           EOF
 
+          # APK: пред- и пост-скрипты защиты пользовательской конфигурации
+          cat <<'EOF' > "$APK_DIR/.pre-install"
+          #!/bin/sh
+          if [ -f /etc/config/cheburnet ]; then
+              cp /etc/config/cheburnet /tmp/.cheburnet_config_preserved
+          fi
+          exit 0
+          EOF
+          chmod 755 "$APK_DIR/.pre-install"
+
+          cat <<'EOF' > "$APK_DIR/.post-install"
+          #!/bin/sh
+          if [ -f /tmp/.cheburnet_config_preserved ]; then
+              mv -f /tmp/.cheburnet_config_preserved /etc/config/cheburnet
+          fi
+          exit 0
+          EOF
+          chmod 755 "$APK_DIR/.post-install"
+
           APK_NAME="luci-app-cheburnet-${{ steps.vars.outputs.version }}.${{ matrix.apk_arch }}.apk"
           tar --numeric-owner --owner=0 --group=0 -czf "dist/$APK_NAME" -C "$APK_DIR" .
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum * > sha256sums.txt
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -174,6 +201,12 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Regenerate Unified Checksums
+        run: |
+          cd release-assets
+          rm -f sha256sums.txt
+          sha256sum * > sha256sums.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

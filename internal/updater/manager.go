@@ -1,7 +1,10 @@
 package updater
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +23,7 @@ type ComponentStatus struct {
 	Current   string `json:"current"`
 	Latest    string `json:"latest"`
 	HasUpdate bool   `json:"has_update"`
+	Installed bool   `json:"installed"`
 }
 
 type UpdateReport struct {
@@ -27,7 +31,12 @@ type UpdateReport struct {
 	SingBox    ComponentStatus `json:"sing_box"`
 	Xray       ComponentStatus `json:"xray"`
 	AutoUpdate bool            `json:"auto_update"`
-	PkgManager string          `json:"pkg_manager"` // "apk" или "opkg"
+	PkgManager string          `json:"pkg_manager"`
+}
+
+type releaseAsset struct {
+	Name string
+	URL  string
 }
 
 type Manager struct {
@@ -67,7 +76,6 @@ func detectTargetArch(pkgMgr string) string {
 			return strings.TrimSpace(string(out))
 		}
 	} else {
-		// Опрос архитектур opkg (берем первую пользовательскую или системную)
 		out, err := exec.Command("opkg", "print-architecture").Output()
 		if err == nil {
 			var chosenArch string
@@ -86,7 +94,6 @@ func detectTargetArch(pkgMgr string) string {
 		}
 	}
 
-	// Fallback по GOARCH
 	switch runtime.GOARCH {
 	case "arm64":
 		if pkgMgr == "apk" {
@@ -111,10 +118,11 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	xrStatus := m.checkPkgStatus("xray-core")
 
 	chStatus := ComponentStatus{
-		Current: strings.TrimPrefix(m.currentVer, "v"),
+		Current:   strings.TrimPrefix(m.currentVer, "v"),
+		Installed: true,
 	}
 
-	latestTag, _, _, err := m.fetchLatestGitHubRelease(ctx)
+	latestTag, _, _, _, err := m.fetchLatestGitHubRelease(ctx)
 	if err == nil {
 		cleanLatest := strings.TrimPrefix(latestTag, "v")
 		chStatus.Latest = cleanLatest
@@ -135,35 +143,66 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 func (m *Manager) checkPkgStatus(pkgName string) ComponentStatus {
 	st := ComponentStatus{}
 
+	binExists := false
+	lookupList := []string{pkgName}
+	if pkgName == "xray-core" {
+		lookupList = append(lookupList, "xray")
+	}
+	for _, bin := range lookupList {
+		if _, err := exec.LookPath(bin); err == nil {
+			binExists = true
+			break
+		}
+	}
+
 	if m.pkgManager == "apk" {
 		out, err := exec.Command("apk", "info", "-v", pkgName).Output()
-		if err == nil {
+		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
 			line := strings.TrimSpace(string(out))
 			st.Current = strings.TrimPrefix(line, pkgName+"-")
 			st.Latest = st.Current
+			st.Installed = true
+		} else {
+			st.Installed = binExists
+			if !binExists {
+				st.Current = ""
+				st.Latest = ""
+				st.HasUpdate = false
+				return st
+			}
 		}
-		// Проверка доступных апдейтов
+
 		outUpgr, err := exec.Command("apk", "version", "-l", "<", pkgName).Output()
-		if err == nil && len(outUpgr) > 0 {
+		if err == nil && len(outUpgr) > 0 && st.Installed {
 			st.HasUpdate = true
 		}
 		return st
 	}
 
-	// opkg
 	outStatus, err := exec.Command("opkg", "status", pkgName).Output()
-	if err == nil {
+	if err == nil && len(strings.TrimSpace(string(outStatus))) > 0 {
 		for _, line := range strings.Split(string(outStatus), "\n") {
 			if strings.HasPrefix(line, "Version:") {
 				st.Current = strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
 				st.Latest = st.Current
+				st.Installed = true
 				break
 			}
 		}
 	}
 
+	if !st.Installed {
+		st.Installed = binExists
+		if !binExists {
+			st.Current = ""
+			st.Latest = ""
+			st.HasUpdate = false
+			return st
+		}
+	}
+
 	outUpgr, err := exec.Command("opkg", "list-upgradable").Output()
-	if err == nil {
+	if err == nil && st.Installed {
 		for _, line := range strings.Split(string(outUpgr), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) >= 5 && fields[0] == pkgName {
@@ -173,20 +212,21 @@ func (m *Manager) checkPkgStatus(pkgName string) ComponentStatus {
 			}
 		}
 	}
+
 	return st
 }
 
-func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgURL string, binURL string, err error) {
+func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, binAsset releaseAsset, checksumsURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", "", err
+		return "", releaseAsset{}, releaseAsset{}, "", err
 	}
 	req.Header.Set("User-Agent", "CheburNet-Updater")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", "", "", fmt.Errorf("github api request failed")
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api request failed")
 	}
 	defer resp.Body.Close()
 
@@ -198,12 +238,11 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", "", "", err
+		return "", releaseAsset{}, releaseAsset{}, "", err
 	}
 
 	tag = strings.TrimPrefix(rel.TagName, "v")
 
-	// 1. Поиск пакета (.apk или .ipk) под текущую систему и архитектуру
 	targetExt := ".ipk"
 	if m.pkgManager == "apk" {
 		targetExt = ".apk"
@@ -211,24 +250,74 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 
 	for _, a := range rel.Assets {
 		name := strings.ToLower(a.Name)
+		if strings.Contains(name, "sha256") || strings.Contains(name, "checksum") {
+			checksumsURL = a.BrowserDownloadURL
+		}
 		if strings.HasSuffix(name, targetExt) {
 			if strings.Contains(name, strings.ToLower(m.targetArch)) || strings.Contains(name, runtime.GOARCH) {
-				pkgURL = a.BrowserDownloadURL
-				break
+				pkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+			}
+		}
+		if strings.Contains(name, fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)) {
+			binAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+		}
+	}
+
+	return tag, pkgAsset, binAsset, checksumsURL, nil
+}
+
+func (m *Manager) fetchExpectedSHA256(ctx context.Context, checksumsURL, filename string) (string, error) {
+	if checksumsURL == "" {
+		return "", nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumsURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := m.httpClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download checksums: %v", err)
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			baseName := filepath.Base(parts[1])
+			if baseName == filename || strings.TrimPrefix(parts[1], "*") == filename {
+				return strings.ToLower(parts[0]), nil
 			}
 		}
 	}
+	return "", nil
+}
 
-	// 2. Fallback: поиск сырого бинарника
-	targetBinPattern := fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)
-	for _, a := range rel.Assets {
-		if strings.Contains(a.Name, targetBinPattern) {
-			binURL = a.BrowserDownloadURL
-			break
-		}
+func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
+	if expectedHash == "" {
+		return nil
 	}
 
-	return tag, pkgURL, binURL, nil
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return err
+	}
+
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if !strings.EqualFold(actualHash, expectedHash) {
+		return fmt.Errorf("sha256 mismatch: expected %s, got %s", expectedHash, actualHash)
+	}
+
+	log.Printf("[INFO] SHA256 verified successfully (%s)", actualHash)
+	return nil
 }
 
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
@@ -236,12 +325,25 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 		pkgs = []string{"sing-box", "xray-core"}
 	}
 
+	var targetPkgs []string
+	for _, p := range pkgs {
+		st := m.checkPkgStatus(p)
+		if st.Installed {
+			targetPkgs = append(targetPkgs, p)
+		}
+	}
+
+	if len(targetPkgs) == 0 {
+		log.Println("[INFO] No active core packages installed to upgrade")
+		return nil
+	}
+
 	if m.pkgManager == "apk" {
 		log.Println("[INFO] Updating apk package repositories...")
 		if out, err := exec.CommandContext(ctx, "apk", "update").CombinedOutput(); err != nil {
 			return fmt.Errorf("apk update failed: %s", string(out))
 		}
-		args := append([]string{"add", "--upgrade"}, pkgs...)
+		args := append([]string{"add", "--upgrade"}, targetPkgs...)
 		log.Printf("[INFO] Running apk %s...", strings.Join(args, " "))
 		if out, err := exec.CommandContext(ctx, "apk", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("apk upgrade failed: %s", string(out))
@@ -249,12 +351,11 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 		return nil
 	}
 
-	// opkg
 	log.Println("[INFO] Updating opkg repository indexes...")
 	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg update failed: %s", string(out))
 	}
-	args := append([]string{"upgrade"}, pkgs...)
+	args := append([]string{"upgrade"}, targetPkgs...)
 	log.Printf("[INFO] Running opkg %s...", strings.Join(args, " "))
 	if out, err := exec.CommandContext(ctx, "opkg", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg upgrade failed: %s", string(out))
@@ -262,22 +363,50 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return nil
 }
 
-// UpgradePackage скачивает .ipk/.apk и устанавливает через пакетный менеджер
 func (m *Manager) UpgradePackage(ctx context.Context) error {
-	tag, pkgURL, binURL, err := m.fetchLatestGitHubRelease(ctx)
+	tag, pkgAsset, binAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Если найден нативный .ipk/.apk пакет
-	if pkgURL != "" {
-		log.Printf("[INFO] Found native package update (%s): %s", m.pkgManager, pkgURL)
-		ext := filepath.Ext(pkgURL)
-		tmpFile := filepath.Join(os.TempDir(), "cheburnet_latest"+ext)
+	const uciCfgPath = "/etc/config/cheburnet"
+	backupCfgPath := filepath.Join(os.TempDir(), "cheburnet_uci_preserved.bak")
+
+	savedConfig := false
+	if cfgData, readErr := os.ReadFile(uciCfgPath); readErr == nil && len(cfgData) > 0 {
+		if writeErr := os.WriteFile(backupCfgPath, cfgData, 0644); writeErr == nil {
+			savedConfig = true
+			defer os.Remove(backupCfgPath)
+		}
+	}
+
+	restoreConfigIfNeeded := func() {
+		if !savedConfig {
+			return
+		}
+		backupData, readErr := os.ReadFile(backupCfgPath)
+		if readErr != nil || len(backupData) == 0 {
+			return
+		}
+		currData, currErr := os.ReadFile(uciCfgPath)
+		if currErr != nil || len(currData) != len(backupData) {
+			_ = os.WriteFile(uciCfgPath, backupData, 0644)
+			log.Println("[INFO] User configuration /etc/config/cheburnet restored")
+		}
+	}
+
+	if pkgAsset.URL != "" {
+		log.Printf("[INFO] Downloading %s package: %s", m.pkgManager, pkgAsset.URL)
+		tmpFile := filepath.Join(os.TempDir(), pkgAsset.Name)
 		defer os.Remove(tmpFile)
 
-		if err := m.downloadFile(ctx, pkgURL, tmpFile); err != nil {
-			return fmt.Errorf("failed to download package: %w", err)
+		if err := m.downloadFile(ctx, pkgAsset.URL, tmpFile); err != nil {
+			return fmt.Errorf("download package failed: %w", err)
+		}
+
+		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
+		if err := m.verifyFileSHA256(tmpFile, expectedHash); err != nil {
+			return fmt.Errorf("security verification failed: %w", err)
 		}
 
 		var cmd *exec.Cmd
@@ -288,54 +417,48 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		}
 
 		out, err := cmd.CombinedOutput()
+		restoreConfigIfNeeded()
+
 		if err != nil {
 			return fmt.Errorf("%s install failed: %s", m.pkgManager, string(out))
 		}
 
-		log.Printf("[INFO] %s package successfully installed: %s", m.pkgManager, string(out))
-
-		// Обновляем текущую версию в памяти менеджера сразу
+		log.Printf("[INFO] %s package successfully updated", m.pkgManager)
 		m.currentVer = tag
 		return nil
 	}
 
-	// Fallback: если пакета под архитектуру нет в релизах, обновляем сырой бинарник
-	if binURL != "" {
-		log.Printf("[INFO] Package not found. Falling back to raw binary self-update: %s", binURL)
-		if err := m.upgradeRawBinary(ctx, binURL); err != nil {
+	if binAsset.URL != "" {
+		log.Printf("[INFO] Package not found. Fallback to raw binary: %s", binAsset.URL)
+		tmpBin := filepath.Join(os.TempDir(), binAsset.Name)
+		defer os.Remove(tmpBin)
+
+		if err := m.downloadFile(ctx, binAsset.URL, tmpBin); err != nil {
 			return err
 		}
+
+		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, binAsset.Name)
+		if err := m.verifyFileSHA256(tmpBin, expectedHash); err != nil {
+			return fmt.Errorf("security verification failed: %w", err)
+		}
+
+		currPath, err := os.Executable()
+		if err != nil {
+			currPath = "/usr/bin/cheburnetd"
+		}
+		currPath, _ = filepath.EvalSymlinks(currPath)
+
+		_ = os.Chmod(tmpBin, 0755)
+		if err := os.Rename(tmpBin, currPath); err != nil {
+			return fmt.Errorf("replace binary failed: %w", err)
+		}
+
+		restoreConfigIfNeeded()
 		m.currentVer = tag
 		return nil
 	}
 
-	return fmt.Errorf("no matching .%s package or binary found for arch %s", m.pkgManager, m.targetArch)
-}
-
-func (m *Manager) upgradeRawBinary(ctx context.Context, downloadURL string) error {
-	currPath, err := os.Executable()
-	if err != nil {
-		currPath = "/usr/bin/cheburnetd"
-	}
-	currPath, _ = filepath.EvalSymlinks(currPath)
-
-	tmpPath := currPath + ".new"
-	defer os.Remove(tmpPath)
-
-	if err := m.downloadFile(ctx, downloadURL, tmpPath); err != nil {
-		return err
-	}
-
-	if err := os.Chmod(tmpPath, 0755); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tmpPath, currPath); err != nil {
-		return fmt.Errorf("replace binary failed: %w", err)
-	}
-
-	log.Println("[INFO] cheburnetd binary successfully replaced.")
-	return nil
+	return fmt.Errorf("no matching release asset found for arch %s", m.targetArch)
 }
 
 func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) error {

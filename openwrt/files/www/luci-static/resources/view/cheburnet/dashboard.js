@@ -25,7 +25,6 @@ return view.extend({
         statusSec.anonymous = true;
 
         statusSec.render = function() {
-            // Жёлтый интерактивный баннер обновлений
             const updateBanner = E('div', {
                 'id': 'update-notification-banner',
                 'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); color: #fef08a;'
@@ -89,16 +88,26 @@ return view.extend({
                 table
             ]);
 
+            function formatComponentStatus(name, comp) {
+                if (!comp || !comp.installed) {
+                    return `<li>${name}: <span style="color:#71717a;">Не установлен</span></li>`;
+                }
+                if (comp.has_update) {
+                    return `<li>${name}: <b>${comp.current}</b> → <span style="color:#4ade80; font-weight:bold;">${comp.latest} (Доступно обновление)</span></li>`;
+                }
+                return `<li>${name}: <b>${comp.current}</b> → <span style="color:#8c8c8c;">Актуально</span></li>`;
+            }
+
             function showUpdateNotification(data) {
                 if (!data) return;
                 let alerts = [];
                 if (data.cheburnet && data.cheburnet.has_update) {
                     alerts.push('Chebur.NET: ' + data.cheburnet.current + ' → ' + data.cheburnet.latest);
                 }
-                if (data.sing_box && data.sing_box.has_update) {
+                if (data.sing_box && data.sing_box.installed && data.sing_box.has_update) {
                     alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
                 }
-                if (data.xray && data.xray.has_update) {
+                if (data.xray && data.xray.installed && data.xray.has_update) {
                     alerts.push('Xray: ' + data.xray.current + ' → ' + data.xray.latest);
                 }
                 if (alerts.length > 0) {
@@ -111,12 +120,39 @@ return view.extend({
                 }
             }
 
+            function renderUpdateReport(r) {
+                const statusDiv = document.getElementById('ws-update-status');
+                const btnUpgrade = document.getElementById('ws-btn-upgrade');
+
+                if (statusDiv) {
+                    let html = `<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">`;
+                    html += formatComponentStatus('Chebur.NET', r.cheburnet);
+                    html += formatComponentStatus('Sing-box', r.sing_box);
+                    html += formatComponentStatus('Xray-core', r.xray);
+                    html += `</ul>`;
+                    statusDiv.innerHTML = html;
+                }
+
+                if (btnUpgrade) {
+                    const hasAppUpdate = r.cheburnet && r.cheburnet.has_update;
+                    const hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
+                    const hasXrUpdate = r.xray && r.xray.installed && r.xray.has_update;
+
+                    if (hasAppUpdate || hasSbUpdate || hasXrUpdate) {
+                        btnUpgrade.style.display = 'inline-block';
+                    } else {
+                        btnUpgrade.style.display = 'none';
+                    }
+                }
+            }
+
             function checkUpdates() {
                 const host = window.location.hostname;
                 fetch('http://' + host + ':8088/api/v1/updates/check')
                     .then(r => r.json())
                     .then(data => {
                         showUpdateNotification(data);
+                        renderUpdateReport(data);
                     })
                     .catch(() => {});
             }
@@ -236,37 +272,15 @@ return view.extend({
                     try {
                         const msg = JSON.parse(event.data);
 
-                        // Живые задержки серверов
                         if (msg.node_latencies) {
                             for (const [tag, latency] of Object.entries(msg.node_latencies)) {
                                 updateNodeUI(tag, latency);
                             }
                         }
 
-                        // Интерактивный ответ модуля обновлений
                         if (msg.type === 'update_report' && msg.data) {
-                            const r = msg.data;
-                            showUpdateNotification(r);
-
-                            const statusDiv = document.getElementById('ws-update-status');
-                            const btnUpgrade = document.getElementById('ws-btn-upgrade');
-
-                            if (statusDiv) {
-                                let html = `<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">`;
-                                html += `<li>Chebur.NET: <b>${r.cheburnet.current}</b> → ${r.cheburnet.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.cheburnet.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
-                                html += `<li>Sing-box: <b>${r.sing_box.current}</b> → ${r.sing_box.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.sing_box.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
-                                html += `<li>Xray-core: <b>${r.xray.current}</b> → ${r.xray.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.xray.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
-                                html += `</ul>`;
-                                statusDiv.innerHTML = html;
-                            }
-
-                            if (btnUpgrade) {
-                                if (r.cheburnet.has_update || r.sing_box.has_update || r.xray.has_update) {
-                                    btnUpgrade.style.display = 'inline-block';
-                                } else {
-                                    btnUpgrade.style.display = 'none';
-                                }
-                            }
+                            showUpdateNotification(msg.data);
+                            renderUpdateReport(msg.data);
                         }
                     } catch (e) {}
                 };
@@ -296,11 +310,10 @@ return view.extend({
             return viewContainer;
         };
 
-        // Функции обработчиков для WebSocket кнопок
         window.cheburCheckUpdates = function(e) {
             e.preventDefault();
             const statusDiv = document.getElementById('ws-update-status');
-            if (statusDiv) statusDiv.innerHTML = '<span style="color:#fbbf24;">Запрос отправлен. Выполняется проверка GitHub и opkg...</span>';
+            if (statusDiv) statusDiv.innerHTML = '<span style="color:#fbbf24;">Запрос отправлен. Выполняется проверка GitHub и пакетов...</span>';
             if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
                 window.cheburWs.send(JSON.stringify({ action: 'check_updates' }));
             } else {
