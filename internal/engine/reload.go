@@ -9,7 +9,7 @@ import (
 	"cheburnet/internal/config"
 )
 
-// SafeReload атомарно генерирует новый конфиг, валидирует его и перезапускает ядро с автоматическим откатом
+// SafeReload атомарно генерирует новый конфиг, валидирует его силами ядра и перезапускает процесс с автоматическим откатом
 func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targetPath string) error {
 	stagingPath := targetPath + ".new"
 	backupPath := targetPath + ".bak"
@@ -18,31 +18,36 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 
 	// 1. Pre-flight: генерируем конфигурацию в staging-файл
 	if err := eng.BuildConfig(cfg, stagingPath); err != nil {
-		return fmt.Errorf("pre-flight build config failed for %s: %w (engine kept untouched)", eng.Name(), err)
+		return fmt.Errorf("build config failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 
-	// 2. Бэкапим текущий рабочий конфиг (если он существует)
+	// 2. Валидация бинарником (sing-box check или xray -test)
+	if err := eng.ValidateConfig(stagingPath); err != nil {
+		return fmt.Errorf("binary validation failed for %s: %w (active process untouched)", eng.Name(), err)
+	}
+
+	// 3. Бэкапим текущий рабочий конфиг (если он существует)
 	if _, err := os.Stat(targetPath); err == nil {
 		if err := copyFile(targetPath, backupPath); err != nil {
 			log.Printf("[engine-reload] warning: failed to create backup config: %v", err)
 		}
 	}
 
-	// 3. Атомарно активируем новый конфигурационный файл
+	// 4. Атомарно активируем новый конфигурационный файл
 	if err := os.Rename(stagingPath, targetPath); err != nil {
 		return fmt.Errorf("failed to commit staging config: %w", err)
 	}
 
-	// 4. Останавливаем текущий процесс ядра
+	// 5. Останавливаем текущий процесс ядра
 	if err := eng.Stop(); err != nil {
 		log.Printf("[engine-reload] warning: stop returned error: %v", err)
 	}
 
-	// 5. Запускаем ядро с новым конфигом
+	// 6. Запускаем ядро с новым конфигом
 	if err := eng.Start(ctx, targetPath); err != nil {
-		log.Printf("[engine-reload] CRITICAL: %s failed to start with new config: %v. Triggering ROLLBACK...", eng.Name(), err)
+		log.Printf("[engine-reload] CRITICAL: %s failed to start after validation: %v. Triggering ROLLBACK...", eng.Name(), err)
 
-		// 6. ROLLBACK: возвращаем бэкап и поднимаем стабильную версию
+		// 7. ROLLBACK: возвращаем бэкап и поднимаем стабильную версию
 		if _, statErr := os.Stat(backupPath); statErr == nil {
 			_ = os.Rename(backupPath, targetPath)
 			if rbErr := eng.Start(ctx, targetPath); rbErr != nil {

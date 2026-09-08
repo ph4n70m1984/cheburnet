@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -30,6 +31,15 @@ func (x *XrayEngine) Name() string {
 func (x *XrayEngine) BuildConfig(cfg *config.CheburConfig, targetPath string) error {
 	x.cfg = cfg
 	return x.builder.Build(cfg, targetPath)
+}
+
+func (x *XrayEngine) ValidateConfig(configPath string) error {
+	cmd := exec.Command("xray", "-test", "-config", configPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("xray -test failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (x *XrayEngine) Start(ctx context.Context, configPath string) error {

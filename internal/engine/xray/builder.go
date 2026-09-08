@@ -1,21 +1,94 @@
 package xray
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/network"
 )
 
-type Builder struct{}
+type Builder struct {
+	rulesLoader *network.CompressedRulesetLoader
+}
 
 func NewBuilder() *Builder {
-	return &Builder{}
+	return &Builder{
+		rulesLoader: network.NewCompressedRulesetLoader(),
+	}
+}
+
+func resolveTargetToCIDR(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+
+	if strings.Contains(target, ":") && !strings.Contains(target, ".") {
+		file, err := os.Open("/tmp/dhcp.leases")
+		if err == nil {
+			defer file.Close()
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				fields := strings.Fields(scanner.Text())
+				if len(fields) >= 3 {
+					if strings.EqualFold(fields[1], target) {
+						target = fields[2]
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if !strings.Contains(target, "/") && net.ParseIP(target) != nil {
+		return target + "/32"
+	}
+
+	return target
 }
 
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
+	// 1. Формирование DNS серверов
+	var dnsServers []interface{}
+
+	dnsServerAddr := cfg.DNSServer
+	if dnsServerAddr == "" {
+		dnsServerAddr = "8.8.8.8"
+	}
+
+	switch cfg.DNSProtocol {
+	case "doh", "https":
+		if !strings.HasPrefix(dnsServerAddr, "https://") {
+			dnsServerAddr = fmt.Sprintf("https://%s/dns-query", dnsServerAddr)
+		}
+		dnsServers = append(dnsServers, dnsServerAddr)
+	case "dot", "tls":
+		if !strings.HasPrefix(dnsServerAddr, "tcp+local://") {
+			dnsServers = append(dnsServers, fmt.Sprintf("tcp://%s:853", dnsServerAddr))
+		}
+	default:
+		if !strings.Contains(dnsServerAddr, ":") {
+			dnsServers = append(dnsServers, dnsServerAddr+":53")
+		} else {
+			dnsServers = append(dnsServers, dnsServerAddr)
+		}
+	}
+
+	if cfg.BootstrapDNS != "" {
+		bootstrap := cfg.BootstrapDNS
+		if !strings.Contains(bootstrap, ":") {
+			bootstrap += ":53"
+		}
+		dnsServers = append(dnsServers, bootstrap)
+	}
+	dnsServers = append(dnsServers, "localhost")
+
 	xrayConfig := map[string]interface{}{
 		"log": map[string]interface{}{
 			"loglevel": "warning",
@@ -40,16 +113,12 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			},
 		},
 		"dns": map[string]interface{}{
-			"servers": []interface{}{
-				cfg.DNSServer,
-				cfg.BootstrapDNS,
-				"localhost",
-			},
+			"servers":       dnsServers,
 			"queryStrategy": "UseIPv4",
 		},
 	}
 
-	// 1. Inbounds (TProxy + DNS Hijack + Dokodemo API)
+	// 2. Inbounds (TProxy + DNS Inbound + Mixed Port + Dokodemo API)
 	inbounds := []map[string]interface{}{
 		{
 			"tag":      "api-in",
@@ -87,22 +156,37 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"protocol": "dokodemo-door",
 			"settings": map[string]interface{}{
 				"network": "tcp,udp",
-				"address": cfg.DNSServer,
+				"address": "127.0.0.1",
 				"port":    53,
 			},
 		},
 	}
+
+	if cfg.MixedPort > 0 {
+		inbounds = append(inbounds, map[string]interface{}{
+			"tag":      "mixed-in",
+			"listen":   "127.0.0.1",
+			"port":     cfg.MixedPort,
+			"protocol": "socks",
+			"settings": map[string]interface{}{
+				"auth": "noauth",
+				"udp":  true,
+			},
+		})
+	}
 	xrayConfig["inbounds"] = inbounds
 
-	// 2. Outbounds (Прямой выход, DNS и ноды)
+	// 3. Outbounds (Прямой выход, Блокировка, DNS и ноды)
+	sockopt := map[string]interface{}{
+		"mark": 2097152, // 0x200000 NFT SelfMark
+	}
+
 	outbounds := []map[string]interface{}{
 		{
 			"tag":      "direct",
 			"protocol": "freedom",
 			"streamSettings": map[string]interface{}{
-				"sockopt": map[string]interface{}{
-					"mark": 2097152, // 0x200000 NFT SelfMark
-				},
+				"sockopt": sockopt,
 			},
 		},
 		{
@@ -116,29 +200,70 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"tag":      "dns-out",
 			"protocol": "dns",
 			"streamSettings": map[string]interface{}{
-				"sockopt": map[string]interface{}{
-					"mark": 2097152,
-				},
+				"sockopt": sockopt,
 			},
 		},
 	}
 
-	var primaryProxyTag string
+	var allNodeTags []string
 	for _, node := range cfg.Nodes {
 		ob, err := b.buildNodeOutbound(node)
 		if err == nil {
 			outbounds = append(outbounds, ob)
-			if primaryProxyTag == "" {
-				primaryProxyTag = node.Tag
-			}
+			allNodeTags = append(allNodeTags, node.Tag)
 		}
 	}
-	if primaryProxyTag == "" {
-		primaryProxyTag = "direct"
+
+	// 4. Балансировка (Observatory + Balancers)
+	var balancers []map[string]interface{}
+	primaryProxyTag := "direct"
+
+	if len(cfg.Groups) > 0 {
+		for _, grp := range cfg.Groups {
+			balancers = append(balancers, map[string]interface{}{
+				"tag":      grp.Tag,
+				"selector": grp.Nodes,
+				"strategy": map[string]interface{}{
+					"type": "leastPing",
+				},
+			})
+			if primaryProxyTag == "direct" {
+				primaryProxyTag = grp.Tag
+			}
+		}
+
+		checkURL := "https://www.gstatic.com/generate_204"
+		if cfg.Groups[0].TargetURL != "" {
+			checkURL = cfg.Groups[0].TargetURL
+		}
+
+		xrayConfig["observatory"] = map[string]interface{}{
+			"subjectSelector":   allNodeTags,
+			"probeUrl":          checkURL,
+			"probeInterval":     "3m",
+			"enableConcurrency": true,
+		}
+	} else if len(allNodeTags) > 0 {
+		balancers = append(balancers, map[string]interface{}{
+			"tag":      "proxy-balancer",
+			"selector": allNodeTags,
+			"strategy": map[string]interface{}{
+				"type": "leastPing",
+			},
+		})
+
+		xrayConfig["observatory"] = map[string]interface{}{
+			"subjectSelector":   allNodeTags,
+			"probeUrl":          "https://www.gstatic.com/generate_204",
+			"probeInterval":     "3m",
+			"enableConcurrency": true,
+		}
+		primaryProxyTag = "proxy-balancer"
 	}
+
 	xrayConfig["outbounds"] = outbounds
 
-	// 3. Routing Rules
+	// 5. Таблица правил маршрутизации (Routing Rules)
 	rules := []map[string]interface{}{
 		{
 			"type":        "field",
@@ -152,58 +277,152 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// Маршрутизация по подсетям (CIDR)
-	if len(cfg.CustomSubnets) > 0 && primaryProxyTag != "direct" {
-		rules = append(rules, map[string]interface{}{
-			"type":        "field",
-			"ip":          cfg.CustomSubnets,
-			"outboundTag": primaryProxyTag,
-		})
-	}
+	// --- ПРИОРИТЕТ 1: Client Policies ---
+	var directClients []string
+	var fullProxyClients []string
 
-	// Маршрутизация по доменам
-	if len(cfg.CustomDomains) > 0 && primaryProxyTag != "direct" {
-		var domainRules []string
-		for _, d := range cfg.CustomDomains {
-			domainRules = append(domainRules, "domain:"+d)
+	for _, cp := range cfg.ClientPolicies {
+		if !cp.Enabled || cp.Target == "" {
+			continue
 		}
+		cidr := resolveTargetToCIDR(cp.Target)
+		if cidr == "" {
+			continue
+		}
+
+		switch cp.Mode {
+		case config.ClientModeDirect:
+			directClients = append(directClients, cidr)
+		case config.ClientModeFullProxy:
+			fullProxyClients = append(fullProxyClients, cidr)
+		}
+	}
+
+	if len(directClients) > 0 {
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
-			"domain":      domainRules,
-			"outboundTag": primaryProxyTag,
+			"inboundTag":  []string{"tproxy-in"},
+			"source":      directClients,
+			"outboundTag": "direct",
 		})
 	}
 
-	// Правила по готовым наборам правил
-	if len(cfg.RuleSets) > 0 && primaryProxyTag != "direct" {
-		var extDomains []string
+	if len(fullProxyClients) > 0 && primaryProxyTag != "direct" {
+		rule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"tproxy-in"},
+			"source":     fullProxyClients,
+		}
+		if len(balancers) > 0 {
+			rule["balancerTag"] = primaryProxyTag
+		} else {
+			rule["outboundTag"] = primaryProxyTag
+		}
+		rules = append(rules, rule)
+	}
+
+	// --- ПРИОРИТЕТ 2: Общие правила маршрутизации ---
+	if primaryProxyTag != "direct" {
+		// Подгрузка подсетей из .lst.gz архивов и кастомных списков
+		totalSubnets := append([]string(nil), cfg.CustomSubnets...)
+		for _, rs := range cfg.RuleSets {
+			subnets, err := b.rulesLoader.GetSubnets(rs)
+			if err == nil && len(subnets) > 0 {
+				totalSubnets = append(totalSubnets, subnets...)
+			}
+		}
+
+		if len(totalSubnets) > 0 {
+			rule := map[string]interface{}{
+				"type":       "field",
+				"inboundTag": []string{"tproxy-in"},
+				"ip":         totalSubnets,
+			}
+			if len(balancers) > 0 {
+				rule["balancerTag"] = primaryProxyTag
+			} else {
+				rule["outboundTag"] = primaryProxyTag
+			}
+			rules = append(rules, rule)
+		}
+
+		// Домены (кастомные + локальные файлы + наборы правил)
+		var totalDomains []string
+		for _, d := range cfg.CustomDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				totalDomains = append(totalDomains, "domain:"+d)
+			}
+		}
+
+		for _, filePath := range cfg.LocalListFiles {
+			if f, err := os.Open(filePath); err == nil {
+				sc := bufio.NewScanner(f)
+				for sc.Scan() {
+					l := strings.TrimSpace(sc.Text())
+					if l != "" && !strings.HasPrefix(l, "#") {
+						totalDomains = append(totalDomains, "domain:"+l)
+					}
+				}
+				f.Close()
+			}
+		}
+
 		for _, rs := range cfg.RuleSets {
 			switch rs {
 			case "youtube":
-				extDomains = append(extDomains, "domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com")
+				totalDomains = append(totalDomains, "domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com")
 			case "meta":
-				extDomains = append(extDomains, "domain:instagram.com", "domain:facebook.com", "domain:cdninstagram.com")
+				totalDomains = append(totalDomains, "domain:instagram.com", "domain:facebook.com", "domain:cdninstagram.com")
 			case "telegram":
-				extDomains = append(extDomains, "domain:t.me", "domain:telegram.org")
+				totalDomains = append(totalDomains, "domain:t.me", "domain:telegram.org")
 			case "discord":
-				extDomains = append(extDomains, "domain:discord.com", "domain:discord.gg", "domain:discordapp.com")
+				totalDomains = append(totalDomains, "domain:discord.com", "domain:discord.gg", "domain:discordapp.com")
 			case "twitter":
-				extDomains = append(extDomains, "domain:x.com", "domain:twitter.com", "domain:twimg.com")
+				totalDomains = append(totalDomains, "domain:x.com", "domain:twitter.com", "domain:twimg.com")
+			case "google_ai":
+				totalDomains = append(totalDomains, "domain:gemini.google.com", "domain:generativelanguage.googleapis.com")
+			case "russia_inside":
+				totalDomains = append(totalDomains, "geosite:category-ru")
 			}
 		}
-		if len(extDomains) > 0 {
-			rules = append(rules, map[string]interface{}{
-				"type":        "field",
-				"domain":      extDomains,
-				"outboundTag": primaryProxyTag,
-			})
+
+		if len(totalDomains) > 0 {
+			rule := map[string]interface{}{
+				"type":       "field",
+				"inboundTag": []string{"tproxy-in"},
+				"domain":     totalDomains,
+			}
+			if len(balancers) > 0 {
+				rule["balancerTag"] = primaryProxyTag
+			} else {
+				rule["outboundTag"] = primaryProxyTag
+			}
+			rules = append(rules, rule)
 		}
 	}
 
-	xrayConfig["routing"] = map[string]interface{}{
+	if cfg.MixedPort > 0 && primaryProxyTag != "direct" {
+		rule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"mixed-in"},
+		}
+		if len(balancers) > 0 {
+			rule["balancerTag"] = primaryProxyTag
+		} else {
+			rule["outboundTag"] = primaryProxyTag
+		}
+		rules = append(rules, rule)
+	}
+
+	routingObj := map[string]interface{}{
 		"domainStrategy": "IPIfNonMatch",
 		"rules":          rules,
 	}
+	if len(balancers) > 0 {
+		routingObj["balancers"] = balancers
+	}
+	xrayConfig["routing"] = routingObj
 
 	data, err := json.MarshalIndent(xrayConfig, "", "  ")
 	if err != nil {
@@ -255,7 +474,7 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 		}
 
 		if node.Security == "reality" {
-			realitySettings := map[string]interface{}{
+			streamSettings["realitySettings"] = map[string]interface{}{
 				"show":        false,
 				"fingerprint": node.Fingerprint,
 				"serverName":  node.SNI,
@@ -263,7 +482,6 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 				"shortId":     node.ShortID,
 				"spiderX":     "/",
 			}
-			streamSettings["realitySettings"] = realitySettings
 		} else if node.Security == "tls" {
 			streamSettings["tlsSettings"] = map[string]interface{}{
 				"serverName":    node.SNI,
@@ -340,6 +558,28 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 				"serverName":    node.SNI,
 				"allowInsecure": node.Insecure,
 			},
+			"sockopt": sockopt,
+		}
+
+	case "socks":
+		out["protocol"] = "socks"
+		serverObj := map[string]interface{}{
+			"address": node.Address,
+			"port":    node.Port,
+		}
+		if node.Username != "" {
+			serverObj["users"] = []map[string]interface{}{
+				{
+					"user":  node.Username,
+					"pass":  node.Password,
+					"level": 0,
+				},
+			}
+		}
+		out["settings"] = map[string]interface{}{
+			"servers": []map[string]interface{}{serverObj},
+		}
+		out["streamSettings"] = map[string]interface{}{
 			"sockopt": sockopt,
 		}
 

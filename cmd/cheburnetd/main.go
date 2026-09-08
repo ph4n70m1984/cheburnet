@@ -300,6 +300,7 @@ func runDaemon() {
 			_ = uciStorage.SaveEngine(name)
 			return app.switchEngine(daemonCtx, name)
 		},
+		app.rulesCron,
 	)
 	app.server = srv
 
@@ -387,13 +388,11 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// 1. Валидация целевого движка до любых действий
 	newEng, newTargetPath, err := a.getEngineByName(name)
 	if err != nil {
 		return err
 	}
 
-	// Если запрошен уже запущенный движок — пропускаем
 	if a.activeEng != nil && a.activeEng.Name() == newEng.Name() {
 		return nil
 	}
@@ -401,12 +400,10 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	oldEng := a.activeEng
 	cfg := a.state.Get()
 
-	// 2. Pre-flight check: собираем и проверяем конфиг ДО остановки текущего сервиса
 	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
 		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine kept running)", name, err)
 	}
 
-	// 3. Конфиг готов: останавливаем старый процесс
 	oldTargetPath := ""
 	if oldEng != nil {
 		if oldEng.Name() == "xray" {
@@ -417,11 +414,9 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		_ = oldEng.Stop()
 	}
 
-	// 4. Запускаем новый движок
 	if err := newEng.Start(ctx, newTargetPath); err != nil {
 		log.Printf("[ERROR] Failed to start new engine %s: %v. Initiating rollback...", name, err)
 
-		// 5. ROLLBACK: возвращаем старое ядро
 		if oldEng != nil && oldTargetPath != "" {
 			if rbErr := oldEng.Start(ctx, oldTargetPath); rbErr != nil {
 				log.Printf("[CRITICAL] Rollback failed! Both engines down: %v", rbErr)
@@ -433,7 +428,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		return fmt.Errorf("failed to start %s, rolled back: %w", name, err)
 	}
 
-	// 6. Фиксируем активный движок только после успешного старта
 	a.activeEng = newEng
 	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
 
@@ -512,57 +506,111 @@ func cliCheckEngine() {
 	fmt.Println(string(data))
 }
 
+func testDNSQuery(ctx context.Context, serverAddr string, isDoH bool) (bool, int64, string) {
+	start := time.Now()
+
+	if isDoH {
+		targetURL := serverAddr
+		if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+			targetURL = fmt.Sprintf("https://%s/dns-query", serverAddr)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL+"?name=google.com&type=A", nil)
+		if err != nil {
+			return false, 0, err.Error()
+		}
+		req.Header.Set("Accept", "application/dns-json")
+
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, 0, err.Error()
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return true, time.Since(start).Milliseconds(), ""
+		}
+		return false, 0, fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+
+	dialTarget := serverAddr
+	if !strings.Contains(dialTarget, ":") {
+		dialTarget += ":53"
+	}
+
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 2 * time.Second}
+			return d.DialContext(ctx, "udp", dialTarget)
+		},
+	}
+
+	ips, err := r.LookupHost(ctx, "google.com")
+	if err != nil || len(ips) == 0 {
+		errStr := "no addresses found"
+		if err != nil {
+			errStr = err.Error()
+		}
+		return false, 0, errStr
+	}
+
+	return true, time.Since(start).Milliseconds(), ""
+}
+
 func cliCheckDNS() {
 	uciStorage := config.NewUCIStorage()
 	cfg, err := uciStorage.Load()
 
-	upstreamServer := "8.8.8.8"
-	dnsInbound := "127.0.0.42"
+	dnsInbound := "127.0.0.42:53"
+	upstreamServer := "8.8.8.8:53"
+	protocol := "udp"
+	isDoH := false
 
 	if err == nil {
+		protocol = cfg.DNSProtocol
 		if cfg.DNSPort > 0 {
 			dnsInbound = fmt.Sprintf("127.0.0.42:%d", cfg.DNSPort)
 		}
 
-		// Выбираем IP для проверки в зависимости от протокола
-		if cfg.DNSProtocol == "doh" || cfg.DNSProtocol == "dot" || strings.HasPrefix(cfg.DNSServer, "https://") {
-			// Для зашифрованных протоколов nslookup на 53 порт апстрима бессмыслен,
-			// поэтому проверяем доступность bootstrap DNS, через который резолвится сам DoH/DoT адрес
-			if cfg.BootstrapDNS != "" {
-				upstreamServer = cfg.BootstrapDNS
+		if protocol == "doh" || strings.HasPrefix(cfg.DNSServer, "https://") {
+			isDoH = true
+			if cfg.DNSServer != "" {
+				upstreamServer = cfg.DNSServer
 			} else {
-				upstreamServer = "77.88.8.8"
+				upstreamServer = "https://1.1.1.1/dns-query"
 			}
-		} else if cfg.DNSServer != "" {
-			upstreamServer = cfg.DNSServer
+		} else {
+			server := cfg.DNSServer
+			if server == "" {
+				server = "8.8.8.8"
+			}
+			if !strings.Contains(server, ":") {
+				server += ":53"
+			}
+			upstreamServer = server
 		}
 	}
 
-	// 1. Проверка локального входящего DNS прокси (dns-in)
-	dnsInHost, dnsInPort, splitErr := net.SplitHostPort(dnsInbound)
-	var outLocal []byte
-	var errLocal error
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	if splitErr == nil && dnsInPort != "53" {
-		outLocal, errLocal = exec.Command("nslookup", "-port="+dnsInPort, "google.com", dnsInHost).CombinedOutput()
-	} else {
-		outLocal, errLocal = exec.Command("nslookup", "google.com", dnsInHost).CombinedOutput()
-	}
-	localOk := errLocal == nil && strings.Contains(string(outLocal), "Address")
-
-	// 2. Проверка сконфигурированного вышестоящего DNS
-	outUpstream, errUpstream := exec.Command("nslookup", "google.com", upstreamServer).CombinedOutput()
-	upstreamOk := errUpstream == nil && strings.Contains(string(outUpstream), "Address")
+	localOk, localRTT, localErr := testDNSQuery(ctx, dnsInbound, false)
+	upstreamOk, upstreamRTT, upstreamErr := testDNSQuery(ctx, upstreamServer, isDoH)
 
 	res := map[string]interface{}{
 		"local_inbound": map[string]interface{}{
 			"target":  dnsInbound,
 			"success": localOk,
+			"rtt_ms":  localRTT,
+			"error":   localErr,
 		},
 		"upstream_dns": map[string]interface{}{
 			"target":   upstreamServer,
-			"protocol": cfg.DNSProtocol,
+			"protocol": protocol,
 			"success":  upstreamOk,
+			"rtt_ms":   upstreamRTT,
+			"error":    upstreamErr,
 		},
 	}
 

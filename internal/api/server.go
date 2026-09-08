@@ -3,6 +3,7 @@ package api
 import (
 	"cheburnet/internal/config"
 	"cheburnet/internal/engine"
+	"cheburnet/internal/network"
 	"cheburnet/internal/subscription"
 	"cheburnet/internal/telemetry"
 	"cheburnet/internal/updater"
@@ -20,6 +21,7 @@ type Server struct {
 	updater    *updater.Manager
 	getEngine  func() engine.Engine
 	swapEngine func(name string) error
+	rulesCron  *network.RulesetCron
 }
 
 func NewServer(
@@ -29,6 +31,7 @@ func NewServer(
 	upd *updater.Manager,
 	getEngine func() engine.Engine,
 	swapEngine func(name string) error,
+	rulesCron *network.RulesetCron,
 ) *Server {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
@@ -48,6 +51,7 @@ func NewServer(
 		updater:    upd,
 		getEngine:  getEngine,
 		swapEngine: swapEngine,
+		rulesCron:  rulesCron,
 	}
 
 	s.setupRoutes()
@@ -66,9 +70,11 @@ func (s *Server) setupRoutes() {
 
 	// Ноды, подписки и источники
 	api.Get("/nodes", s.handleGetNodes)
+	api.Post("/nodes", s.handleAddNode)
 	api.Post("/nodes/add", s.handleAddNode)
-	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
+	api.Post("/source", s.handleAddSource)
 	api.Post("/sources/add", s.handleAddSource)
+	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
 
 	// WebSocket телеметрия
 	s.app.Use("/ws", func(c *fiber.Ctx) error {

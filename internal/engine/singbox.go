@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -28,6 +30,15 @@ func (s *SingBoxEngine) Name() string {
 
 func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string) error {
 	return s.builder.Build(cfg, targetPath)
+}
+
+func (s *SingBoxEngine) ValidateConfig(configPath string) error {
+	cmd := exec.Command("sing-box", "check", "-c", configPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sing-box check failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {

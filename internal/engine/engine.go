@@ -13,6 +13,7 @@ type UnifiedMetrics struct {
 type Engine interface {
 	Name() string
 	BuildConfig(cfg *config.CheburConfig, targetPath string) error
+	ValidateConfig(configPath string) error
 	Start(ctx context.Context, configPath string) error
 	Stop() error
 	CollectMetrics(ctx context.Context) (*UnifiedMetrics, error)
