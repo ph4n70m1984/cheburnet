@@ -25,6 +25,7 @@ return view.extend({
         statusSec.anonymous = true;
 
         statusSec.render = function() {
+            // Жёлтый интерактивный баннер обновлений
             const updateBanner = E('div', {
                 'id': 'update-notification-banner',
                 'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); color: #fef08a;'
@@ -33,7 +34,8 @@ return view.extend({
                 E('button', {
                     'class': 'btn cbi-button-action',
                     'style': 'font-size: 12px; margin: 0; padding: 4px 12px;',
-                    'click': function() {
+                    'click': function(e) {
+                        e.preventDefault();
                         ui.showIndicator('updating-system', _('Выполняется обновление компонентов...'));
                         fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
                             method: 'POST',
@@ -87,30 +89,34 @@ return view.extend({
                 table
             ]);
 
+            function showUpdateNotification(data) {
+                if (!data) return;
+                let alerts = [];
+                if (data.cheburnet && data.cheburnet.has_update) {
+                    alerts.push('Chebur.NET: ' + data.cheburnet.current + ' → ' + data.cheburnet.latest);
+                }
+                if (data.sing_box && data.sing_box.has_update) {
+                    alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
+                }
+                if (data.xray && data.xray.has_update) {
+                    alerts.push('Xray: ' + data.xray.current + ' → ' + data.xray.latest);
+                }
+                if (alerts.length > 0) {
+                    const banner = document.getElementById('update-notification-banner');
+                    const txt = document.getElementById('update-banner-text');
+                    if (banner && txt) {
+                        txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
+                        banner.style.display = 'flex';
+                    }
+                }
+            }
+
             function checkUpdates() {
                 const host = window.location.hostname;
                 fetch('http://' + host + ':8088/api/v1/updates/check')
                     .then(r => r.json())
                     .then(data => {
-                        if (!data) return;
-                        let alerts = [];
-                        if (data.cheburnet && data.cheburnet.has_update) {
-                            alerts.push('Chebur.NET: ' + data.cheburnet.current + ' → ' + data.cheburnet.latest);
-                        }
-                        if (data.sing_box && data.sing_box.has_update) {
-                            alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
-                        }
-                        if (data.xray && data.xray.has_update) {
-                            alerts.push('Xray: ' + data.xray.current + ' → ' + data.xray.latest);
-                        }
-                        if (!data.auto_update && alerts.length > 0) {
-                            const banner = document.getElementById('update-notification-banner');
-                            const txt = document.getElementById('update-banner-text');
-                            if (banner && txt) {
-                                txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
-                                banner.style.display = 'flex';
-                            }
-                        }
+                        showUpdateNotification(data);
                     })
                     .catch(() => {});
             }
@@ -216,6 +222,7 @@ return view.extend({
                     });
 
                 const ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
+                window.cheburWs = ws;
 
                 ws.onopen = function() {
                     const statusEl = document.getElementById('daemon-status');
@@ -228,9 +235,38 @@ return view.extend({
                 ws.onmessage = function(event) {
                     try {
                         const msg = JSON.parse(event.data);
-                        if (!msg.node_latencies) return;
-                        for (const [tag, latency] of Object.entries(msg.node_latencies)) {
-                            updateNodeUI(tag, latency);
+
+                        // Живые задержки серверов
+                        if (msg.node_latencies) {
+                            for (const [tag, latency] of Object.entries(msg.node_latencies)) {
+                                updateNodeUI(tag, latency);
+                            }
+                        }
+
+                        // Интерактивный ответ модуля обновлений
+                        if (msg.type === 'update_report' && msg.data) {
+                            const r = msg.data;
+                            showUpdateNotification(r);
+
+                            const statusDiv = document.getElementById('ws-update-status');
+                            const btnUpgrade = document.getElementById('ws-btn-upgrade');
+
+                            if (statusDiv) {
+                                let html = `<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">`;
+                                html += `<li>Chebur.NET: <b>${r.cheburnet.current}</b> → ${r.cheburnet.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.cheburnet.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
+                                html += `<li>Sing-box: <b>${r.sing_box.current}</b> → ${r.sing_box.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.sing_box.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
+                                html += `<li>Xray-core: <b>${r.xray.current}</b> → ${r.xray.has_update ? '<span style="color:#4ade80; font-weight:bold;">' + r.xray.latest + ' (Доступно обновление)</span>' : '<span style="color:#8c8c8c;">Актуально</span>'}</li>`;
+                                html += `</ul>`;
+                                statusDiv.innerHTML = html;
+                            }
+
+                            if (btnUpgrade) {
+                                if (r.cheburnet.has_update || r.sing_box.has_update || r.xray.has_update) {
+                                    btnUpgrade.style.display = 'inline-block';
+                                } else {
+                                    btnUpgrade.style.display = 'none';
+                                }
+                            }
                         }
                     } catch (e) {}
                 };
@@ -238,7 +274,7 @@ return view.extend({
                 ws.onerror = function() {
                     const statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
-                        statusEl.textContent = '● Ошибка';
+                        statusEl.textContent = '● Ошибка связи';
                         statusEl.style.color = '#f87171';
                     }
                 };
@@ -253,11 +289,35 @@ return view.extend({
                 };
 
                 setInterval(syncClashDelays, 3000);
-                setTimeout(checkUpdates, 1000);
+                setTimeout(checkUpdates, 1200);
             }
 
             setTimeout(initTelemetry, 250);
             return viewContainer;
+        };
+
+        // Функции обработчиков для WebSocket кнопок
+        window.cheburCheckUpdates = function(e) {
+            e.preventDefault();
+            const statusDiv = document.getElementById('ws-update-status');
+            if (statusDiv) statusDiv.innerHTML = '<span style="color:#fbbf24;">Запрос отправлен. Выполняется проверка GitHub и opkg...</span>';
+            if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
+                window.cheburWs.send(JSON.stringify({ action: 'check_updates' }));
+            } else {
+                if (statusDiv) statusDiv.innerHTML = '<span style="color:#f87171;">Ошибка: соединение с сервером не установлено.</span>';
+            }
+        };
+
+        window.cheburPerformUpgrade = function(e) {
+            e.preventDefault();
+            const statusDiv = document.getElementById('ws-update-status');
+            const btnUpgrade = document.getElementById('ws-btn-upgrade');
+            if (statusDiv) statusDiv.innerHTML = '<span style="color:#38bdf8;">Процесс обновления запущен в фоне. Демон перезапустится автоматически...</span>';
+            if (btnUpgrade) btnUpgrade.style.display = 'none';
+
+            if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
+                window.cheburWs.send(JSON.stringify({ action: 'perform_upgrade', target: 'all' }));
+            }
         };
 
         // ==========================================
@@ -276,7 +336,7 @@ return view.extend({
                 }, [
                     E('summary', {
                         'style': 'font-size: 15px; font-weight: bold; cursor: pointer; padding: 8px 10px; user-select: none; color: #38bdf8;'
-                    }, _('▶ Параметры маршрутизации и прокси (нажмите, чтобы развернуть)')),
+                    }, _('▶ Параметры маршрутизации, сети и обновлений (нажмите, чтобы развернуть)')),
                     contentNode
                 ]);
             });
@@ -285,6 +345,7 @@ return view.extend({
         s.tab('general', _('Прокси и ядро'));
         s.tab('routing_rules', _('Маршрутизация списков'));
         s.tab('dns_settings', _('Настройки DNS и сети'));
+        s.tab('updates', _('Менеджер обновлений'));
 
         // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
         let o = s.taboption('general', form.ListValue, 'engine', _('Движок ядра'));
@@ -296,9 +357,6 @@ return view.extend({
         o.value('rules', _('По спискам (Избирательный обход)'));
         o.value('global', _('Весь трафик (Полный туннель / Global VPN)'));
         o.default = 'rules';
-
-        o = s.taboption('general', form.Flag, 'auto_update', _('Автоматическое обновление'));
-        o.default = '0';
 
         o = s.taboption('general', form.ListValue, 'config_type', _('Тип конфигурации'));
         o.value('urltest', 'URLTest (Автовыбор по задержке)');
@@ -339,9 +397,7 @@ return view.extend({
         o.depends('auto_hwid', '0');
         o.placeholder = '00000000-0000-0000-0000-000000000000';
 
-        // ==========================================
-        // ТАБЛИЦА ПОДПИСОК (USER-AGENT, HWID, URL)
-        // ==========================================
+        // --- ТАБЛИЦА ПОДПИСОК ---
         const subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
@@ -379,9 +435,7 @@ return view.extend({
         o.rmempty = false;
         o.editable = true;
 
-        // ==========================================
-        // ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ (CLIENT POLICY)
-        // ==========================================
+        // --- ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ (CLIENT POLICY) ---
         const clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'),
             _('Индивидуальные правила маршрутизации для устройств локальной сети. Направляют трафик устройства мимо общих списков.'));
         clientSec.anonymous = true;
@@ -529,11 +583,29 @@ return view.extend({
         o = s.taboption('dns_settings', form.Flag, 'enable_yacd', _('Включить YACD'));
         o.default = '1';
 
+        // --- ВКЛАДКА 4: МЕНЕДЖЕР ОБНОВЛЕНИЙ ---
+        let o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
+        o_upd.rawhtml = true;
+        o_upd.default = `
+            <div style="margin-bottom:15px; padding:15px; border:1px solid rgba(255,255,255,0.15); border-radius:6px; background:rgba(0,0,0,0.25);">
+                <div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:#8c8c8c; font-size:13px;">
+                    Ожидание ручной проверки релизов...
+                </div>
+                <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                    <button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">Проверить наличие обновлений</button>
+                    <button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">Установить все обновления</button>
+                </div>
+            </div>
+        `;
+
+        o = s.taboption('updates', form.Flag, 'auto_update', _('Автоматическое обновление'));
+        o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
+        o.default = '0';
+
         return m.render();
     },
 
     handleSaveApply: function(ev, mode) {
-        const self = this;
         ui.showIndicator('saving-cheburnet', _('Сохранение конфигурации...'));
 
         return this.handleSave(ev).then(function() {

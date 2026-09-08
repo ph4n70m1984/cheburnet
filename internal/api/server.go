@@ -1,6 +1,11 @@
 package api
 
 import (
+	"context"
+	"log"
+	"os/exec"
+	"time"
+
 	"cheburnet/internal/config"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
@@ -76,7 +81,7 @@ func (s *Server) setupRoutes() {
 	api.Post("/sources/add", s.handleAddSource)
 	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
 
-	// WebSocket телеметрия
+	// WebSocket телеметрия и интерактивное управление
 	s.app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
@@ -89,8 +94,51 @@ func (s *Server) setupRoutes() {
 		defer s.hub.Unregister(c)
 
 		for {
-			if _, _, err := c.ReadMessage(); err != nil {
+			var msg struct {
+				Action string `json:"action"`
+				Target string `json:"target"`
+			}
+
+			if err := c.ReadJSON(&msg); err != nil {
 				break
+			}
+
+			switch msg.Action {
+			case "check_updates":
+				go func(conn *websocket.Conn) {
+					cfg := s.state.Get()
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer cancel()
+
+					report, err := s.updater.CheckUpdates(ctx, cfg.AutoUpdate)
+					if err == nil {
+						_ = conn.WriteJSON(map[string]interface{}{
+							"type": "update_report",
+							"data": report,
+						})
+					}
+				}(c)
+
+			case "perform_upgrade":
+				target := msg.Target
+				if target == "" {
+					target = "all"
+				}
+
+				go func(tgt string) {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+
+					if err := s.updater.PerformUpgrade(ctx, tgt); err != nil {
+						log.Printf("[ERROR] WebSocket triggered upgrade failed: %v", err)
+						return
+					}
+
+					if tgt == "cheburnet" || tgt == "all" {
+						time.Sleep(1 * time.Second)
+						_ = exec.Command("/etc/init.d/cheburnet", "restart").Run()
+					}
+				}(target)
 			}
 		}
 	}))

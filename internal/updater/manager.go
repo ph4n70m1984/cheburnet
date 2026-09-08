@@ -45,23 +45,22 @@ func NewManager(repo, currentVer string) *Manager {
 	}
 }
 
-// CheckUpdates опрашивает opkg для ядер и GitHub для Chebur.NET
 func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateReport, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 1. Проверяем opkg status / list-upgradable
 	sbStatus := m.checkOpkg("sing-box")
 	xrStatus := m.checkOpkg("xray-core")
 
-	// 2. Проверяем GitHub Releases для Chebur.NET
 	chStatus := ComponentStatus{
 		Current: m.currentVer,
 	}
 	latestTag, downloadURL, err := m.fetchLatestGitHubRelease(ctx)
 	if err == nil {
 		chStatus.Latest = latestTag
-		chStatus.HasUpdate = latestTag != "" && latestTag != m.currentVer
+		// Защита от дублей v1.0.0 vs 1.0.0
+		cleanCurrent := strings.TrimPrefix(m.currentVer, "v")
+		chStatus.HasUpdate = latestTag != "" && latestTag != cleanCurrent
 	}
 
 	report := &UpdateReport{
@@ -71,13 +70,12 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 		AutoUpdate: autoUpdate,
 	}
 
-	_ = downloadURL // используется при установке
+	_ = downloadURL
 	return report, nil
 }
 
 func (m *Manager) checkOpkg(pkgName string) ComponentStatus {
 	st := ComponentStatus{}
-
 	outStatus, err := exec.Command("opkg", "status", pkgName).Output()
 	if err == nil {
 		for _, line := range strings.Split(string(outStatus), "\n") {
@@ -100,7 +98,6 @@ func (m *Manager) checkOpkg(pkgName string) ComponentStatus {
 			}
 		}
 	}
-
 	return st
 }
 
@@ -134,36 +131,30 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (string, string,
 
 	var downloadURL string
 	for _, a := range rel.Assets {
-		if strings.Contains(a.Name, targetAssetName) || strings.Contains(a.Name, runtime.GOARCH) {
+		if strings.Contains(a.Name, targetAssetName) {
 			downloadURL = a.BrowserDownloadURL
 			break
 		}
 	}
-
 	return tag, downloadURL, nil
 }
 
-// UpgradeCores вызывает opkg update и opkg upgrade
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	if len(pkgs) == 0 {
 		pkgs = []string{"sing-box", "xray-core"}
 	}
-
 	log.Println("[INFO] Updating opkg repository indexes...")
 	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg update failed: %s", string(out))
 	}
-
 	args := append([]string{"upgrade"}, pkgs...)
 	log.Printf("[INFO] Running opkg %s...", strings.Join(args, " "))
 	if out, err := exec.CommandContext(ctx, "opkg", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg upgrade failed: %s", string(out))
 	}
-
 	return nil
 }
 
-// UpgradeSelf скачивает новый бинарник и атомарно заменяет текущий
 func (m *Manager) UpgradeSelf(ctx context.Context) error {
 	_, downloadURL, err := m.fetchLatestGitHubRelease(ctx)
 	if err != nil {
@@ -201,7 +192,6 @@ func (m *Manager) UpgradeSelf(ctx context.Context) error {
 	}
 	out.Close()
 
-	// Linux позволяет делать rename поверх запущенного бинарника
 	if err := os.Rename(tmpPath, currPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("replace binary: %w", err)
@@ -211,7 +201,6 @@ func (m *Manager) UpgradeSelf(ctx context.Context) error {
 	return nil
 }
 
-// PerformUpgrade диспетчер задач обновления
 func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	m.mu.Lock()
 	if m.isUpgrading {

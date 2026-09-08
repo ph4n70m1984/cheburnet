@@ -69,18 +69,19 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
         run: |
-          go build -ldflags="-s -w -X main.version=${{ steps.vars.outputs.version }}" \
+          go build -ldflags="-s -w -X main.CheburVersion=${{ steps.vars.outputs.version }}" \
                    -trimpath \
                    -o bin/cheburnetd ./cmd/cheburnetd
 
       - name: Compress binary with UPX
         if: ${{ matrix.use_upx }}
         run: |
-          echo "Размер до сжатия:"
-          ls -lh bin/cheburnetd
           upx --best --lzma bin/cheburnetd
-          echo "Размер после сжатия:"
-          ls -lh bin/cheburnetd
+
+      - name: Copy raw binary for Manager UpgradeSelf
+        run: |
+          mkdir -p dist
+          cp bin/cheburnetd dist/cheburnetd_linux_${{ matrix.goarch }}
 
       - name: Pack .ipk Package
         run: |
@@ -103,7 +104,7 @@ jobs:
 
           cat <<EOF > "$PKG_DIR/control/control"
           Package: luci-app-cheburnet
-          Version: ${{ steps.vars.outputs.version }}-1
+          Version: ${{ steps.vars.outputs.version }}
           Depends: sing-box, nftables, ip-full, ca-bundle
           Section: luci
           Architecture: ${{ matrix.opkg_arch }}
@@ -116,11 +117,10 @@ jobs:
           tar --numeric-owner --owner=0 --group=0 -czf "$PKG_DIR/data.tar.gz" -C "$PKG_DIR/data" .
           tar --numeric-owner --owner=0 --group=0 -czf "$PKG_DIR/control.tar.gz" -C "$PKG_DIR/control" .
 
-          IPK_NAME="luci-app-cheburnet_${{ steps.vars.outputs.version }}-1_${{ matrix.opkg_arch }}.ipk"
+          IPK_NAME="luci-app-cheburnet_${{ steps.vars.outputs.version }}_${{ matrix.opkg_arch }}.ipk"
           tar --numeric-owner --owner=0 --group=0 -czf "$IPK_NAME" \
               -C "$PKG_DIR" debian-binary control.tar.gz data.tar.gz
 
-          mkdir -p dist
           mv "$IPK_NAME" dist/
 
       - name: Pack .apk Package
@@ -142,7 +142,7 @@ jobs:
 
           cat <<EOF > "$APK_DIR/.PKGINFO"
           pkgname = luci-app-cheburnet
-          pkgver = ${{ steps.vars.outputs.version }}-r1
+          pkgver = ${{ steps.vars.outputs.version }}
           pkgdesc = Transparent proxy and routing daemon on top of sing-box/xray
           url = https://github.com/${{ github.repository }}
           builddate = $(date +%s)
@@ -154,7 +154,7 @@ jobs:
           depend = ip-full
           EOF
 
-          APK_NAME="luci-app-cheburnet-${{ steps.vars.outputs.version }}-r1.${{ matrix.apk_arch }}.apk"
+          APK_NAME="luci-app-cheburnet-${{ steps.vars.outputs.version }}.${{ matrix.apk_arch }}.apk"
           tar --numeric-owner --owner=0 --group=0 -czf "dist/$APK_NAME" -C "$APK_DIR" .
 
       - name: Upload Artifacts

@@ -5,18 +5,20 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"cheburnet/internal/config"
 )
 
-// SafeReload атомарно генерирует новый конфиг, валидирует его силами ядра и перезапускает процесс с автоматическим откатом
+// SafeReload атомарно генерирует новый конфиг, валидирует его силами ядра,
+// перезапускает процесс, проводит проверку здоровья и выполняет автоматический откат при сбое.
 func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targetPath string) error {
 	stagingPath := targetPath + ".new"
 	backupPath := targetPath + ".bak"
 
 	defer os.Remove(stagingPath)
 
-	// 1. Pre-flight: генерируем конфигурацию в staging-файл
+	// 1. Pre-flight: сборка конфигурации во временный файл
 	if err := eng.BuildConfig(cfg, stagingPath); err != nil {
 		return fmt.Errorf("build config failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
@@ -26,43 +28,57 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 		return fmt.Errorf("binary validation failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 
-	// 3. Бэкапим текущий рабочий конфиг (если он существует)
+	// 3. Резервная копия текущего рабочего файла (если он существует)
 	if _, err := os.Stat(targetPath); err == nil {
 		if err := copyFile(targetPath, backupPath); err != nil {
 			log.Printf("[engine-reload] warning: failed to create backup config: %v", err)
 		}
 	}
 
-	// 4. Атомарно активируем новый конфигурационный файл
+	// 4. Атомарная замена рабочего файла валидированным
 	if err := os.Rename(stagingPath, targetPath); err != nil {
 		return fmt.Errorf("failed to commit staging config: %w", err)
 	}
 
-	// 5. Останавливаем текущий процесс ядра
+	// 5. Остановка текущего процесса ядра
 	if err := eng.Stop(); err != nil {
 		log.Printf("[engine-reload] warning: stop returned error: %v", err)
 	}
 
-	// 6. Запускаем ядро с новым конфигом
+	// 6. Запуск обновленного ядра
 	if err := eng.Start(ctx, targetPath); err != nil {
-		log.Printf("[engine-reload] CRITICAL: %s failed to start after validation: %v. Triggering ROLLBACK...", eng.Name(), err)
-
-		// 7. ROLLBACK: возвращаем бэкап и поднимаем стабильную версию
-		if _, statErr := os.Stat(backupPath); statErr == nil {
-			_ = os.Rename(backupPath, targetPath)
-			if rbErr := eng.Start(ctx, targetPath); rbErr != nil {
-				log.Printf("[engine-reload] FATAL: rollback start failed: %v", rbErr)
-				return fmt.Errorf("engine start failed: %w; rollback also failed: %v", err, rbErr)
-			}
-			log.Printf("[engine-reload] Rollback successful: %s restored from backup config", eng.Name())
-		}
-
-		return fmt.Errorf("engine %s failed to start, rolled back to previous config: %w", eng.Name(), err)
+		return triggerRollback(ctx, eng, targetPath, backupPath, fmt.Errorf("engine start failed: %w", err))
 	}
 
-	// Успешный запуск — удаляем временный бэкап
+	// 7. Пост-старт верификация локальных портов (даем процессу 1 секунду на bind сокетов)
+	time.Sleep(1 * time.Second)
+
+	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	if err := VerifyEngineAlive(healthCtx, cfg); err != nil {
+		log.Printf("[engine-reload] CRITICAL: Engine %s started but health check failed: %v", eng.Name(), err)
+		return triggerRollback(ctx, eng, targetPath, backupPath, fmt.Errorf("health check failed: %w", err))
+	}
+
+	// Успешный запуск и прохождение проверки — очищаем бэкап
 	_ = os.Remove(backupPath)
 	return nil
+}
+
+func triggerRollback(ctx context.Context, eng Engine, targetPath, backupPath string, originalErr error) error {
+	log.Printf("[engine-reload] Initiating ROLLBACK due to: %v", originalErr)
+
+	if _, statErr := os.Stat(backupPath); statErr == nil {
+		_ = os.Rename(backupPath, targetPath)
+		if rbErr := eng.Start(ctx, targetPath); rbErr != nil {
+			log.Printf("[engine-reload] FATAL: rollback start failed: %v", rbErr)
+			return fmt.Errorf("%w; rollback also failed: %v", originalErr, rbErr)
+		}
+		log.Printf("[engine-reload] Rollback successful: %s restored from backup config", eng.Name())
+	}
+
+	return fmt.Errorf("rolled back to previous config: %w", originalErr)
 }
 
 func copyFile(src, dst string) error {

@@ -11,19 +11,19 @@ import (
 )
 
 type Hub struct {
-	clients map[*websocket.Conn]bool
-	mu      sync.Mutex
+	clients map[*websocket.Conn]*sync.Mutex
+	mu      sync.RWMutex
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients: make(map[*websocket.Conn]bool),
+		clients: make(map[*websocket.Conn]*sync.Mutex),
 	}
 }
 
 func (h *Hub) Register(c *websocket.Conn) {
 	h.mu.Lock()
-	h.clients[c] = true
+	h.clients[c] = &sync.Mutex{}
 	h.mu.Unlock()
 }
 
@@ -33,15 +33,43 @@ func (h *Hub) Unregister(c *websocket.Conn) {
 	h.mu.Unlock()
 }
 
+// SendJSON безопасно отправляет JSON конкретному клиенту, избегая concurrent write
+func (h *Hub) SendJSON(c *websocket.Conn, v interface{}) error {
+	h.mu.RLock()
+	writeMu, ok := h.clients[c]
+	h.mu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	return c.WriteJSON(v)
+}
+
+// BroadcastJSON рассылает телеметрию всем подключённым сессиям
 func (h *Hub) BroadcastJSON(v interface{}) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for client := range h.clients {
-		_ = client.WriteJSON(v)
+	h.mu.RLock()
+	activeClients := make(map[*websocket.Conn]*sync.Mutex, len(h.clients))
+	for client, writeMu := range h.clients {
+		activeClients[client] = writeMu
+	}
+	h.mu.RUnlock()
+
+	for client, writeMu := range activeClients {
+		go func(c *websocket.Conn, mu *sync.Mutex) {
+			mu.Lock()
+			defer mu.Unlock()
+			if err := c.WriteJSON(v); err != nil {
+				h.Unregister(c)
+			}
+		}(client, writeMu)
 	}
 }
 
-func (h *Hub) Run(ctx context.Context, eng engine.Engine) {
+// Run динамически опрашивает метрики активного ядра каждые 3 секунды
+func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -52,11 +80,16 @@ func (h *Hub) Run(ctx context.Context, eng engine.Engine) {
 		case <-ticker.C:
 			latencies := make(map[string]int64)
 
-			// Опрашиваем метрики через активное ядро (sing-box или xray)
-			if eng != nil {
-				metrics, err := eng.CollectMetrics(ctx)
-				if err == nil && metrics != nil && metrics.NodeLatencies != nil {
-					latencies = metrics.NodeLatencies
+			if getEngine != nil {
+				currentEng := getEngine()
+				if currentEng != nil {
+					queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+					metrics, err := currentEng.CollectMetrics(queryCtx)
+					cancel()
+
+					if err == nil && metrics != nil && metrics.NodeLatencies != nil {
+						latencies = metrics.NodeLatencies
+					}
 				}
 			}
 

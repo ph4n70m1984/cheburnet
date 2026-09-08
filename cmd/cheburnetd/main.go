@@ -27,7 +27,7 @@ import (
 	"cheburnet/pkg/uri"
 )
 
-const (
+var (
 	CheburVersion            = "1.0.0-dual"
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
 	RuntimeConfigPathXray    = "/tmp/run/cheburnet/xray.json"
@@ -54,7 +54,9 @@ func showHelp() {
 		"    stop                    Stop cheburnet background daemon\n" +
 		"    restart                 Restart daemon service\n" +
 		"    reload                  Reload configuration without dropping routing\n" +
-		"    list_update             Update subscriptions and rulesets\n\n" +
+		"    list_update             Update subscriptions and rulesets\n" +
+		"    check_updates           Check component and daemon updates\n" +
+		"    upgrade [target]        Run upgrade (target: all | cheburnet | cores | sing-box | xray)\n\n" +
 		"Diagnostics & Network:\n" +
 		"    check_proxy             Check proxy connectivity through mixed port\n" +
 		"    check_nft               Check NFT rules presence\n" +
@@ -97,6 +99,17 @@ func main() {
 
 	case "list_update":
 		callAPI(http.MethodPost, "/api/v1/subscriptions/update", nil)
+
+	case "check_updates":
+		callAPI(http.MethodGet, "/api/v1/updates/check", nil)
+
+	case "upgrade":
+		target := "all"
+		if len(os.Args) >= 3 {
+			target = os.Args[2]
+		}
+		body := fmt.Sprintf(`{"target":"%s"}`, target)
+		callAPI(http.MethodPost, "/api/v1/updates/upgrade", strings.NewReader(body))
 
 	case "switch_engine":
 		if len(os.Args) < 3 {
@@ -241,7 +254,8 @@ func runDaemon() {
 	xrEngine := engine.NewXrayEngine()
 	hub := telemetry.NewHub()
 
-	updManager := updater.NewManager("cheburnet/cheburnet", CheburVersion)
+	// Привязка к репозиторию проекта
+	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
 
 	app := &App{
 		state:       state,
@@ -288,7 +302,7 @@ func runDaemon() {
 	)
 	app.rulesCron.Start(daemonCtx)
 
-	go hub.Run(daemonCtx, app.getCurrentEngine())
+	go hub.Run(daemonCtx, app.getCurrentEngine)
 
 	srv := api.NewServer(
 		state,
@@ -309,6 +323,9 @@ func runDaemon() {
 			log.Printf("[INFO] API Server stopped: %v", err)
 		}
 	}()
+
+	// Запуск фонового супервизора ядра
+	go app.supervisorLoop(daemonCtx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -434,8 +451,65 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	return nil
 }
 
+func (a *App) supervisorLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	consecutiveFailures := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.mu.Lock()
+			eng := a.activeEng
+			cfg := a.state.Get()
+			a.mu.Unlock()
+
+			if eng == nil {
+				continue
+			}
+
+			healthCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := engine.VerifyEngineAlive(healthCtx, &cfg)
+			cancel()
+
+			if err != nil {
+				consecutiveFailures++
+				log.Printf("[supervisor] Warning: Engine %s health check failed (%d/3): %v", eng.Name(), consecutiveFailures, err)
+
+				if consecutiveFailures >= 3 {
+					log.Printf("[supervisor] CRITICAL: Engine %s failed 3 consecutive health checks. Restarting process...", eng.Name())
+
+					a.mu.Lock()
+					_ = eng.Stop()
+					targetPath := RuntimeConfigPathSingBox
+					if eng.Name() == "xray" {
+						targetPath = RuntimeConfigPathXray
+					}
+
+					if startErr := eng.Start(ctx, targetPath); startErr != nil {
+						log.Printf("[supervisor] ERROR: Engine restart failed: %v", startErr)
+					} else {
+						log.Printf("[supervisor] INFO: Engine %s successfully revived", eng.Name())
+					}
+					a.mu.Unlock()
+
+					consecutiveFailures = 0
+				}
+			} else {
+				if consecutiveFailures > 0 {
+					log.Printf("[supervisor] INFO: Engine %s healthy again", eng.Name())
+				}
+				consecutiveFailures = 0
+			}
+		}
+	}
+}
+
 func callAPI(method, endpoint string, body io.Reader) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest(method, "http://"+DefaultAPIBind+endpoint, body)
 	if err != nil {
 		fmt.Printf("Error creating request: %v\n", err)
