@@ -51,10 +51,12 @@ type BalancingGroup struct {
 }
 
 type SubscriptionConfig struct {
-	URL       string `json:"url"`
-	UserAgent string `json:"user_agent"`
-	HWID      string `json:"hwid,omitempty"`
-	Enabled   bool   `json:"enabled"`
+	Name         string   `json:"name"`
+	URL          string   `json:"url"`
+	UserAgent    string   `json:"user_agent"`
+	HWID         string   `json:"hwid,omitempty"`
+	Enabled      bool     `json:"enabled"`
+	ExcludeRegex []string `json:"exclude_regex,omitempty"` // Фильтрация нод по регулярным выражениям
 }
 
 type CheburConfig struct {

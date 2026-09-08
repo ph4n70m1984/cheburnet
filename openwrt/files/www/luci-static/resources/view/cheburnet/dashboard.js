@@ -410,16 +410,45 @@ return view.extend({
         o.depends('auto_hwid', '0');
         o.placeholder = '00000000-0000-0000-0000-000000000000';
 
-        // --- ТАБЛИЦА ПОДПИСОК ---
+        // --- ТАБЛИЦА ПОДПИСОК (CBI GridSection с поддержкой модального окна) ---
         const subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
         subSec.sortable = true;
 
+        // 1. Поля, отображаемые в строке таблицы
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
         o.rmempty = false;
         o.editable = true;
+
+        o = subSec.option(form.Value, 'name', _('Наименование провайдера'));
+        o.placeholder = _('Например: EcoBuy / Мой VPN');
+        o.datatype = 'string';
+        o.rmempty = false;
+        o.editable = true;
+        o.renderWidget = function(/* ... */) {
+            const node = form.Value.prototype.renderWidget.apply(this, arguments);
+            const input = node.querySelector('input');
+            if (input) {
+                input.style.maxWidth = '260px';
+                input.style.width = '100%';
+            }
+            return node;
+        };
+
+        // 2. Поля, доступные только во всплывающем модальном окне при нажатии "Редактировать"
+        o = subSec.option(form.Value, 'url', _('URL подписки'));
+        o.placeholder = 'https://sub.domain.com/token';
+        o.rmempty = false;
+        o.modalonly = true;
+
+        o = subSec.option(form.DynamicList, 'exclude_regex', _('Исключить по регулярному выражению'));
+        o.description = _('Скрыть серверы, чьи имена соответствуют выражению. Если пусто — выводятся все.');
+        o.placeholder = _('Например: LTE|Белые списки');
+        o.datatype = 'string';
+        o.rmempty = true;
+        o.modalonly = true;
 
         o = subSec.option(form.Value, 'user_agent', _('User-Agent'));
         o.placeholder = 'Выберите из списка или введите свой';
@@ -436,17 +465,12 @@ return view.extend({
         o.value('NekoBox/1.2.9', 'NekoBox');
         o.default = 'Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)';
         o.rmempty = false;
-        o.editable = true;
+        o.modalonly = true;
 
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
         o.placeholder = 'Оставьте пустым, если не нужен';
         o.rmempty = true;
-        o.editable = true;
-
-        o = subSec.option(form.Value, 'url', _('URL подписки'));
-        o.placeholder = 'https://sub.domain.com/token';
-        o.rmempty = false;
-        o.editable = true;
+        o.modalonly = true;
 
         // --- ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ (CLIENT POLICY) ---
         const clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'),

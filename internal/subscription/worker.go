@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -70,16 +72,62 @@ type ClashConfig struct {
 	} `yaml:"proxies"`
 }
 
+type xrayProfileItem struct {
+	Remarks   string             `json:"remarks"`
+	Outbounds []xrayOutboundItem `json:"outbounds"`
+}
+
+type xrayOutboundItem struct {
+	Tag            string                 `json:"tag"`
+	Protocol       string                 `json:"protocol"`
+	Settings       map[string]interface{} `json:"settings"`
+	StreamSettings map[string]interface{} `json:"streamSettings"`
+}
+
+func filterNodesByRegex(nodes []*config.GenericNode, patterns []string) []*config.GenericNode {
+	if len(patterns) == 0 {
+		return nodes
+	}
+
+	var compiled []*regexp.Regexp
+	for _, p := range patterns {
+		p = strings.TrimSpace(strings.Trim(p, "'\""))
+		if p == "" {
+			continue
+		}
+		if re, err := regexp.Compile("(?i)" + p); err == nil {
+			compiled = append(compiled, re)
+		}
+	}
+
+	if len(compiled) == 0 {
+		return nodes
+	}
+
+	filtered := make([]*config.GenericNode, 0, len(nodes))
+	for _, node := range nodes {
+		exclude := false
+		for _, re := range compiled {
+			if re.MatchString(node.Tag) {
+				exclude = true
+				break
+			}
+		}
+		if !exclude {
+			filtered = append(filtered, node)
+		}
+	}
+	return filtered
+}
+
 func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) ([]*config.GenericNode, error) {
 	reqURL := strings.TrimSpace(sub.URL)
 
-	// Приоритет: 1) HWID конкретной подписки -> 2) глобальный авто HWID
 	targetHWID := strings.TrimSpace(sub.HWID)
 	if targetHWID == "" && w.autoHWID {
 		targetHWID = w.getOrGenerateHWID()
 	}
 
-	// Изолируем контекст запроса от верхнего ctx
 	reqCtx, reqCancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer reqCancel()
 
@@ -95,13 +143,14 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "keep-alive")
 
-	// Передаем точный заголовок, аналогично рабочему curl
 	if targetHWID != "" {
 		req.Header.Set("x-hwid", targetHWID)
+		req.Header.Set("hwid", targetHWID)
+		req.Header.Set("X-HWID", targetHWID)
 	}
 
-	// Резолвер напрямую через публичный DNS во избежание проблем с локальным 53 портом
 	dialer := &net.Dialer{
 		Timeout:   6 * time.Second,
 		KeepAlive: 0,
@@ -141,72 +190,198 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return nil, err
 	}
 
-	content := string(body)
 	var nodes []*config.GenericNode
 
-	// 1. Попытка распарсить как Clash YAML
-	var clashCfg ClashConfig
-	if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
-		for _, p := range clashCfg.Proxies {
-			if strings.Contains(p.Name, "не поддерживается") || strings.Contains(p.Name, "not supported") {
-				continue
+	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)
+	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex); len(xrayNodes) > 0 {
+		nodes = xrayNodes
+	} else {
+		// 2. Попытка распарсить как Clash YAML
+		var clashCfg ClashConfig
+		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
+			for _, p := range clashCfg.Proxies {
+				if strings.Contains(p.Name, "не поддерживается") || strings.Contains(p.Name, "not supported") {
+					continue
+				}
+
+				sec := "none"
+				if p.TLS {
+					sec = "tls"
+				}
+				if p.RealityOpts.PublicKey != "" {
+					sec = "reality"
+				}
+
+				node := &config.GenericNode{
+					Tag:         p.Name,
+					Address:     p.Server,
+					Port:        p.Port,
+					Protocol:    p.Type,
+					UUID:        p.UUID,
+					Flow:        p.Flow,
+					Network:     p.Network,
+					Security:    sec,
+					SNI:         p.Servername,
+					Fingerprint: p.ClientFingerprint,
+					PublicKey:   p.RealityOpts.PublicKey,
+					ShortID:     p.RealityOpts.ShortID,
+					HWID:        targetHWID,
+				}
+				nodes = append(nodes, node)
+			}
+		} else {
+			// 3. Base64
+			content := string(body)
+			trimmed := strings.TrimSpace(content)
+
+			if !strings.Contains(trimmed, "://") {
+				if dec, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
+					content = string(dec)
+				} else if decURL, err := base64.RawURLEncoding.DecodeString(trimmed); err == nil {
+					content = string(decURL)
+				} else if decRaw, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
+					content = string(decRaw)
+				}
 			}
 
-			sec := "none"
-			if p.TLS {
-				sec = "tls"
+			// 4. Plaintext построчно
+			scanner := bufio.NewScanner(strings.NewReader(content))
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "не поддерживается") {
+					continue
+				}
+
+				node, err := uri.ParseNodeURI(line, w.autoHWID, targetHWID)
+				if err == nil && node != nil {
+					nodes = append(nodes, node)
+				}
 			}
-			if p.RealityOpts.PublicKey != "" {
-				sec = "reality"
-			}
-
-			node := &config.GenericNode{
-				Tag:         p.Name,
-				Address:     p.Server,
-				Port:        p.Port,
-				Protocol:    p.Type,
-				UUID:        p.UUID,
-				Flow:        p.Flow,
-				Network:     p.Network,
-				Security:    sec,
-				SNI:         p.Servername,
-				Fingerprint: p.ClientFingerprint,
-				PublicKey:   p.RealityOpts.PublicKey,
-				ShortID:     p.RealityOpts.ShortID,
-				HWID:        targetHWID,
-			}
-			nodes = append(nodes, node)
 		}
 
-		if len(nodes) > 0 {
-			return nodes, nil
-		}
-	}
-
-	// 2. Base64
-	if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(content)); err == nil {
-		content = string(dec)
-	} else if decURL, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(content)); err == nil {
-		content = string(decURL)
-	}
-
-	// 3. Plaintext построчно
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "не поддерживается") {
-			continue
-		}
-
-		node, err := uri.ParseNodeURI(line, w.autoHWID, targetHWID)
-		if err == nil {
-			nodes = append(nodes, node)
-		}
+		// Дополнительная фильтрация нод по регулярным выражениям для форматов Clash/Plaintext
+		nodes = filterNodesByRegex(nodes, sub.ExcludeRegex)
 	}
 
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("панель не вернула рабочих серверов")
+		return nil, fmt.Errorf("панель не вернула серверов либо все были отфильтрованы правилом exclude_regex")
 	}
 
 	return nodes, nil
+}
+
+func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string) []*config.GenericNode {
+	var profiles []xrayProfileItem
+	if err := json.Unmarshal(data, &profiles); err != nil {
+		var single xrayProfileItem
+		if errSingle := json.Unmarshal(data, &single); errSingle == nil {
+			profiles = append(profiles, single)
+		} else {
+			return nil
+		}
+	}
+
+	var compiled []*regexp.Regexp
+	for _, p := range excludeRegexes {
+		p = strings.TrimSpace(strings.Trim(p, "'\""))
+		if p == "" {
+			continue
+		}
+		if re, err := regexp.Compile("(?i)" + p); err == nil {
+			compiled = append(compiled, re)
+		}
+	}
+
+	var nodes []*config.GenericNode
+	seenTags := make(map[string]bool)
+
+	for _, prof := range profiles {
+		baseRemarks := strings.TrimSpace(prof.Remarks)
+
+		for _, ob := range prof.Outbounds {
+			if ob.Protocol != "vless" && ob.Protocol != "hysteria2" && ob.Protocol != "shadowsocks" && ob.Protocol != "trojan" {
+				continue
+			}
+
+			tag := ob.Tag
+			if baseRemarks != "" && !strings.Contains(baseRemarks, "Автовыбор") {
+				tag = fmt.Sprintf("%s (%s)", baseRemarks, ob.Tag)
+			}
+			if seenTags[tag] {
+				tag = fmt.Sprintf("%s-%s", tag, ob.Tag)
+			}
+
+			// Проверка совпадений с регулярными выражениями (по Tag, по Remarks группы и по исходному тегу аутбаунда)
+			excluded := false
+			for _, re := range compiled {
+				if re.MatchString(tag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+
+			seenTags[tag] = true
+
+			node := &config.GenericNode{
+				Tag:      tag,
+				Protocol: ob.Protocol,
+				HWID:     targetHWID,
+			}
+
+			if ob.Protocol == "vless" {
+				if vnext, ok := ob.Settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+					if firstTarget, ok := vnext[0].(map[string]interface{}); ok {
+						if addr, ok := firstTarget["address"].(string); ok {
+							node.Address = addr
+						}
+						if port, ok := firstTarget["port"].(float64); ok {
+							node.Port = int(port)
+						}
+						if users, ok := firstTarget["users"].([]interface{}); ok && len(users) > 0 {
+							if u, ok := users[0].(map[string]interface{}); ok {
+								if id, ok := u["id"].(string); ok {
+									node.UUID = id
+								}
+								if flow, ok := u["flow"].(string); ok {
+									node.Flow = flow
+								}
+							}
+						}
+					}
+				}
+
+				if ss := ob.StreamSettings; ss != nil {
+					if netType, ok := ss["network"].(string); ok {
+						node.Network = netType
+					}
+					if sec, ok := ss["security"].(string); ok {
+						node.Security = sec
+					}
+					if reality, ok := ss["realitySettings"].(map[string]interface{}); ok {
+						if sni, ok := reality["serverName"].(string); ok {
+							node.SNI = sni
+						}
+						if pbk, ok := reality["publicKey"].(string); ok {
+							node.PublicKey = pbk
+						}
+						if sid, ok := reality["shortId"].(string); ok {
+							node.ShortID = sid
+						}
+						if fp, ok := reality["fingerprint"].(string); ok {
+							node.Fingerprint = fp
+						}
+					}
+				}
+			}
+
+			if node.Address != "" && node.Port > 0 {
+				nodes = append(nodes, node)
+			}
+		}
+	}
+
+	return nodes
 }

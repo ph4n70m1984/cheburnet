@@ -156,7 +156,15 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 			}
 		}
 
-		switch keyParts[2] {
+		// Очищаем ключ от индекса списка (например: exclude_regex[0] -> exclude_regex)
+		propName := keyParts[2]
+		if idx := strings.Index(propName, "["); idx != -1 {
+			propName = propName[:idx]
+		}
+
+		switch propName {
+		case "name":
+			secMap[secID].Name = val
 		case "url":
 			secMap[secID].URL = val
 		case "user_agent":
@@ -165,6 +173,20 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 			secMap[secID].HWID = val
 		case "enabled":
 			secMap[secID].Enabled = (val == "1" || val == "true")
+		case "exclude_regex":
+			// Обработка как одиночного значения, так и склеенных списков вида 'val1' 'val2'
+			rawRight := parts[1]
+			if strings.Contains(rawRight, "'") {
+				tokens := strings.Split(rawRight, "'")
+				for _, token := range tokens {
+					item := strings.TrimSpace(token)
+					if item != "" && item != "\"" {
+						secMap[secID].ExcludeRegex = append(secMap[secID].ExcludeRegex, item)
+					}
+				}
+			} else if val != "" {
+				secMap[secID].ExcludeRegex = append(secMap[secID].ExcludeRegex, val)
+			}
 		}
 	}
 
@@ -281,12 +303,22 @@ func (u *UCIStorage) AddSubscription(sub SubscriptionConfig) error {
 		ua = "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)"
 	}
 
+	if sub.Name != "" {
+		_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.name=%s", secID, sub.Name)).Run()
+	}
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.url=%s", secID, sub.URL)).Run()
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.user_agent=%s", secID, ua)).Run()
 	if sub.HWID != "" {
 		_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.hwid=%s", secID, sub.HWID)).Run()
 	}
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.enabled=1", secID)).Run()
+
+	for _, reg := range sub.ExcludeRegex {
+		reg = strings.TrimSpace(reg)
+		if reg != "" {
+			_ = exec.Command("uci", "add_list", fmt.Sprintf("cheburnet.%s.exclude_regex=%s", secID, reg)).Run()
+		}
+	}
 
 	return exec.Command("uci", "commit", "cheburnet").Run()
 }
