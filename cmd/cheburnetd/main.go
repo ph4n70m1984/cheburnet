@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -338,6 +339,17 @@ func (a *App) getCurrentEngine() engine.Engine {
 	return a.activeEng
 }
 
+func (a *App) getEngineByName(name string) (engine.Engine, string, error) {
+	switch name {
+	case "xray":
+		return a.xrayEng, RuntimeConfigPathXray, nil
+	case "sing-box":
+		return a.singboxEng, RuntimeConfigPathSingBox, nil
+	default:
+		return nil, "", fmt.Errorf("unknown engine %s", name)
+	}
+}
+
 func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -348,12 +360,7 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	if err := a.activeEng.BuildConfig(&cfg, targetPath); err != nil {
-		return fmt.Errorf("rebuild config: %w", err)
-	}
-
-	_ = a.activeEng.Stop()
-	return a.activeEng.Start(ctx, targetPath)
+	return engine.SafeReload(ctx, a.activeEng, &cfg, targetPath)
 }
 
 func (a *App) startActiveEngine(ctx context.Context) error {
@@ -380,18 +387,57 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.stopActiveEngine()
-
-	switch name {
-	case "xray":
-		a.activeEng = a.xrayEng
-	case "sing-box":
-		a.activeEng = a.singboxEng
-	default:
-		return fmt.Errorf("unknown engine %s", name)
+	// 1. Валидация целевого движка до любых действий
+	newEng, newTargetPath, err := a.getEngineByName(name)
+	if err != nil {
+		return err
 	}
 
-	return a.startActiveEngine(ctx)
+	// Если запрошен уже запущенный движок — пропускаем
+	if a.activeEng != nil && a.activeEng.Name() == newEng.Name() {
+		return nil
+	}
+
+	oldEng := a.activeEng
+	cfg := a.state.Get()
+
+	// 2. Pre-flight check: собираем и проверяем конфиг ДО остановки текущего сервиса
+	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
+		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine kept running)", name, err)
+	}
+
+	// 3. Конфиг готов: останавливаем старый процесс
+	oldTargetPath := ""
+	if oldEng != nil {
+		if oldEng.Name() == "xray" {
+			oldTargetPath = RuntimeConfigPathXray
+		} else {
+			oldTargetPath = RuntimeConfigPathSingBox
+		}
+		_ = oldEng.Stop()
+	}
+
+	// 4. Запускаем новый движок
+	if err := newEng.Start(ctx, newTargetPath); err != nil {
+		log.Printf("[ERROR] Failed to start new engine %s: %v. Initiating rollback...", name, err)
+
+		// 5. ROLLBACK: возвращаем старое ядро
+		if oldEng != nil && oldTargetPath != "" {
+			if rbErr := oldEng.Start(ctx, oldTargetPath); rbErr != nil {
+				log.Printf("[CRITICAL] Rollback failed! Both engines down: %v", rbErr)
+				return fmt.Errorf("switch failed: %w; rollback failed: %v", err, rbErr)
+			}
+			log.Printf("[INFO] Rollback successful: restored previous engine %s", oldEng.Name())
+		}
+
+		return fmt.Errorf("failed to start %s, rolled back: %w", name, err)
+	}
+
+	// 6. Фиксируем активный движок только после успешного старта
+	a.activeEng = newEng
+	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
+
+	return nil
 }
 
 func callAPI(method, endpoint string, body io.Reader) {
@@ -467,16 +513,59 @@ func cliCheckEngine() {
 }
 
 func cliCheckDNS() {
-	outLocal, errLocal := exec.Command("nslookup", "google.com", "127.0.0.42").CombinedOutput()
+	uciStorage := config.NewUCIStorage()
+	cfg, err := uciStorage.Load()
+
+	upstreamServer := "8.8.8.8"
+	dnsInbound := "127.0.0.42"
+
+	if err == nil {
+		if cfg.DNSPort > 0 {
+			dnsInbound = fmt.Sprintf("127.0.0.42:%d", cfg.DNSPort)
+		}
+
+		// Выбираем IP для проверки в зависимости от протокола
+		if cfg.DNSProtocol == "doh" || cfg.DNSProtocol == "dot" || strings.HasPrefix(cfg.DNSServer, "https://") {
+			// Для зашифрованных протоколов nslookup на 53 порт апстрима бессмыслен,
+			// поэтому проверяем доступность bootstrap DNS, через который резолвится сам DoH/DoT адрес
+			if cfg.BootstrapDNS != "" {
+				upstreamServer = cfg.BootstrapDNS
+			} else {
+				upstreamServer = "77.88.8.8"
+			}
+		} else if cfg.DNSServer != "" {
+			upstreamServer = cfg.DNSServer
+		}
+	}
+
+	// 1. Проверка локального входящего DNS прокси (dns-in)
+	dnsInHost, dnsInPort, splitErr := net.SplitHostPort(dnsInbound)
+	var outLocal []byte
+	var errLocal error
+
+	if splitErr == nil && dnsInPort != "53" {
+		outLocal, errLocal = exec.Command("nslookup", "-port="+dnsInPort, "google.com", dnsInHost).CombinedOutput()
+	} else {
+		outLocal, errLocal = exec.Command("nslookup", "google.com", dnsInHost).CombinedOutput()
+	}
 	localOk := errLocal == nil && strings.Contains(string(outLocal), "Address")
 
-	outUpstream, errUpstream := exec.Command("nslookup", "google.com", "8.8.8.8").CombinedOutput()
+	// 2. Проверка сконфигурированного вышестоящего DNS
+	outUpstream, errUpstream := exec.Command("nslookup", "google.com", upstreamServer).CombinedOutput()
 	upstreamOk := errUpstream == nil && strings.Contains(string(outUpstream), "Address")
 
-	res := map[string]bool{
-		"local_inbound_127.0.0.42_ok": localOk,
-		"upstream_8.8.8.8_ok":         upstreamOk,
+	res := map[string]interface{}{
+		"local_inbound": map[string]interface{}{
+			"target":  dnsInbound,
+			"success": localOk,
+		},
+		"upstream_dns": map[string]interface{}{
+			"target":   upstreamServer,
+			"protocol": cfg.DNSProtocol,
+			"success":  upstreamOk,
+		},
 	}
+
 	data, _ := json.MarshalIndent(res, "", "  ")
 	fmt.Println(string(data))
 }

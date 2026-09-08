@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/engine"
 	"cheburnet/pkg/uri"
 
 	"github.com/gofiber/fiber/v2"
@@ -126,16 +127,19 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 	s.state.UpdateNodes(allNodes)
 	cfg.Nodes = allNodes
 
-	// Пересобираем и перезапускаем sing-box / xray
+	// Безопасный перезапуск sing-box / xray через SafeReload
 	eng := s.getEngine()
 	targetPath := "/tmp/run/cheburnet/sing-box.json"
 	if eng.Name() == "xray" {
 		targetPath = "/tmp/run/cheburnet/xray.json"
 	}
 
-	_ = eng.BuildConfig(&cfg, targetPath)
-	_ = eng.Stop()
-	_ = eng.Start(c.Context(), targetPath)
+	if err := engine.SafeReload(c.Context(), eng, &cfg, targetPath); err != nil {
+		log.Printf("[api] update subscriptions reload error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to safely apply updated subscriptions: " + err.Error(),
+		})
+	}
 
 	return c.JSON(fiber.Map{
 		"status":         "ok",
@@ -222,12 +226,9 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		targetPath = "/tmp/run/cheburnet/xray.json"
 	}
 
-	if err := eng.BuildConfig(&currentCfg, targetPath); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to rebuild engine config: " + err.Error()})
+	if err := engine.SafeReload(c.Context(), eng, &currentCfg, targetPath); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to safely reload engine with new source: " + err.Error()})
 	}
-
-	_ = eng.Stop()
-	_ = eng.Start(c.Context(), targetPath)
 
 	return c.JSON(fiber.Map{
 		"status":      "ok",
@@ -280,19 +281,14 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		targetPath = "/tmp/run/cheburnet/xray.json"
 	}
 
-	if err := eng.BuildConfig(newCfg, targetPath); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to rebuild engine config: " + err.Error(),
-		})
-	}
-
-	_ = eng.Stop()
 	if len(newCfg.Nodes) > 0 {
-		if err := eng.Start(c.Context(), targetPath); err != nil {
+		if err := engine.SafeReload(c.Context(), eng, newCfg, targetPath); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to restart engine: " + err.Error(),
+				"error": "Failed to safely reload engine: " + err.Error(),
 			})
 		}
+	} else {
+		_ = eng.Stop()
 	}
 
 	return c.JSON(fiber.Map{
