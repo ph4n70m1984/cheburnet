@@ -54,6 +54,8 @@ func resolveTargetToCIDR(target string) string {
 }
 
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
+	isGlobal := cfg.RoutingMode == "global"
+
 	// 1. Формирование DNS серверов
 	var dnsServers []interface{}
 
@@ -87,7 +89,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 		dnsServers = append(dnsServers, bootstrap)
 	}
-	dnsServers = append(dnsServers, "localhost")
+
+	// В режиме выборочных правил локальные домены могут резолвиться локально
+	if !isGlobal {
+		dnsServers = append(dnsServers, "localhost")
+	}
 
 	xrayConfig := map[string]interface{}{
 		"log": map[string]interface{}{
@@ -118,6 +124,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
+	tproxyPort := cfg.TProxyPort
+	if tproxyPort == 0 {
+		tproxyPort = 1602
+	}
+
 	// 2. Inbounds (TProxy + DNS Inbound + Mixed Port + Dokodemo API)
 	inbounds := []map[string]interface{}{
 		{
@@ -131,8 +142,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 		{
 			"tag":      "tproxy-in",
-			"listen":   "127.0.0.1",
-			"port":     cfg.TProxyPort,
+			"listen":   "0.0.0.0", // Обязательно 0.0.0.0 для TProxy перехвата
+			"port":     tproxyPort,
 			"protocol": "dokodemo-door",
 			"settings": map[string]interface{}{
 				"network":        "tcp,udp",
@@ -323,20 +334,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	// --- ПРИОРИТЕТ 2: Общие правила маршрутизации ---
 	if primaryProxyTag != "direct" {
-		// Подгрузка подсетей из .lst.gz архивов и кастомных списков
-		totalSubnets := append([]string(nil), cfg.CustomSubnets...)
-		for _, rs := range cfg.RuleSets {
-			subnets, err := b.rulesLoader.GetSubnets(rs)
-			if err == nil && len(subnets) > 0 {
-				totalSubnets = append(totalSubnets, subnets...)
-			}
-		}
-
-		if len(totalSubnets) > 0 {
+		if isGlobal {
+			// РЕЖИМ GLOBAL: весь оставшийся входящий трафик уходит в прокси
 			rule := map[string]interface{}{
 				"type":       "field",
 				"inboundTag": []string{"tproxy-in"},
-				"ip":         totalSubnets,
 			}
 			if len(balancers) > 0 {
 				rule["balancerTag"] = primaryProxyTag
@@ -344,64 +346,87 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				rule["outboundTag"] = primaryProxyTag
 			}
 			rules = append(rules, rule)
-		}
-
-		// Домены (кастомные + локальные файлы + наборы правил)
-		var totalDomains []string
-		for _, d := range cfg.CustomDomains {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				totalDomains = append(totalDomains, "domain:"+d)
-			}
-		}
-
-		for _, filePath := range cfg.LocalListFiles {
-			if f, err := os.Open(filePath); err == nil {
-				sc := bufio.NewScanner(f)
-				for sc.Scan() {
-					l := strings.TrimSpace(sc.Text())
-					if l != "" && !strings.HasPrefix(l, "#") {
-						totalDomains = append(totalDomains, "domain:"+l)
-					}
+		} else {
+			// РЕЖИМ RULES: роутинг по спискам подсетей и доменов
+			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
+			for _, rs := range cfg.RuleSets {
+				subnets, err := b.rulesLoader.GetSubnets(rs)
+				if err == nil && len(subnets) > 0 {
+					totalSubnets = append(totalSubnets, subnets...)
 				}
-				f.Close()
 			}
-		}
 
-		for _, rs := range cfg.RuleSets {
-			switch rs {
-			case "youtube":
-				totalDomains = append(totalDomains, "domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com")
-			case "meta":
-				totalDomains = append(totalDomains, "domain:instagram.com", "domain:facebook.com", "domain:cdninstagram.com")
-			case "telegram":
-				totalDomains = append(totalDomains, "domain:t.me", "domain:telegram.org")
-			case "discord":
-				totalDomains = append(totalDomains, "domain:discord.com", "domain:discord.gg", "domain:discordapp.com")
-			case "twitter":
-				totalDomains = append(totalDomains, "domain:x.com", "domain:twitter.com", "domain:twimg.com")
-			case "google_ai":
-				totalDomains = append(totalDomains, "domain:gemini.google.com", "domain:generativelanguage.googleapis.com")
-			case "russia_inside":
-				totalDomains = append(totalDomains, "geosite:category-ru")
+			if len(totalSubnets) > 0 {
+				rule := map[string]interface{}{
+					"type":       "field",
+					"inboundTag": []string{"tproxy-in"},
+					"ip":         totalSubnets,
+				}
+				if len(balancers) > 0 {
+					rule["balancerTag"] = primaryProxyTag
+				} else {
+					rule["outboundTag"] = primaryProxyTag
+				}
+				rules = append(rules, rule)
 			}
-		}
 
-		if len(totalDomains) > 0 {
-			rule := map[string]interface{}{
-				"type":       "field",
-				"inboundTag": []string{"tproxy-in"},
-				"domain":     totalDomains,
+			var totalDomains []string
+			for _, d := range cfg.CustomDomains {
+				d = strings.TrimSpace(d)
+				if d != "" {
+					totalDomains = append(totalDomains, "domain:"+d)
+				}
 			}
-			if len(balancers) > 0 {
-				rule["balancerTag"] = primaryProxyTag
-			} else {
-				rule["outboundTag"] = primaryProxyTag
+
+			for _, filePath := range cfg.LocalListFiles {
+				if f, err := os.Open(filePath); err == nil {
+					sc := bufio.NewScanner(f)
+					for sc.Scan() {
+						l := strings.TrimSpace(sc.Text())
+						if l != "" && !strings.HasPrefix(l, "#") {
+							totalDomains = append(totalDomains, "domain:"+l)
+						}
+					}
+					f.Close()
+				}
 			}
-			rules = append(rules, rule)
+
+			for _, rs := range cfg.RuleSets {
+				switch rs {
+				case "youtube":
+					totalDomains = append(totalDomains, "domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com")
+				case "meta":
+					totalDomains = append(totalDomains, "domain:instagram.com", "domain:facebook.com", "domain:cdninstagram.com")
+				case "telegram":
+					totalDomains = append(totalDomains, "domain:t.me", "domain:telegram.org")
+				case "discord":
+					totalDomains = append(totalDomains, "domain:discord.com", "domain:discord.gg", "domain:discordapp.com")
+				case "twitter":
+					totalDomains = append(totalDomains, "domain:x.com", "domain:twitter.com", "domain:twimg.com")
+				case "google_ai":
+					totalDomains = append(totalDomains, "domain:gemini.google.com", "domain:generativelanguage.googleapis.com")
+				case "russia_inside":
+					totalDomains = append(totalDomains, "geosite:category-ru")
+				}
+			}
+
+			if len(totalDomains) > 0 {
+				rule := map[string]interface{}{
+					"type":       "field",
+					"inboundTag": []string{"tproxy-in"},
+					"domain":     totalDomains,
+				}
+				if len(balancers) > 0 {
+					rule["balancerTag"] = primaryProxyTag
+				} else {
+					rule["outboundTag"] = primaryProxyTag
+				}
+				rules = append(rules, rule)
+			}
 		}
 	}
 
+	// Mixed-in порт всегда направляется в прокси
 	if cfg.MixedPort > 0 && primaryProxyTag != "direct" {
 		rule := map[string]interface{}{
 			"type":       "field",
