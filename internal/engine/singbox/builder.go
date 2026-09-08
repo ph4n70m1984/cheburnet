@@ -393,7 +393,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					"action":   "route",
 					"inbound":  []string{"tproxy-in"},
 					"network":  "udp",
-					"port":     []string{"50000:65535"},
+					"port":     []string{"443", "50000:65535"},
 					"outbound": activeOutboundTag,
 				})
 			}
