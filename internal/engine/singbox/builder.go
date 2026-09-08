@@ -23,14 +23,12 @@ func NewBuilder() *Builder {
 	}
 }
 
-// resolveTargetToCIDR проверяет переданное значение (MAC или IP) и возвращает валидный CIDR
 func resolveTargetToCIDR(target string) string {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return ""
 	}
 
-	// Если передан MAC-адрес (содержит двоеточия и не содержит точки)
 	if strings.Contains(target, ":") && !strings.Contains(target, ".") {
 		file, err := os.Open("/tmp/dhcp.leases")
 		if err == nil {
@@ -38,7 +36,6 @@ func resolveTargetToCIDR(target string) string {
 			scanner := bufio.NewScanner(file)
 			for scanner.Scan() {
 				fields := strings.Fields(scanner.Text())
-				// Формат dnsmasq: <timestamp> <mac> <ip> <hostname> <client-id>
 				if len(fields) >= 3 {
 					if strings.EqualFold(fields[1], target) {
 						target = fields[2]
@@ -49,7 +46,6 @@ func resolveTargetToCIDR(target string) string {
 		}
 	}
 
-	// Если это IPv4 адрес без маски подсети
 	if !strings.Contains(target, "/") && net.ParseIP(target) != nil {
 		return target + "/32"
 	}
@@ -57,7 +53,6 @@ func resolveTargetToCIDR(target string) string {
 	return target
 }
 
-// getRouterLANIP получает первый валидный IPv4-адрес интерфейса br-lan
 func getRouterLANIP() string {
 	iface, err := net.InterfaceByName("br-lan")
 	if err == nil {
@@ -122,22 +117,29 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// FakeIP для пользовательских доменов
-	if len(cfg.CustomDomains) > 0 {
-		dnsRules = append(dnsRules, map[string]interface{}{
-			"action":        "route",
-			"server":        "fakeip-dns",
-			"domain_suffix": cfg.CustomDomains,
-		})
-	}
+	isGlobal := cfg.RoutingMode == "global"
 
-	// FakeIP для наборов правил .srs
-	if len(cfg.RuleSets) > 0 {
+	// В режиме global все домены резолвятся через FakeIP для последующего проксирования
+	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
-			"action":   "route",
-			"server":   "fakeip-dns",
-			"rule_set": cfg.RuleSets,
+			"action": "route",
+			"server": "fakeip-dns",
 		})
+	} else {
+		if len(cfg.CustomDomains) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":        "route",
+				"server":        "fakeip-dns",
+				"domain_suffix": cfg.CustomDomains,
+			})
+		}
+		if len(cfg.RuleSets) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":   "route",
+				"server":   "fakeip-dns",
+				"rule_set": cfg.RuleSets,
+			})
+		}
 	}
 
 	dnsConfig := map[string]interface{}{
@@ -184,6 +186,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
+	tproxyPort := cfg.TProxyPort
+	if tproxyPort == 0 {
+		tproxyPort = 1602
+	}
+
 	sbConfig := map[string]interface{}{
 		"log": map[string]interface{}{
 			"level":     "warn",
@@ -194,10 +201,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			{
 				"type":          "tproxy",
 				"tag":           "tproxy-in",
-				"listen":        "127.0.0.1",
-				"listen_port":   cfg.TProxyPort,
+				"listen":        "0.0.0.0", // Обязательно для TProxy
+				"listen_port":   tproxyPort,
 				"tcp_fast_open": true,
 				"udp_fragment":  true,
+				"sniff":         true,
 			},
 			{
 				"type":        "direct",
@@ -215,7 +223,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"experimental": experimentalConfig,
 	}
 
-	// 1. Формирование аутбаундов нод
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -232,7 +239,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 2. Сборка балансировочных групп (urltest / selector)
 	activeOutboundTag := "direct-out"
 
 	if len(cfg.Groups) > 0 {
@@ -298,7 +304,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	sbConfig["outbounds"] = outbounds
 
-	// 3. Таблица правил маршрутизации (Route)
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",
@@ -310,9 +315,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// ============================================================
-	// ПРИОРИТЕТ 1: ПОЛИТИКИ КЛИЕНТОВ (CLIENT POLICY)
-	// ============================================================
+	// Клиентские политики
 	var directClients []string
 	var fullProxyClients []string
 
@@ -330,12 +333,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			directClients = append(directClients, cidr)
 		case config.ClientModeFullProxy:
 			fullProxyClients = append(fullProxyClients, cidr)
-		case config.ClientModeRules:
-			// Режим "по спискам": трафик проходит ниже к общим правилам
 		}
 	}
 
-	// Прямой доступ для устройств-исключений
 	if len(directClients) > 0 {
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":         "route",
@@ -345,7 +345,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
-	// Полный туннель для выбранных устройств
 	if len(fullProxyClients) > 0 && activeOutboundTag != "direct-out" {
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":         "route",
@@ -355,48 +354,52 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
-	// ============================================================
-	// ПРИОРИТЕТ 2: ОБЩИЕ ПРАВИЛА (ПОДСЕТИ, ДОМЕНЫ, RULE-SETS)
-	// ============================================================
 	if activeOutboundTag != "direct-out" {
-		totalSubnets := make([]string, 0, len(cfg.CustomSubnets))
-		totalSubnets = append(totalSubnets, cfg.CustomSubnets...)
+		if isGlobal {
+			// В режиме Global весь остальной входящий трафик направляется в прокси
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"outbound": activeOutboundTag,
+			})
+		} else {
+			// Режим Rules
+			totalSubnets := make([]string, 0, len(cfg.CustomSubnets))
+			totalSubnets = append(totalSubnets, cfg.CustomSubnets...)
 
-		// Подгрузка подсетей на лету из .lst.gz архивов
-		for _, rs := range cfg.RuleSets {
-			subnets, err := b.rulesLoader.GetSubnets(rs)
-			if err == nil && len(subnets) > 0 {
-				totalSubnets = append(totalSubnets, subnets...)
+			for _, rs := range cfg.RuleSets {
+				subnets, err := b.rulesLoader.GetSubnets(rs)
+				if err == nil && len(subnets) > 0 {
+					totalSubnets = append(totalSubnets, subnets...)
+				}
 			}
-		}
 
-		if len(totalSubnets) > 0 {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  totalSubnets,
-				"outbound": activeOutboundTag,
-			})
-		}
+			if len(totalSubnets) > 0 {
+				routeRules = append(routeRules, map[string]interface{}{
+					"action":   "route",
+					"inbound":  []string{"tproxy-in"},
+					"ip_cidr":  totalSubnets,
+					"outbound": activeOutboundTag,
+				})
+			}
 
-		// Пользовательские домены
-		if len(cfg.CustomDomains) > 0 {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":        "route",
-				"inbound":       []string{"tproxy-in"},
-				"domain_suffix": cfg.CustomDomains,
-				"outbound":      activeOutboundTag,
-			})
-		}
+			if len(cfg.CustomDomains) > 0 {
+				routeRules = append(routeRules, map[string]interface{}{
+					"action":        "route",
+					"inbound":       []string{"tproxy-in"},
+					"domain_suffix": cfg.CustomDomains,
+					"outbound":      activeOutboundTag,
+				})
+			}
 
-		// Готовые списки .srs
-		if len(cfg.RuleSets) > 0 {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"outbound": activeOutboundTag,
-				"rule_set": cfg.RuleSets,
-			})
+			if len(cfg.RuleSets) > 0 {
+				routeRules = append(routeRules, map[string]interface{}{
+					"action":   "route",
+					"inbound":  []string{"tproxy-in"},
+					"outbound": activeOutboundTag,
+					"rule_set": cfg.RuleSets,
+				})
+			}
 		}
 	}
 
@@ -407,21 +410,28 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	})
 
 	var ruleSetObjects []map[string]interface{}
-	for _, rs := range cfg.RuleSets {
-		ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
-			"type":            "remote",
-			"tag":             rs,
-			"format":          "binary",
-			"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", rs),
-			"download_detour": activeOutboundTag,
-			"update_interval": "1d",
-		})
+	if !isGlobal {
+		for _, rs := range cfg.RuleSets {
+			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+				"type":            "remote",
+				"tag":             rs,
+				"format":          "binary",
+				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", rs),
+				"download_detour": activeOutboundTag,
+				"update_interval": "1d",
+			})
+		}
+	}
+
+	finalOutbound := "direct-out"
+	if isGlobal && activeOutboundTag != "direct-out" {
+		finalOutbound = activeOutboundTag
 	}
 
 	sbConfig["route"] = map[string]interface{}{
 		"rules":                   routeRules,
 		"rule_set":                ruleSetObjects,
-		"final":                   "direct-out",
+		"final":                   finalOutbound,
 		"auto_detect_interface":   true,
 		"default_domain_resolver": "bootstrap-dns",
 		"default_mark":            2097152,

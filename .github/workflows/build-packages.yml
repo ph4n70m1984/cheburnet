@@ -88,7 +88,7 @@ jobs:
           PKG_DIR="ipk_pkg"
           mkdir -p "$PKG_DIR/control" "$PKG_DIR/data/usr/bin" "$PKG_DIR/data/etc/init.d" \
                    "$PKG_DIR/data/etc/config" "$PKG_DIR/data/www/luci-static/resources/view/cheburnet" \
-                   "$PKG_DIR/data/usr/share/luci/menu.d"
+                   "$PKG_DIR/data/usr/share/luci/menu.d" "$PKG_DIR/data/usr/share/rpcd/acl.d"
 
           cp bin/cheburnetd "$PKG_DIR/data/usr/bin/cheburnetd"
           chmod 755 "$PKG_DIR/data/usr/bin/cheburnetd"
@@ -101,6 +101,25 @@ jobs:
 
           cp openwrt/files/www/luci-static/resources/view/cheburnet/dashboard.js "$PKG_DIR/data/www/luci-static/resources/view/cheburnet/dashboard.js"
           cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/luci/menu.d/luci-app-cheburnet.json"
+
+          # ACL манифест для rpcd (устраняет ошибку RPC call to uci/get: Permission denied)
+          if [ -f openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
+              cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/rpcd/acl.d/"
+          else
+              cat <<'EOF' > "$PKG_DIR/data/usr/share/rpcd/acl.d/luci-app-cheburnet.json"
+          {
+              "luci-app-cheburnet": {
+                  "description": "Grant UCI access for Chebur.NET LuCI app",
+                  "read": {
+                      "uci": [ "cheburnet" ]
+                  },
+                  "write": {
+                      "uci": [ "cheburnet" ]
+                  }
+              }
+          }
+          EOF
+          fi
 
           cat <<EOF > "$PKG_DIR/control/control"
           Package: luci-app-cheburnet
@@ -131,7 +150,7 @@ jobs:
           APK_DIR="apk_pkg"
           mkdir -p "$APK_DIR/usr/bin" "$APK_DIR/etc/init.d" "$APK_DIR/etc/config" \
                    "$APK_DIR/www/luci-static/resources/view/cheburnet" \
-                   "$APK_DIR/usr/share/luci/menu.d"
+                   "$APK_DIR/usr/share/luci/menu.d" "$APK_DIR/usr/share/rpcd/acl.d"
 
           cp bin/cheburnetd "$APK_DIR/usr/bin/cheburnetd"
           chmod 755 "$APK_DIR/usr/bin/cheburnetd"
@@ -142,6 +161,25 @@ jobs:
           cp openwrt/files/etc/config/cheburnet "$APK_DIR/etc/config/cheburnet"
           cp openwrt/files/www/luci-static/resources/view/cheburnet/dashboard.js "$APK_DIR/www/luci-static/resources/view/cheburnet/dashboard.js"
           cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_DIR/usr/share/luci/menu.d/luci-app-cheburnet.json"
+
+          # ACL манифест для rpcd (устраняет ошибку RPC call to uci/get: Permission denied)
+          if [ -f openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
+              cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$APK_DIR/usr/share/rpcd/acl.d/"
+          else
+              cat <<'EOF' > "$APK_DIR/usr/share/rpcd/acl.d/luci-app-cheburnet.json"
+          {
+              "luci-app-cheburnet": {
+                  "description": "Grant UCI access for Chebur.NET LuCI app",
+                  "read": {
+                      "uci": [ "cheburnet" ]
+                  },
+                  "write": {
+                      "uci": [ "cheburnet" ]
+                  }
+              }
+          }
+          EOF
+          fi
 
           cat <<EOF > "$APK_DIR/.PKGINFO"
           pkgname = luci-app-cheburnet

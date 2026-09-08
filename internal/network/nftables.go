@@ -13,19 +13,23 @@ const (
 	SelfMark  = "0x00200000"
 )
 
-func ApplyNFTRules(ifaces []string, subnets []string, tproxyPort int) error {
+func ApplyNFTRules(ifaces []string, subnets []string, tproxyPort int, isGlobalMode bool) error {
 	if len(ifaces) == 0 {
 		ifaces = []string{"br-lan"}
 	}
 
 	ifaceElements := strings.Join(ifaces, ", ")
 
-	// Формируем блок подсетей для сета bypass_subnets
 	subnetElements := ""
 	bypassMangleRule := ""
 	bypassOutputRule := ""
 
-	if len(subnets) > 0 {
+	if isGlobalMode {
+		// В режиме Global VPN перехватываем весь внешний трафик
+		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr != @localv4 meta mark set %s counter", TableMark)
+		bypassOutputRule = fmt.Sprintf("ip daddr != @localv4 meta mark set %s counter", TableMark)
+	} else if len(subnets) > 0 {
+		// В режиме Rules — только указанные диапазоны
 		subnetElements = fmt.Sprintf(`
 	set bypass_subnets {
 		type ipv4_addr
@@ -57,6 +61,7 @@ table inet %s {
 		type filter hook prerouting priority -150; policy accept;
 		ct status dnat return
 		udp dport 123 return
+		ip daddr @localv4 return
 		%s
 		iifname @interfaces ip daddr 198.18.0.0/15 meta l4proto tcp meta mark set %s counter
 		iifname @interfaces ip daddr 198.18.0.0/15 meta l4proto udp meta mark set %s counter

@@ -276,8 +276,9 @@ func runDaemon() {
 		sourceIface = "br-lan"
 	}
 
-	log.Println("[INFO] Setting up nftables and routing...")
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, initialConfig.TProxyPort); err != nil {
+	isGlobal := initialConfig.RoutingMode == "global"
+	log.Printf("[INFO] Setting up nftables and routing (global mode: %v)...", isGlobal)
+	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, initialConfig.TProxyPort, isGlobal); err != nil {
 		log.Fatalf("[FATAL] nftables setup error: %v", err)
 	}
 	if err := network.SetupRouting(); err != nil {
@@ -385,6 +386,21 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
+	// Синхронизируем правила сетевого экрана с текущим режимом маршрутизации
+	isGlobal := cfg.RoutingMode == "global"
+	sourceIface := cfg.SourceIface
+	if sourceIface == "" || sourceIface == "lan" {
+		sourceIface = "br-lan"
+	}
+	allSubnets := cfg.CustomSubnets
+	if len(cfg.RuleSets) > 0 && a.rulesLoader != nil {
+		fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, cfg.RuleSets)
+		allSubnets = append(allSubnets, fetched...)
+	}
+	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, cfg.TProxyPort, isGlobal); err != nil {
+		log.Printf("[WARN] Failed to re-apply nftables rules on reload: %v", err)
+	}
+
 	return engine.SafeReload(ctx, eng, &cfg, targetPath)
 }
 
@@ -489,8 +505,8 @@ func (a *App) supervisorLoop(ctx context.Context) {
 		60 * time.Second,
 	}
 	const faultCooldown = 5 * time.Minute
-	const l1Interval = 10 * time.Second // L1: локальный опрос (процесс + порты + DNS)
-	const l2Interval = 60 * time.Second // L2: сквозной опрос внешнего трафика
+	const l1Interval = 10 * time.Second
+	const l2Interval = 60 * time.Second
 
 	l1Failures := 0
 	l2Failures := 0
@@ -502,7 +518,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 	defer l1Ticker.Stop()
 	defer l2Ticker.Stop()
 
-	// Вспомогательная функция выполнения безопасного рестарта с backoff
 	triggerRestart := func(reason string) {
 		if restartAttempts >= len(backoffDelays) {
 			if !isInFaultState {
@@ -555,9 +570,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		// ----------------------------------------------------
-		// L1: Local/Process Health (Каждые 10 секунд)
-		// ----------------------------------------------------
 		case <-l1Ticker.C:
 			a.mu.RLock()
 			eng := a.activeEng
@@ -590,9 +602,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				}
 			}
 
-		// ----------------------------------------------------
-		// L2: Traffic/Outbound Health (Каждые 60 секунд)
-		// ----------------------------------------------------
 		case <-l2Ticker.C:
 			a.mu.RLock()
 			eng := a.activeEng
@@ -603,7 +612,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				continue
 			}
 
-			// Если L1 уже фиксирует сбой сокетов, нет смысла делать E2E
 			if l1Failures > 0 {
 				continue
 			}
@@ -615,7 +623,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			if err != nil {
 				l2Failures++
 				log.Printf("[supervisor] L2 Warning: Proxy traffic test failed (%d/2): %v", l2Failures, err)
-				// 2 подряд проваленных теста (2 минуты без трафика через рабочий процесс)
 				if l2Failures >= 2 {
 					l2Failures = 0
 					triggerRestart("L2_TRAFFIC_DEAD")

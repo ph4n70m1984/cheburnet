@@ -1,0 +1,11 @@
+{
+	"luci-app-cheburnet": {
+		"description": "Grant UCI access for Chebur.NET LuCI app",
+		"read": {
+			"uci": [ "cheburnet" ]
+		},
+		"write": {
+			"uci": [ "cheburnet" ]
+		}
+	}
+}
