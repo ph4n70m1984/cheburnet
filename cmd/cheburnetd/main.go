@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -176,6 +177,38 @@ func loadSubnetsFromCompressedStorage(loader *network.CompressedRulesetLoader, r
 	return subnets
 }
 
+func extractFullProxyIPs(policies []config.ClientPolicy) []string {
+	var ips []string
+	for _, p := range policies {
+		if !p.Enabled || p.Mode != config.ClientModeFullProxy || p.Target == "" {
+			continue
+		}
+		target := strings.TrimSpace(p.Target)
+
+		// Преобразование MAC-адреса в IP через DHCP leases
+		if strings.Contains(target, ":") && !strings.Contains(target, ".") {
+			file, err := os.Open("/tmp/dhcp.leases")
+			if err == nil {
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					fields := strings.Fields(scanner.Text())
+					if len(fields) >= 3 && strings.EqualFold(fields[1], target) {
+						target = fields[2]
+						break
+					}
+				}
+				file.Close()
+			}
+		}
+
+		cleanIP := strings.Split(target, "/")[0]
+		if net.ParseIP(cleanIP) != nil {
+			ips = append(ips, cleanIP)
+		}
+	}
+	return ips
+}
+
 func runDaemon() {
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
@@ -277,8 +310,10 @@ func runDaemon() {
 	}
 
 	isGlobal := initialConfig.RoutingMode == "global"
-	log.Printf("[INFO] Setting up nftables and routing (global mode: %v)...", isGlobal)
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, initialConfig.TProxyPort, isGlobal); err != nil {
+	fullProxyIPs := extractFullProxyIPs(initialConfig.ClientPolicies)
+
+	log.Printf("[INFO] Setting up nftables and routing (global: %v, full_proxy clients: %v)...", isGlobal, fullProxyIPs)
+	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, initialConfig.TProxyPort, isGlobal); err != nil {
 		log.Fatalf("[FATAL] nftables setup error: %v", err)
 	}
 	if err := network.SetupRouting(); err != nil {
@@ -386,7 +421,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	// Синхронизируем правила сетевого экрана с текущим режимом маршрутизации
 	isGlobal := cfg.RoutingMode == "global"
 	sourceIface := cfg.SourceIface
 	if sourceIface == "" || sourceIface == "lan" {
@@ -397,7 +431,9 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, cfg.RuleSets)
 		allSubnets = append(allSubnets, fetched...)
 	}
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, cfg.TProxyPort, isGlobal); err != nil {
+
+	fullProxyIPs := extractFullProxyIPs(cfg.ClientPolicies)
+	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, cfg.TProxyPort, isGlobal); err != nil {
 		log.Printf("[WARN] Failed to re-apply nftables rules on reload: %v", err)
 	}
 

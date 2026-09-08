@@ -13,7 +13,7 @@ const (
 	SelfMark  = "0x00200000"
 )
 
-func ApplyNFTRules(ifaces []string, subnets []string, tproxyPort int, isGlobalMode bool) error {
+func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobalMode bool) error {
 	if len(ifaces) == 0 {
 		ifaces = []string{"br-lan"}
 	}
@@ -25,11 +25,11 @@ func ApplyNFTRules(ifaces []string, subnets []string, tproxyPort int, isGlobalMo
 	bypassOutputRule := ""
 
 	if isGlobalMode {
-		// В режиме Global VPN перехватываем весь внешний трафик
+		// В режиме Global VPN перехватываем весь не-локальный трафик
 		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr != @localv4 meta mark set %s counter", TableMark)
 		bypassOutputRule = fmt.Sprintf("ip daddr != @localv4 meta mark set %s counter", TableMark)
 	} else if len(subnets) > 0 {
-		// В режиме Rules — только указанные диапазоны
+		// В режиме Rules перехватываем только указанные подсети
 		subnetElements = fmt.Sprintf(`
 	set bypass_subnets {
 		type ipv4_addr
@@ -40,6 +40,20 @@ func ApplyNFTRules(ifaces []string, subnets []string, tproxyPort int, isGlobalMo
 
 		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr @bypass_subnets meta mark set %s counter", TableMark)
 		bypassOutputRule = fmt.Sprintf("ip daddr @bypass_subnets meta mark set %s counter", TableMark)
+	}
+
+	// Сет клиентов, чей весь трафик принудительно перенаправляется в прокси
+	clientSetElements := ""
+	clientMangleRule := ""
+	if len(fullProxyIPs) > 0 {
+		clientSetElements = fmt.Sprintf(`
+	set full_proxy_clients {
+		type ipv4_addr
+		flags interval
+		elements = { %s }
+	}`, strings.Join(fullProxyIPs, ", "))
+
+		clientMangleRule = fmt.Sprintf("iifname @interfaces ip saddr @full_proxy_clients ip daddr != @localv4 meta mark set %s counter", TableMark)
 	}
 
 	tpl := `
@@ -57,11 +71,13 @@ table inet %s {
 		elements = { %s }
 	}
 %s
+%s
 	chain mangle {
 		type filter hook prerouting priority -150; policy accept;
 		ct status dnat return
 		udp dport 123 return
 		ip daddr @localv4 return
+		%s
 		%s
 		iifname @interfaces ip daddr 198.18.0.0/15 meta l4proto tcp meta mark set %s counter
 		iifname @interfaces ip daddr 198.18.0.0/15 meta l4proto udp meta mark set %s counter
@@ -87,6 +103,8 @@ table inet %s {
 		TableName,
 		ifaceElements,
 		subnetElements,
+		clientSetElements,
+		clientMangleRule,
 		bypassMangleRule,
 		TableMark,
 		TableMark,

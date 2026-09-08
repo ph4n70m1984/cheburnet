@@ -55,7 +55,7 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		AutoUpdate:   u.get("cheburnet.main.auto_update", "0") == "1",
 	}
 
-	// 1. Чтение типизированных секций 'subscription' (новый формат с user_agent и hwid)
+	// 1. Чтение секций 'subscription'
 	cfg.Subscriptions = u.loadSubscriptionSections()
 
 	// 2. Обратная совместимость: чтение старого 'list subscription' из main
@@ -74,6 +74,9 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 			}
 		}
 	}
+
+	// 3. Чтение политик для устройств (client_rule)
+	cfg.ClientPolicies = u.loadClientRuleSections()
 
 	// Чтение списка одиночных ссылок нод (vless://, hy2:// и др.)
 	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.manual_nodes").Output(); err == nil {
@@ -171,6 +174,62 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 		}
 	}
 	return subs
+}
+
+func (u *UCIStorage) loadClientRuleSections() []ClientPolicy {
+	var policies []ClientPolicy
+	out, err := exec.Command("uci", "-q", "show", "cheburnet").Output()
+	if err != nil {
+		return policies
+	}
+
+	secMap := make(map[string]*ClientPolicy)
+	lines := strings.Split(string(out), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "cheburnet.@client_rule[") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		keyParts := strings.Split(parts[0], ".")
+		if len(keyParts) < 3 {
+			continue
+		}
+
+		secID := keyParts[1]
+		val := strings.Trim(parts[1], "'\"")
+
+		if _, ok := secMap[secID]; !ok {
+			secMap[secID] = &ClientPolicy{
+				Enabled: true,
+				Mode:    ClientModeRules,
+			}
+		}
+
+		switch keyParts[2] {
+		case "name":
+			secMap[secID].Name = val
+		case "target":
+			secMap[secID].Target = val
+		case "mode":
+			secMap[secID].Mode = ClientMode(val)
+		case "enabled":
+			secMap[secID].Enabled = (val == "1" || val == "true")
+		}
+	}
+
+	for _, p := range secMap {
+		if p.Target != "" && p.Enabled {
+			policies = append(policies, *p)
+		}
+	}
+	return policies
 }
 
 func (u *UCIStorage) SaveEngine(engineName string) error {
