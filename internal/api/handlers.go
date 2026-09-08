@@ -95,9 +95,11 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 	uciStorage := config.NewUCIStorage()
 	freshCfg, err := uciStorage.Load()
 	if err == nil {
-		s.state.Get().RuleSets = freshCfg.RuleSets
-		s.state.Get().Subscriptions = freshCfg.Subscriptions
-		s.state.Get().ManualNodes = freshCfg.ManualNodes
+		s.state.Update(func(cfg *config.CheburConfig) {
+			cfg.RuleSets = freshCfg.RuleSets
+			cfg.Subscriptions = freshCfg.Subscriptions
+			cfg.ManualNodes = freshCfg.ManualNodes
+		})
 	}
 
 	cfg := s.state.Get()
@@ -122,6 +124,7 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 	}
 
 	s.state.UpdateNodes(allNodes)
+	cfg.Nodes = allNodes
 
 	// Пересобираем и перезапускаем sing-box / xray
 	eng := s.getEngine()
@@ -130,7 +133,7 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		targetPath = "/tmp/run/cheburnet/xray.json"
 	}
 
-	_ = eng.BuildConfig(cfg, targetPath)
+	_ = eng.BuildConfig(&cfg, targetPath)
 	_ = eng.Stop()
 	_ = eng.Start(c.Context(), targetPath)
 
@@ -183,18 +186,19 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		}
 
 		_ = uci.AddSubscription(subCfg)
-		cfg.Subscriptions = append(cfg.Subscriptions, subCfg)
-
-		existingTags := make(map[string]bool)
-		for _, n := range cfg.Nodes {
-			existingTags[n.Tag] = true
-		}
-		for _, n := range newNodes {
-			if !existingTags[n.Tag] {
-				cfg.Nodes = append(cfg.Nodes, n)
+		s.state.Update(func(c *config.CheburConfig) {
+			c.Subscriptions = append(c.Subscriptions, subCfg)
+			existingTags := make(map[string]bool)
+			for _, n := range c.Nodes {
 				existingTags[n.Tag] = true
 			}
-		}
+			for _, n := range newNodes {
+				if !existingTags[n.Tag] {
+					c.Nodes = append(c.Nodes, n)
+					existingTags[n.Tag] = true
+				}
+			}
+		})
 
 	case "node":
 		node, err := uri.ParseNodeURI(req.URL, cfg.AutoHWID, cfg.CustomHWID)
@@ -203,21 +207,22 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		}
 
 		_ = uci.AddManualNode(req.URL)
-		cfg.Nodes = append(cfg.Nodes, node)
+		s.state.Update(func(c *config.CheburConfig) {
+			c.Nodes = append(c.Nodes, node)
+		})
 
 	default:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "type must be 'subscription' or 'node'"})
 	}
 
-	s.state.UpdateNodes(cfg.Nodes)
-
+	currentCfg := s.state.Get()
 	eng := s.getEngine()
 	targetPath := "/tmp/run/cheburnet/sing-box.json"
 	if eng.Name() == "xray" {
 		targetPath = "/tmp/run/cheburnet/xray.json"
 	}
 
-	if err := eng.BuildConfig(cfg, targetPath); err != nil {
+	if err := eng.BuildConfig(&currentCfg, targetPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to rebuild engine config: " + err.Error()})
 	}
 
@@ -226,13 +231,12 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"status":      "ok",
-		"total_nodes": len(cfg.Nodes),
+		"total_nodes": len(currentCfg.Nodes),
 	})
 }
 
 // handleReloadConfig считывает актуальный UCI-файл и обновляет ноды (включая случай полного удаления всех подписок)
 func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
-	// Принудительно фиксируем любые staging-изменения LuCI в системный конфиг на диске
 	_ = exec.Command("uci", "commit", "cheburnet").Run()
 
 	uciStorage := config.NewUCIStorage()
@@ -265,10 +269,10 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 
 	newCfg.Nodes = allNodes
 
-	// Обновляем состояние ядра в памяти даже если список пуст
-	s.state.UpdateNodes(newCfg.Nodes)
-	s.state.SetEngine(newCfg.Engine)
-	s.state.SetAutoHWID(newCfg.AutoHWID, newCfg.CustomHWID)
+	// Атомарно обновляем конфигурацию в состоянии
+	s.state.Update(func(cfg *config.CheburConfig) {
+		*cfg = *newCfg
+	})
 
 	eng := s.getEngine()
 	targetPath := "/tmp/run/cheburnet/sing-box.json"

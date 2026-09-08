@@ -419,6 +419,14 @@ return view.extend({
         o.editable = true;
 
         // --- ВКЛАДКА 2: МАРШРУТИЗАЦИЯ СПИСКОВ ---
+        o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
+        o.depends('routing_mode', 'rules');
+        o.value('24h', _('24 часа (каждый день)'));
+        o.value('72h', _('72 часа (раз в 3 дня)'));
+        o.value('168h', _('1 неделя'));
+        o.default = '72h';
+        o.rmempty = false;
+
         o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Service list (Предопределенные списки)'));
         o.depends('routing_mode', 'rules');
         o.value('russia_inside', 'russia_inside (Россия / РКН)');

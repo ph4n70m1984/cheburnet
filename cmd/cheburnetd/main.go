@@ -35,13 +35,15 @@ const (
 )
 
 type App struct {
-	state      *config.StateManager
-	singboxEng *engine.SingBoxEngine
-	xrayEng    *engine.XrayEngine
-	activeEng  engine.Engine
-	hub        *telemetry.Hub
-	server     *api.Server
-	mu         sync.Mutex
+	state       *config.StateManager
+	singboxEng  *engine.SingBoxEngine
+	xrayEng     *engine.XrayEngine
+	activeEng   engine.Engine
+	hub         *telemetry.Hub
+	server      *api.Server
+	rulesLoader *network.CompressedRulesetLoader
+	rulesCron   *network.RulesetCron
+	mu          sync.Mutex
 }
 
 func showHelp() {
@@ -148,40 +150,22 @@ func main() {
 	}
 }
 
-func fetchSubnetsForRulesets(ruleSets []string) []string {
+func loadSubnetsFromCompressedStorage(loader *network.CompressedRulesetLoader, ruleSets []string) []string {
 	var subnets []string
-	client := &http.Client{Timeout: 5 * time.Second}
-
 	for _, rs := range ruleSets {
-		url := fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.lst", rs)
-		resp, err := client.Get(url)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			continue
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				subnets = append(subnets, line)
-			}
+		list, err := loader.GetSubnets(rs)
+		if err == nil && len(list) > 0 {
+			subnets = append(subnets, list...)
 		}
 	}
 	return subnets
 }
 
 func runDaemon() {
-	// 1. Предварительная очистка зависших правил от прошлых сессий
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
 
-	// 2. Гарантированный сброс маршрутизации при любом завершении/панике
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[PANIC RECOVER] %v", r)
@@ -198,6 +182,10 @@ func runDaemon() {
 	initialConfig, err := uciStorage.Load()
 	if err != nil {
 		log.Fatalf("[FATAL] Load config failed: %v", err)
+	}
+
+	if initialConfig.RulesetUpdateInterval == "" {
+		initialConfig.RulesetUpdateInterval = "72h"
 	}
 
 	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID)
@@ -237,10 +225,12 @@ func runDaemon() {
 
 	log.Printf("[INFO] Total active nodes initialized: %d (source mode: %s)", len(initialConfig.Nodes), initialConfig.SourceMode)
 
+	rulesLoader := network.NewCompressedRulesetLoader()
+
 	allSubnets := initialConfig.CustomSubnets
 	if len(initialConfig.RuleSets) > 0 {
-		log.Printf("[INFO] Fetching direct subnets for rulesets: %v", initialConfig.RuleSets)
-		fetched := fetchSubnetsForRulesets(initialConfig.RuleSets)
+		log.Printf("[INFO] Loading cached subnets for rulesets: %v", initialConfig.RuleSets)
+		fetched := loadSubnetsFromCompressedStorage(rulesLoader, initialConfig.RuleSets)
 		allSubnets = append(allSubnets, fetched...)
 		log.Printf("[INFO] Total subnets loaded for direct routing: %d", len(allSubnets))
 	}
@@ -253,10 +243,11 @@ func runDaemon() {
 	updManager := updater.NewManager("cheburnet/cheburnet", CheburVersion)
 
 	app := &App{
-		state:      state,
-		singboxEng: sbEngine,
-		xrayEng:    xrEngine,
-		hub:        hub,
+		state:       state,
+		singboxEng:  sbEngine,
+		xrayEng:     xrEngine,
+		hub:         hub,
+		rulesLoader: rulesLoader,
 	}
 
 	if initialConfig.Engine == "xray" {
@@ -285,6 +276,16 @@ func runDaemon() {
 	if err := app.startActiveEngine(daemonCtx); err != nil {
 		log.Printf("[WARN] Initial proxy engine failed to start: %v", err)
 	}
+
+	app.rulesCron = network.NewRulesetCron(
+		rulesLoader,
+		initialConfig.RuleSets,
+		initialConfig.RulesetUpdateInterval,
+		func() error {
+			return app.reloadActiveEngine(daemonCtx)
+		},
+	)
+	app.rulesCron.Start(daemonCtx)
 
 	go hub.Run(daemonCtx, app.getCurrentEngine())
 
@@ -337,6 +338,24 @@ func (a *App) getCurrentEngine() engine.Engine {
 	return a.activeEng
 }
 
+func (a *App) reloadActiveEngine(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cfg := a.state.Get()
+	targetPath := RuntimeConfigPathSingBox
+	if a.activeEng.Name() == "xray" {
+		targetPath = RuntimeConfigPathXray
+	}
+
+	if err := a.activeEng.BuildConfig(&cfg, targetPath); err != nil {
+		return fmt.Errorf("rebuild config: %w", err)
+	}
+
+	_ = a.activeEng.Stop()
+	return a.activeEng.Start(ctx, targetPath)
+}
+
 func (a *App) startActiveEngine(ctx context.Context) error {
 	cfg := a.state.Get()
 	targetPath := RuntimeConfigPathSingBox
@@ -344,7 +363,7 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	if err := a.activeEng.BuildConfig(cfg, targetPath); err != nil {
+	if err := a.activeEng.BuildConfig(&cfg, targetPath); err != nil {
 		return fmt.Errorf("build %s config: %w", a.activeEng.Name(), err)
 	}
 

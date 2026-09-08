@@ -10,12 +10,17 @@ import (
 	"strings"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/network"
 )
 
-type Builder struct{}
+type Builder struct {
+	rulesLoader *network.CompressedRulesetLoader
+}
 
 func NewBuilder() *Builder {
-	return &Builder{}
+	return &Builder{
+		rulesLoader: network.NewCompressedRulesetLoader(),
+	}
 }
 
 // resolveTargetToCIDR проверяет переданное значение (MAC или IP) и возвращает валидный CIDR
@@ -326,11 +331,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		case config.ClientModeFullProxy:
 			fullProxyClients = append(fullProxyClients, cidr)
 		case config.ClientModeRules:
-			// Режим "по спискам": трафик направляется дальше по общим правилам
+			// Режим "по спискам": трафик проходит ниже к общим правилам
 		}
 	}
 
-	// Прямой режим: отправляем в direct-out
+	// Прямой доступ для устройств-исключений
 	if len(directClients) > 0 {
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":         "route",
@@ -340,7 +345,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
-	// Полный туннель: отправляем в активный прокси
+	// Полный туннель для выбранных устройств
 	if len(fullProxyClients) > 0 && activeOutboundTag != "direct-out" {
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":         "route",
@@ -351,15 +356,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	// ============================================================
-	// ПРИОРИТЕТ 2: ОБЩИЕ ПРАВИЛА (ДЛЯ КЛИЕНТОВ "rules" И ОСТАЛЬНЫХ)
+	// ПРИОРИТЕТ 2: ОБЩИЕ ПРАВИЛА (ПОДСЕТИ, ДОМЕНЫ, RULE-SETS)
 	// ============================================================
 	if activeOutboundTag != "direct-out" {
-		// Пользовательские подсети (CIDR / IP)
-		if len(cfg.CustomSubnets) > 0 {
+		totalSubnets := make([]string, 0, len(cfg.CustomSubnets))
+		totalSubnets = append(totalSubnets, cfg.CustomSubnets...)
+
+		// Подгрузка подсетей на лету из .lst.gz архивов
+		for _, rs := range cfg.RuleSets {
+			subnets, err := b.rulesLoader.GetSubnets(rs)
+			if err == nil && len(subnets) > 0 {
+				totalSubnets = append(totalSubnets, subnets...)
+			}
+		}
+
+		if len(totalSubnets) > 0 {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  cfg.CustomSubnets,
+				"ip_cidr":  totalSubnets,
 				"outbound": activeOutboundTag,
 			})
 		}
