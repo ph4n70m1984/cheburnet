@@ -343,6 +343,7 @@ func (s *Server) handlePerformUpdate(c *fiber.Ctx) error {
 		}
 
 		if body.Target == "cheburnet" || body.Target == "all" {
+			log.Println("[INFO] Package upgrade completed. Restarting service via init script...")
 			time.Sleep(1 * time.Second)
 			_ = exec.Command("/etc/init.d/cheburnet", "restart").Run()
 		}

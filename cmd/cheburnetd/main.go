@@ -44,7 +44,8 @@ type App struct {
 	server      *api.Server
 	rulesLoader *network.CompressedRulesetLoader
 	rulesCron   *network.RulesetCron
-	mu          sync.Mutex
+	mu          sync.RWMutex
+	engineOpMu  sync.Mutex
 }
 
 func showHelp() {
@@ -220,7 +221,7 @@ func runDaemon() {
 			initialConfig.Nodes = append(initialConfig.Nodes, node)
 		}
 
-	default: // "subscription"
+	default:
 		for _, sub := range initialConfig.Subscriptions {
 			sub.URL = strings.TrimSpace(sub.URL)
 			if sub.URL == "" || !sub.Enabled {
@@ -254,7 +255,6 @@ func runDaemon() {
 	xrEngine := engine.NewXrayEngine()
 	hub := telemetry.NewHub()
 
-	// Привязка к репозиторию проекта
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
 
 	app := &App{
@@ -324,7 +324,6 @@ func runDaemon() {
 		}
 	}()
 
-	// Запуск фонового супервизора ядра
 	go app.supervisorLoop(daemonCtx)
 
 	sigChan := make(chan os.Signal, 1)
@@ -352,8 +351,8 @@ func stopDaemon() {
 }
 
 func (a *App) getCurrentEngine() engine.Engine {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.activeEng
 }
 
@@ -369,53 +368,81 @@ func (a *App) getEngineByName(name string) (engine.Engine, string, error) {
 }
 
 func (a *App) reloadActiveEngine(ctx context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.engineOpMu.Lock()
+	defer a.engineOpMu.Unlock()
 
+	a.mu.RLock()
+	eng := a.activeEng
 	cfg := a.state.Get()
+	a.mu.RUnlock()
+
+	if eng == nil {
+		return fmt.Errorf("no active engine")
+	}
+
 	targetPath := RuntimeConfigPathSingBox
-	if a.activeEng.Name() == "xray" {
+	if eng.Name() == "xray" {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	return engine.SafeReload(ctx, a.activeEng, &cfg, targetPath)
+	return engine.SafeReload(ctx, eng, &cfg, targetPath)
 }
 
 func (a *App) startActiveEngine(ctx context.Context) error {
+	a.engineOpMu.Lock()
+	defer a.engineOpMu.Unlock()
+
+	a.mu.RLock()
+	eng := a.activeEng
 	cfg := a.state.Get()
+	a.mu.RUnlock()
+
+	if eng == nil {
+		return fmt.Errorf("no active engine")
+	}
+
 	targetPath := RuntimeConfigPathSingBox
-	if a.activeEng.Name() == "xray" {
+	if eng.Name() == "xray" {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	if err := a.activeEng.BuildConfig(&cfg, targetPath); err != nil {
-		return fmt.Errorf("build %s config: %w", a.activeEng.Name(), err)
+	if err := eng.BuildConfig(&cfg, targetPath); err != nil {
+		return fmt.Errorf("build %s config: %w", eng.Name(), err)
 	}
 
-	return a.activeEng.Start(ctx, targetPath)
+	return eng.Start(ctx, targetPath)
 }
 
 func (a *App) stopActiveEngine() {
-	if a.activeEng != nil {
-		_ = a.activeEng.Stop()
+	a.engineOpMu.Lock()
+	defer a.engineOpMu.Unlock()
+
+	a.mu.RLock()
+	eng := a.activeEng
+	a.mu.RUnlock()
+
+	if eng != nil {
+		_ = eng.Stop()
 	}
 }
 
 func (a *App) switchEngine(ctx context.Context, name string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	newEng, newTargetPath, err := a.getEngineByName(name)
 	if err != nil {
 		return err
 	}
 
-	if a.activeEng != nil && a.activeEng.Name() == newEng.Name() {
-		return nil
-	}
+	a.engineOpMu.Lock()
+	defer a.engineOpMu.Unlock()
 
+	a.mu.RLock()
 	oldEng := a.activeEng
 	cfg := a.state.Get()
+	a.mu.RUnlock()
+
+	if oldEng != nil && oldEng.Name() == newEng.Name() {
+		return nil
+	}
 
 	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
 		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine kept running)", name, err)
@@ -445,29 +472,99 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		return fmt.Errorf("failed to start %s, rolled back: %w", name, err)
 	}
 
+	a.mu.Lock()
 	a.activeEng = newEng
-	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
+	a.mu.Unlock()
 
+	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
 	return nil
 }
 
 func (a *App) supervisorLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	backoffDelays := []time.Duration{
+		0 * time.Second,
+		5 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+		60 * time.Second,
+	}
+	const faultCooldown = 5 * time.Minute
+	const l1Interval = 10 * time.Second // L1: локальный опрос (процесс + порты + DNS)
+	const l2Interval = 60 * time.Second // L2: сквозной опрос внешнего трафика
 
-	consecutiveFailures := 0
+	l1Failures := 0
+	l2Failures := 0
+	restartAttempts := 0
+	isInFaultState := false
+
+	l1Ticker := time.NewTicker(l1Interval)
+	l2Ticker := time.NewTicker(l2Interval)
+	defer l1Ticker.Stop()
+	defer l2Ticker.Stop()
+
+	// Вспомогательная функция выполнения безопасного рестарта с backoff
+	triggerRestart := func(reason string) {
+		if restartAttempts >= len(backoffDelays) {
+			if !isInFaultState {
+				isInFaultState = true
+				log.Printf("[supervisor] CRITICAL: Engine reached max restart attempts (%d). Entering ENGINE_FAULT state! Cooldown: %v",
+					restartAttempts, faultCooldown)
+			}
+			time.Sleep(faultCooldown)
+			restartAttempts = 0
+			return
+		}
+
+		delay := backoffDelays[restartAttempts]
+		restartAttempts++
+
+		log.Printf("[supervisor] Restarting engine due to [%s] (attempt %d/%d, delay: %v)...",
+			reason, restartAttempts, len(backoffDelays), delay)
+
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+		}
+
+		a.engineOpMu.Lock()
+		a.mu.RLock()
+		currentEng := a.activeEng
+		a.mu.RUnlock()
+
+		if currentEng != nil {
+			targetPath := RuntimeConfigPathSingBox
+			if currentEng.Name() == "xray" {
+				targetPath = RuntimeConfigPathXray
+			}
+
+			_ = currentEng.Stop()
+			if startErr := currentEng.Start(ctx, targetPath); startErr != nil {
+				log.Printf("[supervisor] ERROR: Engine %s restart failed: %v", currentEng.Name(), startErr)
+			} else {
+				log.Printf("[supervisor] INFO: Engine %s successfully restarted", currentEng.Name())
+			}
+		}
+		a.engineOpMu.Unlock()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			a.mu.Lock()
+
+		// ----------------------------------------------------
+		// L1: Local/Process Health (Каждые 10 секунд)
+		// ----------------------------------------------------
+		case <-l1Ticker.C:
+			a.mu.RLock()
 			eng := a.activeEng
 			cfg := a.state.Get()
-			a.mu.Unlock()
+			a.mu.RUnlock()
 
-			if eng == nil {
+			if eng == nil || len(cfg.Nodes) == 0 {
 				continue
 			}
 
@@ -476,33 +573,62 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			cancel()
 
 			if err != nil {
-				consecutiveFailures++
-				log.Printf("[supervisor] Warning: Engine %s health check failed (%d/3): %v", eng.Name(), consecutiveFailures, err)
-
-				if consecutiveFailures >= 3 {
-					log.Printf("[supervisor] CRITICAL: Engine %s failed 3 consecutive health checks. Restarting process...", eng.Name())
-
-					a.mu.Lock()
-					_ = eng.Stop()
-					targetPath := RuntimeConfigPathSingBox
-					if eng.Name() == "xray" {
-						targetPath = RuntimeConfigPathXray
-					}
-
-					if startErr := eng.Start(ctx, targetPath); startErr != nil {
-						log.Printf("[supervisor] ERROR: Engine restart failed: %v", startErr)
-					} else {
-						log.Printf("[supervisor] INFO: Engine %s successfully revived", eng.Name())
-					}
-					a.mu.Unlock()
-
-					consecutiveFailures = 0
+				l1Failures++
+				log.Printf("[supervisor] L1 Warning: Engine %s local check failed (%d/3): %v", eng.Name(), l1Failures, err)
+				if l1Failures >= 3 {
+					l1Failures = 0
+					triggerRestart("L1_PROCESS_DEAD")
 				}
 			} else {
-				if consecutiveFailures > 0 {
-					log.Printf("[supervisor] INFO: Engine %s healthy again", eng.Name())
+				if l1Failures > 0 {
+					log.Printf("[supervisor] L1 INFO: Engine %s local health recovered", eng.Name())
+					l1Failures = 0
 				}
-				consecutiveFailures = 0
+				if restartAttempts > 0 && l2Failures == 0 {
+					restartAttempts = 0
+					isInFaultState = false
+				}
+			}
+
+		// ----------------------------------------------------
+		// L2: Traffic/Outbound Health (Каждые 60 секунд)
+		// ----------------------------------------------------
+		case <-l2Ticker.C:
+			a.mu.RLock()
+			eng := a.activeEng
+			cfg := a.state.Get()
+			a.mu.RUnlock()
+
+			if eng == nil || len(cfg.Nodes) == 0 {
+				continue
+			}
+
+			// Если L1 уже фиксирует сбой сокетов, нет смысла делать E2E
+			if l1Failures > 0 {
+				continue
+			}
+
+			trafficCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := engine.VerifyTraffic(trafficCtx, &cfg)
+			cancel()
+
+			if err != nil {
+				l2Failures++
+				log.Printf("[supervisor] L2 Warning: Proxy traffic test failed (%d/2): %v", l2Failures, err)
+				// 2 подряд проваленных теста (2 минуты без трафика через рабочий процесс)
+				if l2Failures >= 2 {
+					l2Failures = 0
+					triggerRestart("L2_TRAFFIC_DEAD")
+				}
+			} else {
+				if l2Failures > 0 {
+					log.Printf("[supervisor] L2 INFO: Proxy traffic pipeline restored")
+					l2Failures = 0
+				}
+				if restartAttempts > 0 && l1Failures == 0 {
+					restartAttempts = 0
+					isInFaultState = false
+				}
 			}
 		}
 	}

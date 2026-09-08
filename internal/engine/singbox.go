@@ -47,9 +47,12 @@ func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 }
 
 func (s *SingBoxEngine) Stop() error {
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-		_ = s.cmd.Wait()
+	if s.cmd != nil {
+		err := TerminateCmd(s.cmd)
+		s.cmd = nil
+		if err != nil {
+			return fmt.Errorf("failed to safely terminate sing-box: %w", err)
+		}
 	}
 	return nil
 }

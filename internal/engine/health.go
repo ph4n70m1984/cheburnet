@@ -11,11 +11,13 @@ import (
 	"cheburnet/internal/config"
 )
 
-// VerifyEngineAlive проверяет только локальную работоспособность (процесс не завис, порты подняты)
+// VerifyEngineAlive проверяет локальную жизнеспособность ядра:
+// 1. TCP-сокет смешанного прокси-порта (mixed/http/socks inbound).
+// 2. Реальный DNS-запрос через локальный UDP-вход ядра (127.0.0.42:53).
 func VerifyEngineAlive(ctx context.Context, cfg *config.CheburConfig) error {
 	dialer := &net.Dialer{Timeout: 1 * time.Second}
 
-	// Проверяем Inbound порт прокси
+	// 1. Проверяем TCP-порт прокси
 	proxyTarget := fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)
 	if cfg.MixedPort == 0 {
 		proxyTarget = "127.0.0.1:4534"
@@ -26,23 +28,34 @@ func VerifyEngineAlive(ctx context.Context, cfg *config.CheburConfig) error {
 	}
 	_ = conn.Close()
 
-	// Проверяем локальный DNS-inbound
+	// 2. Проверяем локальный DNS через реальный запрос A-записи
 	dnsTarget := fmt.Sprintf("127.0.0.42:%d", cfg.DNSPort)
 	if cfg.DNSPort == 0 {
 		dnsTarget = "127.0.0.42:53"
 	}
-	connDNS, err := dialer.DialContext(ctx, "udp", dnsTarget)
-	if err != nil {
-		return fmt.Errorf("local dns inbound unreachable: %w", err)
+
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 1500 * time.Millisecond}
+			return d.DialContext(dialCtx, "udp", dnsTarget)
+		},
 	}
-	_ = connDNS.Close()
+
+	// Выполняем реальный запрос к локальному DNS-инбаунду ядра
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	addrs, err := r.LookupHost(lookupCtx, "example.com")
+	if err != nil || len(addrs) == 0 {
+		return fmt.Errorf("local dns inbound (%s) query failed: %w", dnsTarget, err)
+	}
 
 	return nil
 }
 
-// VerifyTraffic делает полный E2E прогон через работающее ядро
+// VerifyTraffic выполняет полный сквозной E2E-тест генерации 204 через исходящий прокси
 func VerifyTraffic(ctx context.Context, cfg *config.CheburConfig) error {
-	// Сначала проверяем, что ядро вообще живо локально
 	if err := VerifyEngineAlive(ctx, cfg); err != nil {
 		return err
 	}

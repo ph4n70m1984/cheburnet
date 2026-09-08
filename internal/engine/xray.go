@@ -48,9 +48,12 @@ func (x *XrayEngine) Start(ctx context.Context, configPath string) error {
 }
 
 func (x *XrayEngine) Stop() error {
-	if x.cmd != nil && x.cmd.Process != nil {
-		_ = x.cmd.Process.Kill()
-		_ = x.cmd.Wait()
+	if x.cmd != nil {
+		err := TerminateCmd(x.cmd)
+		x.cmd = nil
+		if err != nil {
+			return fmt.Errorf("failed to safely terminate xray: %w", err)
+		}
 	}
 	return nil
 }

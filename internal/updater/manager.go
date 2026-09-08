@@ -27,6 +27,7 @@ type UpdateReport struct {
 	SingBox    ComponentStatus `json:"sing_box"`
 	Xray       ComponentStatus `json:"xray"`
 	AutoUpdate bool            `json:"auto_update"`
+	PkgManager string          `json:"pkg_manager"` // "apk" или "opkg"
 }
 
 type Manager struct {
@@ -35,13 +36,70 @@ type Manager struct {
 	currentVer  string
 	httpClient  *http.Client
 	isUpgrading bool
+	pkgManager  string
+	targetArch  string
 }
 
 func NewManager(repo, currentVer string) *Manager {
+	pkgMgr := detectPackageManager()
+	arch := detectTargetArch(pkgMgr)
+
 	return &Manager{
 		githubRepo: repo,
 		currentVer: currentVer,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{Timeout: 60 * time.Second},
+		pkgManager: pkgMgr,
+		targetArch: arch,
+	}
+}
+
+func detectPackageManager() string {
+	if _, err := exec.LookPath("apk"); err == nil {
+		return "apk"
+	}
+	return "opkg"
+}
+
+func detectTargetArch(pkgMgr string) string {
+	if pkgMgr == "apk" {
+		out, err := exec.Command("apk", "--print-arch").Output()
+		if err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	} else {
+		// Опрос архитектур opkg (берем первую пользовательскую или системную)
+		out, err := exec.Command("opkg", "print-architecture").Output()
+		if err == nil {
+			var chosenArch string
+			lines := strings.Split(string(out), "\n")
+			for _, line := range lines {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 && parts[0] == "arch" {
+					if parts[1] != "all" && parts[1] != "noarch" {
+						chosenArch = parts[1]
+					}
+				}
+			}
+			if chosenArch != "" {
+				return chosenArch
+			}
+		}
+	}
+
+	// Fallback по GOARCH
+	switch runtime.GOARCH {
+	case "arm64":
+		if pkgMgr == "apk" {
+			return "aarch64"
+		}
+		return "aarch64_cortex-a53"
+	case "arm":
+		if pkgMgr == "apk" {
+			return "armhf"
+		}
+		return "arm_cortex-a7_neon-vfpv4"
+	default:
+		return runtime.GOARCH
 	}
 }
 
@@ -49,18 +107,18 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	sbStatus := m.checkOpkg("sing-box")
-	xrStatus := m.checkOpkg("xray-core")
+	sbStatus := m.checkPkgStatus("sing-box")
+	xrStatus := m.checkPkgStatus("xray-core")
 
 	chStatus := ComponentStatus{
-		Current: m.currentVer,
+		Current: strings.TrimPrefix(m.currentVer, "v"),
 	}
-	latestTag, downloadURL, err := m.fetchLatestGitHubRelease(ctx)
+
+	latestTag, _, _, err := m.fetchLatestGitHubRelease(ctx)
 	if err == nil {
-		chStatus.Latest = latestTag
-		// Защита от дублей v1.0.0 vs 1.0.0
-		cleanCurrent := strings.TrimPrefix(m.currentVer, "v")
-		chStatus.HasUpdate = latestTag != "" && latestTag != cleanCurrent
+		cleanLatest := strings.TrimPrefix(latestTag, "v")
+		chStatus.Latest = cleanLatest
+		chStatus.HasUpdate = cleanLatest != "" && cleanLatest != chStatus.Current
 	}
 
 	report := &UpdateReport{
@@ -68,14 +126,31 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 		SingBox:    sbStatus,
 		Xray:       xrStatus,
 		AutoUpdate: autoUpdate,
+		PkgManager: m.pkgManager,
 	}
 
-	_ = downloadURL
 	return report, nil
 }
 
-func (m *Manager) checkOpkg(pkgName string) ComponentStatus {
+func (m *Manager) checkPkgStatus(pkgName string) ComponentStatus {
 	st := ComponentStatus{}
+
+	if m.pkgManager == "apk" {
+		out, err := exec.Command("apk", "info", "-v", pkgName).Output()
+		if err == nil {
+			line := strings.TrimSpace(string(out))
+			st.Current = strings.TrimPrefix(line, pkgName+"-")
+			st.Latest = st.Current
+		}
+		// Проверка доступных апдейтов
+		outUpgr, err := exec.Command("apk", "version", "-l", "<", pkgName).Output()
+		if err == nil && len(outUpgr) > 0 {
+			st.HasUpdate = true
+		}
+		return st
+	}
+
+	// opkg
 	outStatus, err := exec.Command("opkg", "status", pkgName).Output()
 	if err == nil {
 		for _, line := range strings.Split(string(outStatus), "\n") {
@@ -101,17 +176,17 @@ func (m *Manager) checkOpkg(pkgName string) ComponentStatus {
 	return st
 }
 
-func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (string, string, error) {
+func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgURL string, binURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	req.Header.Set("User-Agent", "CheburNet-Updater")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("github api request failed")
+		return "", "", "", fmt.Errorf("github api request failed")
 	}
 	defer resp.Body.Close()
 
@@ -123,26 +198,58 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (string, string,
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	tag := strings.TrimPrefix(rel.TagName, "v")
-	targetAssetName := fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)
+	tag = strings.TrimPrefix(rel.TagName, "v")
 
-	var downloadURL string
+	// 1. Поиск пакета (.apk или .ipk) под текущую систему и архитектуру
+	targetExt := ".ipk"
+	if m.pkgManager == "apk" {
+		targetExt = ".apk"
+	}
+
 	for _, a := range rel.Assets {
-		if strings.Contains(a.Name, targetAssetName) {
-			downloadURL = a.BrowserDownloadURL
+		name := strings.ToLower(a.Name)
+		if strings.HasSuffix(name, targetExt) {
+			if strings.Contains(name, strings.ToLower(m.targetArch)) || strings.Contains(name, runtime.GOARCH) {
+				pkgURL = a.BrowserDownloadURL
+				break
+			}
+		}
+	}
+
+	// 2. Fallback: поиск сырого бинарника
+	targetBinPattern := fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)
+	for _, a := range rel.Assets {
+		if strings.Contains(a.Name, targetBinPattern) {
+			binURL = a.BrowserDownloadURL
 			break
 		}
 	}
-	return tag, downloadURL, nil
+
+	return tag, pkgURL, binURL, nil
 }
 
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	if len(pkgs) == 0 {
 		pkgs = []string{"sing-box", "xray-core"}
 	}
+
+	if m.pkgManager == "apk" {
+		log.Println("[INFO] Updating apk package repositories...")
+		if out, err := exec.CommandContext(ctx, "apk", "update").CombinedOutput(); err != nil {
+			return fmt.Errorf("apk update failed: %s", string(out))
+		}
+		args := append([]string{"add", "--upgrade"}, pkgs...)
+		log.Printf("[INFO] Running apk %s...", strings.Join(args, " "))
+		if out, err := exec.CommandContext(ctx, "apk", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("apk upgrade failed: %s", string(out))
+		}
+		return nil
+	}
+
+	// opkg
 	log.Println("[INFO] Updating opkg repository indexes...")
 	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg update failed: %s", string(out))
@@ -155,25 +262,57 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return nil
 }
 
-func (m *Manager) UpgradeSelf(ctx context.Context) error {
-	_, downloadURL, err := m.fetchLatestGitHubRelease(ctx)
+// UpgradePackage скачивает .ipk/.apk и устанавливает через пакетный менеджер
+func (m *Manager) UpgradePackage(ctx context.Context) error {
+	tag, pkgURL, binURL, err := m.fetchLatestGitHubRelease(ctx)
 	if err != nil {
 		return err
 	}
-	if downloadURL == "" {
-		return fmt.Errorf("no compatible asset found for arch: %s", runtime.GOARCH)
+
+	// Если найден нативный .ipk/.apk пакет
+	if pkgURL != "" {
+		log.Printf("[INFO] Found native package update (%s): %s", m.pkgManager, pkgURL)
+		ext := filepath.Ext(pkgURL)
+		tmpFile := filepath.Join(os.TempDir(), "cheburnet_latest"+ext)
+		defer os.Remove(tmpFile)
+
+		if err := m.downloadFile(ctx, pkgURL, tmpFile); err != nil {
+			return fmt.Errorf("failed to download package: %w", err)
+		}
+
+		var cmd *exec.Cmd
+		if m.pkgManager == "apk" {
+			cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", tmpFile)
+		} else {
+			cmd = exec.CommandContext(ctx, "opkg", "install", "--force-reinstall", tmpFile)
+		}
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s install failed: %s", m.pkgManager, string(out))
+		}
+
+		log.Printf("[INFO] %s package successfully installed: %s", m.pkgManager, string(out))
+
+		// Обновляем текущую версию в памяти менеджера сразу
+		m.currentVer = tag
+		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return err
+	// Fallback: если пакета под архитектуру нет в релизах, обновляем сырой бинарник
+	if binURL != "" {
+		log.Printf("[INFO] Package not found. Falling back to raw binary self-update: %s", binURL)
+		if err := m.upgradeRawBinary(ctx, binURL); err != nil {
+			return err
+		}
+		m.currentVer = tag
+		return nil
 	}
-	resp, err := m.httpClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download binary failed: %v", err)
-	}
-	defer resp.Body.Close()
 
+	return fmt.Errorf("no matching .%s package or binary found for arch %s", m.pkgManager, m.targetArch)
+}
+
+func (m *Manager) upgradeRawBinary(ctx context.Context, downloadURL string) error {
 	currPath, err := os.Executable()
 	if err != nil {
 		currPath = "/usr/bin/cheburnetd"
@@ -181,24 +320,44 @@ func (m *Manager) UpgradeSelf(ctx context.Context) error {
 	currPath, _ = filepath.EvalSymlinks(currPath)
 
 	tmpPath := currPath + ".new"
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
-		return fmt.Errorf("create temp binary: %w", err)
+	defer os.Remove(tmpPath)
+
+	if err := m.downloadFile(ctx, downloadURL, tmpPath); err != nil {
+		return err
 	}
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		out.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write binary: %w", err)
+
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		return err
 	}
-	out.Close()
 
 	if err := os.Rename(tmpPath, currPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("replace binary: %w", err)
+		return fmt.Errorf("replace binary failed: %w", err)
 	}
 
-	log.Println("[INFO] cheburnetd binary successfully replaced. Restart required.")
+	log.Println("[INFO] cheburnetd binary successfully replaced.")
 	return nil
+}
+
+func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download error (status: %d)", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+
+	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return err
 }
 
 func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
@@ -224,10 +383,10 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	case "cores":
 		return m.UpgradeCores(ctx, "sing-box", "xray-core")
 	case "cheburnet":
-		return m.UpgradeSelf(ctx)
+		return m.UpgradePackage(ctx)
 	case "all":
 		_ = m.UpgradeCores(ctx, "sing-box", "xray-core")
-		return m.UpgradeSelf(ctx)
+		return m.UpgradePackage(ctx)
 	default:
 		return fmt.Errorf("unknown target: %s", target)
 	}
