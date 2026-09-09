@@ -10,7 +10,6 @@ import (
 	"cheburnet/internal/network"
 )
 
-// EvaluateSnapshot возвращает 13 базовых проверок здоровья ядра, DNS и трафика
 func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 	if !s.Initialized {
 		return nil
@@ -34,7 +33,6 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   s.Engine.CrashCount < 3,
 		Severity:  SeverityError,
 		Message:   fmt.Sprintf("Ядро нестабильно (%d сбоев)", s.Engine.CrashCount),
-		Action:    "",
 	})
 
 	r = append(r, CheckResult{
@@ -52,7 +50,6 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   s.Engine.ConfigValid,
 		Severity:  SeverityCritical,
 		Message:   "Ошибка конфигурации ядра",
-		Action:    "",
 	})
 
 	// --- DNS checks (4) ---
@@ -80,7 +77,6 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   s.DNS.BootstrapAlive,
 		Severity:  SeverityError,
 		Message:   "Bootstrap DNS сервер недоступен",
-		Action:    "",
 	})
 
 	r = append(r, CheckResult{
@@ -89,7 +85,6 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   s.DNS.LatencyMs < 600,
 		Severity:  SeverityWarning,
 		Message:   fmt.Sprintf("Высокая задержка DNS (%d ms)", s.DNS.LatencyMs),
-		Action:    "",
 	})
 
 	// --- Connectivity checks (2) ---
@@ -99,7 +94,6 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   s.Network.InternetDirect,
 		Severity:  SeverityWarning,
 		Message:   "Прямое интернет-соединение недоступно",
-		Action:    "",
 	})
 
 	r = append(r, CheckResult{
@@ -111,7 +105,7 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Action:    "restart_engine",
 	})
 
-	// --- Nodes checks (3) ---
+	// --- Nodes checks (2) ---
 	r = append(r, CheckResult{
 		CheckID:   "nodes.no_available",
 		Component: "nodes",
@@ -131,26 +125,14 @@ func EvaluateSnapshot(s engine.HealthSnapshot) []CheckResult {
 		Healthy:   partialHealthy,
 		Severity:  SeverityWarning,
 		Message:   fmt.Sprintf("Доступно менее половины узлов (%d/%d)", s.Network.AvailableNodes, s.Network.TotalNodes),
-		Action:    "",
-	})
-
-	r = append(r, CheckResult{
-		CheckID:   "nodes.all_failed",
-		Component: "nodes",
-		Healthy:   s.Network.AvailableNodes > 0 || s.Network.TotalNodes == 0,
-		Severity:  SeverityCritical,
-		Message:   "Все серверы подписки упали по таймауту",
-		Action:    "restart_engine",
 	})
 
 	return r
 }
 
-// CheckSystemRouting возвращает 3 системные проверки сетевого стека и фаервола
 func CheckSystemRouting(ctx context.Context, expectedTproxyPort int) []CheckResult {
 	var r []CheckResult
 
-	// 1. Проверяем ip rule на наличие fwmark (0x100000 / 1048576 или 0x200000 / 2097152)
 	out, err := exec.CommandContext(ctx, "ip", "rule", "show").Output()
 	outStr := string(out)
 	hasFwmarkRule := err == nil && (strings.Contains(outStr, "1048576") || strings.Contains(outStr, "2097152") || strings.Contains(outStr, "0x100000") || strings.Contains(outStr, "0x200000"))
@@ -164,7 +146,6 @@ func CheckSystemRouting(ctx context.Context, expectedTproxyPort int) []CheckResu
 		Action:    "fix_routing",
 	})
 
-	// 2. Проверяем таблицу nftables CheburTable
 	nftOut, nftErr := exec.CommandContext(ctx, "nft", "list", "table", "inet", network.TableName).Output()
 	nftStr := string(nftOut)
 	hasNFT := nftErr == nil && strings.Contains(nftStr, "tproxy")
@@ -178,7 +159,6 @@ func CheckSystemRouting(ctx context.Context, expectedTproxyPort int) []CheckResu
 		Action:    "reload_firewall",
 	})
 
-	// 3. Проверяем соответствие TProxy порта в правилах
 	driftHealthy := true
 	if hasNFT && expectedTproxyPort > 0 {
 		if !strings.Contains(nftStr, fmt.Sprintf("%d", expectedTproxyPort)) {

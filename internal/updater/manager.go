@@ -514,3 +514,70 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 		return fmt.Errorf("unknown target: %s", target)
 	}
 }
+
+// StartAutoUpdateLoop запускает периодический фоновый опрос релизов и установку обновлений
+func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled func() bool, onUpdateSuccess func()) {
+	// Первая проверка через 5 минут после старта устройства (чтобы дать подняться сети и прокси)
+	// Далее проверяем каждые 6 часов
+	initialDelay := 5 * time.Minute
+	checkInterval := 6 * time.Hour
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(initialDelay):
+		}
+
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+
+		checkAndUpgrade := func() {
+			if !isAutoUpdateEnabled() {
+				return
+			}
+
+			checkCtx, checkCancel := context.WithTimeout(ctx, 45*time.Second)
+			report, err := m.CheckUpdates(checkCtx, true)
+			checkCancel()
+
+			if err != nil {
+				log.Printf("[updater] Auto-check failed: %v", err)
+				return
+			}
+
+			needUpgrade := report.CheburNet.HasUpdate || report.SingBox.HasUpdate || report.Xray.HasUpdate
+			if !needUpgrade {
+				return
+			}
+
+			log.Printf("[updater] Auto-update triggered! Components: CheburNet=%v, SingBox=%v, Xray=%v",
+				report.CheburNet.HasUpdate, report.SingBox.HasUpdate, report.Xray.HasUpdate)
+
+			upgCtx, upgCancel := context.WithTimeout(ctx, 5*time.Minute)
+			defer upgCancel()
+
+			if err := m.PerformUpgrade(upgCtx, "all"); err != nil {
+				log.Printf("[updater] Auto-upgrade failed: %v", err)
+				return
+			}
+
+			log.Println("[updater] Auto-upgrade completed successfully.")
+			if onUpdateSuccess != nil {
+				onUpdateSuccess()
+			}
+		}
+
+		// Выполняем первую проверку
+		checkAndUpgrade()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkAndUpgrade()
+			}
+		}
+	}()
+}

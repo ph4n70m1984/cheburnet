@@ -1,77 +1,77 @@
 package diagnostics
 
-import "time"
-
 type HysteresisPolicy struct {
 	FailuresToOpen   int
 	SuccessesToClose int
 }
 
 type StateTracker struct {
-	Policy       HysteresisPolicy
-	State        ProblemState
-	Failures     int
-	Successes    int
-	FirstFailure time.Time
-	LastChange   time.Time
+	State            ProblemState
+	Policy           HysteresisPolicy
+	consecutiveFails int
+	consecutiveOKs   int
 }
 
 func NewStateTracker(policy HysteresisPolicy) *StateTracker {
+	if policy.FailuresToOpen <= 0 {
+		policy.FailuresToOpen = 1
+	}
+	if policy.SuccessesToClose <= 0 {
+		policy.SuccessesToClose = 1
+	}
 	return &StateTracker{
-		Policy: policy,
 		State:  StateClear,
+		Policy: policy,
 	}
 }
 
+// Step возвращает 1 при переходе в StateActive, -1 при возврате в StateClear, иначе 0
 func (t *StateTracker) Step(healthy bool) int {
-	now := time.Now()
 	if !healthy {
-		t.Successes = 0
-		t.Failures++
+		t.consecutiveOKs = 0
+		t.consecutiveFails++
 
 		switch t.State {
 		case StateClear:
+			if t.consecutiveFails >= t.Policy.FailuresToOpen {
+				t.State = StateActive
+				return 1
+			}
 			t.State = StatePending
-			t.FirstFailure = now
-			if t.Failures >= t.Policy.FailuresToOpen {
-				t.State = StateActive
-				t.LastChange = now
-				return 1
-			}
+
 		case StatePending:
-			if t.Failures >= t.Policy.FailuresToOpen {
+			if t.consecutiveFails >= t.Policy.FailuresToOpen {
 				t.State = StateActive
-				t.LastChange = now
 				return 1
 			}
+
 		case StateRecovering:
 			t.State = StateActive
-			t.LastChange = now
-		case StateActive:
 		}
-	} else {
-		t.Failures = 0
-		t.Successes++
+		return 0
+	}
 
-		switch t.State {
-		case StatePending:
+	// healthy == true
+	t.consecutiveFails = 0
+	t.consecutiveOKs++
+
+	switch t.State {
+	case StatePending:
+		t.State = StateClear
+
+	case StateActive:
+		if t.consecutiveOKs >= t.Policy.SuccessesToClose {
 			t.State = StateClear
-			t.LastChange = now
-		case StateActive:
-			t.State = StateRecovering
-			if t.Successes >= t.Policy.SuccessesToClose {
-				t.State = StateClear
-				t.LastChange = now
-				return -1
-			}
-		case StateRecovering:
-			if t.Successes >= t.Policy.SuccessesToClose {
-				t.State = StateClear
-				t.LastChange = now
-				return -1
-			}
-		case StateClear:
+			return -1
+		}
+		t.State = StateRecovering
+
+	case StateRecovering:
+		if t.consecutiveOKs >= t.Policy.SuccessesToClose {
+			t.State = StateClear
+			return -1
 		}
 	}
+
 	return 0
 }

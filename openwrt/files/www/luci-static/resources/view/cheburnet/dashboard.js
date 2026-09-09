@@ -72,8 +72,11 @@ return view.extend({
                 if (!banner || !content) return;
 
                 const snap = window.cheburLastDiagSnapshot;
-                if (!snap) {
-                    content.textContent = _('● Проверка диагностических показателей...');
+                if (!snap || !snap.ready) {
+                    banner.style.background = 'rgba(255, 255, 255, 0.05)';
+                    banner.style.borderColor = 'rgba(255, 255, 255, 0.15)';
+                    banner.style.color = '#a1a1aa';
+                    content.textContent = _('● Инициализация системы диагностики...');
                     return;
                 }
 
@@ -84,21 +87,18 @@ return view.extend({
                     banner.style.background = 'rgba(74, 222, 128, 0.1)';
                     banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
                     banner.style.color = '#4ade80';
-                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 16}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
+                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 15}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
                     const container = document.getElementById('diag-problems-container');
                     if (container) container.innerHTML = '';
                     return;
                 }
 
-                const critsCount = pList.filter(p => p.severity === 'critical').length;
-                const errsCount = pList.filter(p => p.severity === 'error' || p.severity === 'warning').length;
-                const hasCrit = critsCount > 0;
-
+                const hasCrit = pList.some(p => p.severity === 'critical');
                 banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
                 banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
                 banner.style.color = hasCrit ? '#f87171' : '#fef08a';
 
-                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> (Критических: <strong>${critsCount}</strong>, Ошибок: <strong>${errsCount}</strong>) &middot; последняя проверка <strong>${relTime}</strong>`;
+                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
             }
 
             function executeProblemAction(action, btnEl) {
@@ -220,7 +220,7 @@ return view.extend({
 
                 if (msg.type === 'diagnostic.snapshot' && msg.snapshot) {
                     renderDiagnosticSnapshot(msg.snapshot);
-                } else if (msg.type === 'diagnostic.problem_created' && msg.problem) {
+                } else if ((msg.type === 'diagnostic.problem_created' || msg.type === 'diagnostic.problem_updated') && msg.problem) {
                     window.cheburProblems[msg.problem.id] = msg.problem;
                     window.cheburLastDiagTime = Date.now();
                     renderProblemsCards();

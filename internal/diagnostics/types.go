@@ -1,10 +1,6 @@
 package diagnostics
 
-import (
-	"time"
-
-	"cheburnet/internal/engine"
-)
+import "time"
 
 type Severity string
 
@@ -14,6 +10,7 @@ const (
 	SeverityWarning  Severity = "warning"
 )
 
+// Состояния трекера гистерезиса
 type ProblemState string
 
 const (
@@ -23,46 +20,44 @@ const (
 	StateRecovering ProblemState = "recovering"
 )
 
-type Problem struct {
-	ID          string         `json:"id"`
-	Component   string         `json:"component"`
-	Severity    Severity       `json:"severity"`
-	Message     string         `json:"message"`
-	FirstSeen   time.Time      `json:"first_seen"`
-	LastSeen    time.Time      `json:"last_seen"`
-	Occurrences uint32         `json:"occurrences"`
-	Details     map[string]any `json:"details,omitempty"`
-	Recoverable bool           `json:"recoverable"`
-	Action      string         `json:"action,omitempty"`
-	ParentID    string         `json:"parent_id,omitempty"`
-	Symptoms    []string       `json:"symptoms,omitempty"`
-}
-
 type CheckResult struct {
 	CheckID   string
 	Component string
 	Healthy   bool
 	Severity  Severity
 	Message   string
-	Details   map[string]any
 	Action    string
+	Details   map[string]interface{}
+}
+
+type Problem struct {
+	ID          string                 `json:"id"`
+	Component   string                 `json:"component"`
+	Severity    Severity               `json:"severity"`
+	Message     string                 `json:"message"`
+	FirstSeen   time.Time              `json:"first_seen"`
+	LastSeen    time.Time              `json:"last_seen"`
+	Occurrences int                    `json:"occurrences"`
+	Details     map[string]interface{} `json:"details,omitempty"`
+	Symptoms    []string               `json:"symptoms,omitempty"`
+	Recoverable bool                   `json:"recoverable"`
+	Action      string                 `json:"action,omitempty"`
 }
 
 type DiagnosticSnapshot struct {
-	Timestamp      time.Time `json:"timestamp"`
-	Healthy        bool      `json:"healthy"`
-	TotalChecks    int       `json:"total_checks"`
-	Critical       int       `json:"critical"`
-	Errors         int       `json:"errors"`
-	Warnings       int       `json:"warnings"`
-	ActiveProblems []Problem `json:"problems"`
+	Ready          bool       `json:"ready"`
+	Timestamp      time.Time  `json:"timestamp"`
+	Healthy        bool       `json:"healthy"`
+	TotalChecks    int        `json:"total_checks"`
+	Critical       int        `json:"critical"`
+	Errors         int        `json:"errors"`
+	Warnings       int        `json:"warnings"`
+	ActiveProblems []*Problem `json:"problems"`
 }
 
 type DiagnosticEvent struct {
 	Type      string              `json:"type"`
+	Snapshot  *DiagnosticSnapshot `json:"snapshot,omitempty"`
 	Problem   *Problem            `json:"problem,omitempty"`
 	ProblemID string              `json:"problem_id,omitempty"`
-	Snapshot  *DiagnosticSnapshot `json:"snapshot,omitempty"`
 }
-
-type HealthSnapshot = engine.HealthSnapshot

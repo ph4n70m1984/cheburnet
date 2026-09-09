@@ -378,6 +378,18 @@ func runDaemon() {
 	app.rulesCron.Start(daemonCtx)
 	diagEngine.StartBackgroundLoop(daemonCtx)
 
+	updManager.StartAutoUpdateLoop(
+		daemonCtx,
+		func() bool {
+			cfg := app.state.Get()
+			return cfg.AutoUpdate
+		},
+		func() {
+			log.Println("[INFO] Restarting daemon after auto-upgrade...")
+			_ = exec.Command("/etc/init.d/cheburnet", "restart").Start()
+		},
+	)
+
 	go hub.Run(daemonCtx, app.getCurrentEngine)
 
 	srv := api.NewServer(

@@ -122,6 +122,7 @@ func filterNodesByRegex(nodes []*config.GenericNode, patterns []string) []*confi
 
 func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) ([]*config.GenericNode, error) {
 	reqURL := strings.TrimSpace(sub.URL)
+	subName := strings.TrimSpace(sub.Name)
 
 	targetHWID := strings.TrimSpace(sub.HWID)
 	if targetHWID == "" && w.autoHWID {
@@ -191,9 +192,29 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 	}
 
 	var nodes []*config.GenericNode
+	seenTags := make(map[string]bool)
+
+	// Вспомогательная функция для генерации уникального тега с учетом имени провайдера
+	makeUniqueTag := func(rawName string) string {
+		tag := strings.TrimSpace(rawName)
+		if tag == "" {
+			tag = "node"
+		}
+		if subName != "" && !strings.HasPrefix(tag, subName+" ") {
+			tag = fmt.Sprintf("[%s] %s", subName, tag)
+		}
+		base := tag
+		counter := 1
+		for seenTags[tag] {
+			counter++
+			tag = fmt.Sprintf("%s (%d)", base, counter)
+		}
+		seenTags[tag] = true
+		return tag
+	}
 
 	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)
-	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex); len(xrayNodes) > 0 {
+	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
 		// 2. Попытка распарсить как Clash YAML
@@ -212,8 +233,10 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 					sec = "reality"
 				}
 
+				uniqueTag := makeUniqueTag(p.Name)
+
 				node := &config.GenericNode{
-					Tag:         p.Name,
+					Tag:         uniqueTag,
 					Address:     p.Server,
 					Port:        p.Port,
 					Protocol:    p.Type,
@@ -254,6 +277,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 
 				node, err := uri.ParseNodeURI(line, w.autoHWID, targetHWID)
 				if err == nil && node != nil {
+					node.Tag = makeUniqueTag(node.Tag)
 					nodes = append(nodes, node)
 				}
 			}
@@ -270,7 +294,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 	return nodes, nil
 }
 
-func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string) []*config.GenericNode {
+func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subName string, seenTags map[string]bool) []*config.GenericNode {
 	var profiles []xrayProfileItem
 	if err := json.Unmarshal(data, &profiles); err != nil {
 		var single xrayProfileItem
@@ -293,7 +317,24 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string) []*c
 	}
 
 	var nodes []*config.GenericNode
-	seenTags := make(map[string]bool)
+
+	makeUniqueTag := func(rawName string) string {
+		tag := strings.TrimSpace(rawName)
+		if tag == "" {
+			tag = "node"
+		}
+		if subName != "" && !strings.HasPrefix(tag, subName+" ") {
+			tag = fmt.Sprintf("[%s] %s", subName, tag)
+		}
+		base := tag
+		counter := 1
+		for seenTags[tag] {
+			counter++
+			tag = fmt.Sprintf("%s (%d)", base, counter)
+		}
+		seenTags[tag] = true
+		return tag
+	}
 
 	for _, prof := range profiles {
 		baseRemarks := strings.TrimSpace(prof.Remarks)
@@ -303,18 +344,15 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string) []*c
 				continue
 			}
 
-			tag := ob.Tag
+			rawTag := ob.Tag
 			if baseRemarks != "" && !strings.Contains(baseRemarks, "Автовыбор") {
-				tag = fmt.Sprintf("%s (%s)", baseRemarks, ob.Tag)
-			}
-			if seenTags[tag] {
-				tag = fmt.Sprintf("%s-%s", tag, ob.Tag)
+				rawTag = fmt.Sprintf("%s (%s)", baseRemarks, ob.Tag)
 			}
 
-			// Проверка совпадений с регулярными выражениями (по Tag, по Remarks группы и по исходному тегу аутбаунда)
+			// Проверка совпадений с регулярными выражениями
 			excluded := false
 			for _, re := range compiled {
-				if re.MatchString(tag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
+				if re.MatchString(rawTag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
 					excluded = true
 					break
 				}
@@ -323,10 +361,10 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string) []*c
 				continue
 			}
 
-			seenTags[tag] = true
+			uniqueTag := makeUniqueTag(rawTag)
 
 			node := &config.GenericNode{
-				Tag:      tag,
+				Tag:      uniqueTag,
 				Protocol: ob.Protocol,
 				HWID:     targetHWID,
 			}

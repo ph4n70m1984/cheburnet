@@ -11,6 +11,7 @@ import (
 
 type DiagnosticsEngine struct {
 	mu             sync.RWMutex
+	ready          bool
 	trackers       map[string]*StateTracker
 	activeProblems map[string]*Problem
 	subscribers    map[chan DiagnosticEvent]struct{}
@@ -18,11 +19,25 @@ type DiagnosticsEngine struct {
 	expectedPort   int
 }
 
+func cloneProblem(p *Problem) *Problem {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if p.Details != nil {
+		cp.Details = maps.Clone(p.Details)
+	}
+	if p.Symptoms != nil {
+		cp.Symptoms = append([]string(nil), p.Symptoms...)
+	}
+	return &cp
+}
+
 func NewEngine(expectedPort int) *DiagnosticsEngine {
-	// 13 проверок из HealthSnapshot + 3 из CheckSystemRouting = 16 активных проверок
-	const totalRealChecks = 16
+	const totalRealChecks = 15
 
 	e := &DiagnosticsEngine{
+		ready:          false,
 		trackers:       make(map[string]*StateTracker),
 		activeProblems: make(map[string]*Problem),
 		subscribers:    make(map[chan DiagnosticEvent]struct{}),
@@ -46,7 +61,7 @@ func NewEngine(expectedPort int) *DiagnosticsEngine {
 		"engine.process_down", "engine.process_unstable", "engine.port_unavailable", "engine.config_invalid",
 		"dns.listener_down", "dns.proxy_unavailable", "dns.bootstrap_failed", "dns.high_latency",
 		"connectivity.internet_unreachable", "connectivity.proxy_e2e_failed",
-		"nodes.no_available", "nodes.partial_unavailable", "nodes.all_failed",
+		"nodes.no_available", "nodes.partial_unavailable",
 		"routing.ip_rule_missing", "routing.nftables_invalid", "config.drift",
 	}
 
@@ -80,6 +95,7 @@ func (e *DiagnosticsEngine) ProcessSnapshot(s engine.HealthSnapshot) {
 	var events []DiagnosticEvent
 
 	e.mu.Lock()
+	e.ready = true
 	for _, res := range results {
 		if ev := e.internalProcessResult(res); ev != nil {
 			events = append(events, *ev)
@@ -117,7 +133,7 @@ func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEv
 		e.activeProblems[res.CheckID] = prob
 		return &DiagnosticEvent{
 			Type:    "diagnostic.problem_created",
-			Problem: prob,
+			Problem: cloneProblem(prob),
 		}
 	} else if transition == -1 {
 		delete(e.activeProblems, res.CheckID)
@@ -134,8 +150,8 @@ func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEv
 				p.Severity = res.Severity
 				p.Details = res.Details
 				return &DiagnosticEvent{
-					Type:    "diagnostic.problem_created",
-					Problem: p,
+					Type:    "diagnostic.problem_updated",
+					Problem: cloneProblem(p),
 				}
 			}
 		}
@@ -144,30 +160,28 @@ func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEv
 	return nil
 }
 
-func (e *DiagnosticsEngine) Snapshot() DiagnosticSnapshot {
-	e.mu.RLock()
-	// Полноценный Deep Copy под защитой RLock для исключения data race
+func (e *DiagnosticsEngine) buildSnapshotLocked() DiagnosticSnapshot {
 	deepCopies := make(map[string]*Problem, len(e.activeProblems))
 	for id, p := range e.activeProblems {
-		if p == nil {
-			continue
-		}
-		cp := *p
-		if p.Details != nil {
-			cp.Details = maps.Clone(p.Details)
-		}
-		if p.Symptoms != nil {
-			cp.Symptoms = append([]string(nil), p.Symptoms...)
-		}
-		deepCopies[id] = &cp
+		deepCopies[id] = cloneProblem(p)
 	}
-	total := e.totalChecks
-	e.mu.RUnlock()
 
-	correlated := Correlate(deepCopies)
+	correlatedRaw := Correlate(deepCopies)
+
+	// Нормализация среза проблем к []*Problem
+	var activeProblems []*Problem
+	switch v := any(correlatedRaw).(type) {
+	case []*Problem:
+		activeProblems = v
+	case []Problem:
+		activeProblems = make([]*Problem, len(v))
+		for i := range v {
+			activeProblems[i] = &v[i]
+		}
+	}
 
 	var crits, errs, warns int
-	for _, p := range correlated {
+	for _, p := range activeProblems {
 		switch p.Severity {
 		case SeverityCritical:
 			crits++
@@ -179,32 +193,39 @@ func (e *DiagnosticsEngine) Snapshot() DiagnosticSnapshot {
 	}
 
 	return DiagnosticSnapshot{
+		Ready:          e.ready,
 		Timestamp:      time.Now(),
-		Healthy:        len(correlated) == 0,
-		TotalChecks:    total,
+		Healthy:        e.ready && len(activeProblems) == 0,
+		TotalChecks:    e.totalChecks,
 		Critical:       crits,
 		Errors:         errs,
 		Warnings:       warns,
-		ActiveProblems: correlated,
+		ActiveProblems: activeProblems,
 	}
+}
+
+func (e *DiagnosticsEngine) Snapshot() DiagnosticSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.buildSnapshotLocked()
 }
 
 func (e *DiagnosticsEngine) Subscribe() (<-chan DiagnosticEvent, func()) {
 	e.mu.Lock()
 	ch := make(chan DiagnosticEvent, 64)
-	e.subscribers[ch] = struct{}{}
-	e.mu.Unlock()
 
-	snap := e.Snapshot()
+	snap := e.buildSnapshotLocked()
 	ch <- DiagnosticEvent{
 		Type:     "diagnostic.snapshot",
 		Snapshot: &snap,
 	}
 
+	e.subscribers[ch] = struct{}{}
+	e.mu.Unlock()
+
 	unsubscribe := func() {
 		e.mu.Lock()
 		delete(e.subscribers, ch)
-		// close(ch) намеренно не вызывается, чтобы исключить send on closed channel при broadcast
 		e.mu.Unlock()
 	}
 
