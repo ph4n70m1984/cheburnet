@@ -509,6 +509,66 @@ return view.extend({
         o.default = 'rules';
         o.editable = true;
 
+        // --- ТАБЛИЦА СЕКЦИЙ МАРШРУТИЗАЦИИ СЕРВИСОВ (ROUTE POLICIES) ---
+        const routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'),
+            _('Выборочная привязка сервисных списков, доменов и подсетей к конкретным нодам выхода.'));
+        routeSec.anonymous = true;
+        routeSec.addremove = true;
+        routeSec.sortable = true;
+
+        o = routeSec.option(form.Flag, 'enabled', _('Вкл'));
+        o.default = '1';
+        o.rmempty = false;
+        o.editable = true;
+
+        o = routeSec.option(form.Value, 'name', _('Название секции'));
+        o.placeholder = 'ai / youtube-hu';
+        o.rmempty = false;
+        o.editable = true;
+
+        o = routeSec.option(form.DynamicList, 'rulesets', _('Сервисные списки'));
+        o.placeholder = _('Выберите списки');
+        o.value('google_ai', 'google_ai (Gemini)');
+        o.value('youtube', 'youtube (Google Video)');
+        o.value('meta', 'meta (Instagram, Facebook)');
+        o.value('telegram', 'telegram (Telegram CDN & Calls)');
+        o.value('discord', 'discord');
+        o.value('twitter', 'twitter');
+        o.value('russia_inside', 'russia_inside (Россия / РКН)');
+        o.editable = true;
+
+        o = routeSec.option(form.ListValue, 'outbound', _('Сервер выхода (Outbound)'));
+        o.placeholder = _('Выберите сервер выхода');
+        o.value('PROXY', _('Глобальный автовыбор (PROXY / AUTO)'));
+        o.value('direct-out', _('Прямой доступ (Мимо прокси / Direct)'));
+        o.rmempty = false;
+        o.editable = true;
+
+        const outboundSelect = o;
+        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes')
+            .then(r => r.json())
+            .then(nodes => {
+                if (Array.isArray(nodes)) {
+                    nodes.forEach(n => {
+                        outboundSelect.value(n.tag, n.tag + ' (' + n.protocol + ')');
+                    });
+                }
+            })
+            .catch(() => {});
+
+        // Расширенные опции секции в модальном окне
+        o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены секции'));
+        o.rows = 4;
+        o.wrap = 'off';
+        o.placeholder = 'gemini.google.com\nai.google.dev';
+        o.modalonly = true;
+
+        o = routeSec.option(form.TextValue, 'custom_subnets', _('Дополнительные подсети секции'));
+        o.rows = 4;
+        o.wrap = 'off';
+        o.placeholder = '142.250.0.0/15';
+        o.modalonly = true;
+
         // --- ВКЛАДКА 2: МАРШРУТИЗАЦИЯ СПИСКОВ ---
         o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
         o.depends('routing_mode', 'rules');
@@ -518,7 +578,7 @@ return view.extend({
         o.default = '72h';
         o.rmempty = false;
 
-        o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Service list (Предопределенные списки)'));
+        o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Service list (Предопределенные списки по умолчанию)'));
         o.depends('routing_mode', 'rules');
         o.value('russia_inside', 'russia_inside (Россия / РКН)');
         o.value('youtube', 'youtube (Google Video)');

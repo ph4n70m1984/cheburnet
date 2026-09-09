@@ -151,24 +151,50 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	isGlobal := cfg.RoutingMode == "global"
 
+	// Сбор всех задействованных RuleSets
+	activeRuleSetsMap := make(map[string]bool)
+	for _, rs := range cfg.RuleSets {
+		activeRuleSetsMap[rs] = true
+	}
+	for _, rp := range cfg.RoutePolicies {
+		if rp.Enabled {
+			for _, rs := range rp.RuleSets {
+				activeRuleSetsMap[rs] = true
+			}
+		}
+	}
+
+	var allRuleSets []string
+	for rs := range activeRuleSetsMap {
+		allRuleSets = append(allRuleSets, rs)
+	}
+
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
 			"server": "fakeip-dns",
 		})
 	} else {
-		if len(cfg.CustomDomains) > 0 {
+		var fakeipDomains []string
+		fakeipDomains = append(fakeipDomains, cfg.CustomDomains...)
+		for _, rp := range cfg.RoutePolicies {
+			if rp.Enabled && len(rp.Domains) > 0 {
+				fakeipDomains = append(fakeipDomains, rp.Domains...)
+			}
+		}
+
+		if len(fakeipDomains) > 0 {
 			dnsRules = append(dnsRules, map[string]interface{}{
 				"action":        "route",
 				"server":        "fakeip-dns",
-				"domain_suffix": cfg.CustomDomains,
+				"domain_suffix": fakeipDomains,
 			})
 		}
-		if len(cfg.RuleSets) > 0 {
+		if len(allRuleSets) > 0 {
 			dnsRules = append(dnsRules, map[string]interface{}{
 				"action":   "route",
 				"server":   "fakeip-dns",
-				"rule_set": cfg.RuleSets,
+				"rule_set": allRuleSets,
 			})
 		}
 	}
@@ -394,6 +420,48 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"outbound": activeOutboundTag,
 			})
 		} else {
+			// Секции маршрутизации по сервисам (Route Policies) имеют наивысший приоритет
+			for _, rp := range cfg.RoutePolicies {
+				if !rp.Enabled || rp.Outbound == "" {
+					continue
+				}
+
+				totalPolicySubnets := append([]string(nil), rp.Subnets...)
+				for _, rs := range rp.RuleSets {
+					if subnets, err := b.rulesLoader.GetSubnets(rs); err == nil && len(subnets) > 0 {
+						totalPolicySubnets = append(totalPolicySubnets, subnets...)
+					}
+				}
+
+				if len(totalPolicySubnets) > 0 {
+					routeRules = append(routeRules, map[string]interface{}{
+						"action":   "route",
+						"inbound":  []string{"tproxy-in"},
+						"ip_cidr":  totalPolicySubnets,
+						"outbound": rp.Outbound,
+					})
+				}
+
+				if len(rp.Domains) > 0 {
+					routeRules = append(routeRules, map[string]interface{}{
+						"action":        "route",
+						"inbound":       []string{"tproxy-in"},
+						"domain_suffix": rp.Domains,
+						"outbound":      rp.Outbound,
+					})
+				}
+
+				if len(rp.RuleSets) > 0 {
+					routeRules = append(routeRules, map[string]interface{}{
+						"action":   "route",
+						"inbound":  []string{"tproxy-in"},
+						"outbound": rp.Outbound,
+						"rule_set": rp.RuleSets,
+					})
+				}
+			}
+
+			// Глобальные динамические подсети и правила по умолчанию
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 
 			hasDiscord := false
@@ -475,7 +543,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
-		for _, rs := range cfg.RuleSets {
+		for _, rs := range allRuleSets {
 			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
 				"type":            "remote",
 				"tag":             rs,

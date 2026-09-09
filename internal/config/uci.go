@@ -78,6 +78,9 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 	// 3. Чтение политик для устройств (client_rule)
 	cfg.ClientPolicies = u.loadClientRuleSections()
 
+	// 4. Чтение секций маршрутизации сервисов (route_policy)
+	cfg.RoutePolicies = u.loadRoutePolicySections()
+
 	// Чтение списка одиночных ссылок нод (vless://, hy2:// и др.)
 	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.manual_nodes").Output(); err == nil {
 		lines := strings.Fields(string(out))
@@ -195,6 +198,81 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 		}
 	}
 	return subs
+}
+
+func (u *UCIStorage) loadRoutePolicySections() []RoutePolicy {
+	var policies []RoutePolicy
+	out, err := exec.Command("uci", "-q", "show", "cheburnet").Output()
+	if err != nil {
+		return policies
+	}
+
+	secMap := make(map[string]*RoutePolicy)
+	lines := strings.Split(string(out), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "cheburnet.@route_policy[") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		keyParts := strings.Split(parts[0], ".")
+		if len(keyParts) < 3 {
+			continue
+		}
+
+		secID := keyParts[1]
+		val := strings.Trim(parts[1], "'\"")
+
+		if _, ok := secMap[secID]; !ok {
+			secMap[secID] = &RoutePolicy{
+				Enabled: true,
+			}
+		}
+
+		propName := keyParts[2]
+		if idx := strings.Index(propName, "["); idx != -1 {
+			propName = propName[:idx]
+		}
+
+		switch propName {
+		case "name":
+			secMap[secID].Name = val
+		case "outbound":
+			secMap[secID].Outbound = val
+		case "enabled":
+			secMap[secID].Enabled = (val == "1" || val == "true")
+		case "rulesets":
+			rawRight := parts[1]
+			if strings.Contains(rawRight, "'") {
+				tokens := strings.Split(rawRight, "'")
+				for _, token := range tokens {
+					item := strings.TrimSpace(token)
+					if item != "" && item != "\"" {
+						secMap[secID].RuleSets = append(secMap[secID].RuleSets, item)
+					}
+				}
+			} else if val != "" {
+				secMap[secID].RuleSets = append(secMap[secID].RuleSets, val)
+			}
+		case "custom_domains":
+			secMap[secID].Domains = append(secMap[secID].Domains, parseTextLines(val)...)
+		case "custom_subnets":
+			secMap[secID].Subnets = append(secMap[secID].Subnets, parseTextLines(val)...)
+		}
+	}
+
+	for _, p := range secMap {
+		if p.Outbound != "" && p.Enabled && (len(p.RuleSets) > 0 || len(p.Domains) > 0 || len(p.Subnets) > 0) {
+			policies = append(policies, *p)
+		}
+	}
+	return policies
 }
 
 func (u *UCIStorage) loadClientRuleSections() []ClientPolicy {

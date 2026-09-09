@@ -15,6 +15,15 @@ type ClientPolicy struct {
 	Enabled bool       `json:"enabled"`
 }
 
+type RoutePolicy struct {
+	Name     string   `json:"name"`      // Название секции (например "ai" или "youtube")
+	Enabled  bool     `json:"enabled"`   // Включено/выключено
+	RuleSets []string `json:"rule_sets"` // Списки правил (.srs), например "google_ai"
+	Domains  []string `json:"domains"`   // Пользовательские домены
+	Subnets  []string `json:"subnets"`   // Пользовательские подсети
+	Outbound string   `json:"outbound"`  // Тег ноды выхода (например "RU-001-1 (vless)" или "AUTO")
+}
+
 type GenericNode struct {
 	Tag          string `json:"tag"`
 	Address      string `json:"address"`
@@ -86,4 +95,5 @@ type CheburConfig struct {
 	CustomPorts           []string             `json:"custom_ports"`     // Введенные вручную порты и диапазоны
 	LocalListFiles        []string             `json:"local_list_files"` // Пути к .lst файлам на роутере
 	ClientPolicies        []ClientPolicy       `json:"client_policies"`  // Правила маршрутизации по клиентам
+	RoutePolicies         []RoutePolicy        `json:"route_policies"`   // Секции маршрутизации по сервисам
 }
