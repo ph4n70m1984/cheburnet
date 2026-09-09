@@ -38,6 +38,24 @@ jobs:
             apk_arch: armhf
             use_upx: true
 
+          # MediaTek MT7621, MT7628, ramips/mipsel (Cudy, Keenetic, Xiaomi и др.)
+          - arch: mipsel_24kc
+            goarch: mipsle
+            goarm: ""
+            gomips: "softfloat"
+            opkg_arch: mipsel_24kc
+            apk_arch: mipsle
+            use_upx: false
+
+          # Qualcomm Atheros / Big-Endian MIPS (AR7xxx/AR9xxx)
+          - arch: mips_24kc
+            goarch: mips
+            goarm: ""
+            gomips: "softfloat"
+            opkg_arch: mips_24kc
+            apk_arch: mips
+            use_upx: false
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
