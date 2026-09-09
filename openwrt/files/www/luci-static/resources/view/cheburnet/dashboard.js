@@ -80,19 +80,25 @@ return view.extend({
                 const relTime = formatRelativeTime(window.cheburLastDiagTime);
                 const pList = Object.values(window.cheburProblems || {});
 
-                if (snap.healthy && pList.length === 0) {
+                if (pList.length === 0) {
                     banner.style.background = 'rgba(74, 222, 128, 0.1)';
                     banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
                     banner.style.color = '#4ade80';
                     content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 16}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
-                } else {
-                    const hasCrit = pList.some(p => p.severity === 'critical') || (snap.critical || 0) > 0;
-                    banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
-                    banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
-                    banner.style.color = hasCrit ? '#f87171' : '#fef08a';
-
-                    content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> (Критических: <strong>${snap.critical || 0}</strong>, Ошибок: <strong>${snap.errors || 0}</strong>) &middot; последняя проверка <strong>${relTime}</strong>`;
+                    const container = document.getElementById('diag-problems-container');
+                    if (container) container.innerHTML = '';
+                    return;
                 }
+
+                const critsCount = pList.filter(p => p.severity === 'critical').length;
+                const errsCount = pList.filter(p => p.severity === 'error' || p.severity === 'warning').length;
+                const hasCrit = critsCount > 0;
+
+                banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
+                banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
+                banner.style.color = hasCrit ? '#f87171' : '#fef08a';
+
+                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> (Критических: <strong>${critsCount}</strong>, Ошибок: <strong>${errsCount}</strong>) &middot; последняя проверка <strong>${relTime}</strong>`;
             }
 
             function executeProblemAction(action, btnEl) {
