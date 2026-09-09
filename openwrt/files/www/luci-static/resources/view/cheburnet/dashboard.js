@@ -47,12 +47,232 @@ return view.extend({
             _('Управление прозрачным проксированием трафика на базе Sing-box и Xray-core'));
 
         // ==========================================
-        // 1. СЕКЦИЯ ЖИВОЙ ТЕЛЕМЕТРИИ (LIVE STATUS)
+        // 1. СЕКЦИЯ ЖИВОЙ ТЕЛЕМЕТРИИ И ДИАГНОСТИКИ
         // ==========================================
-        const statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние и телеметрия в реальном времени'));
+        const statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
 
         statusSec.render = function() {
+            window.cheburProblems = {};
+            window.cheburLastDiagSnapshot = null;
+            window.cheburLastDiagTime = null;
+
+            function formatRelativeTime(timestampMs) {
+                if (!timestampMs) return _('только что');
+                const diffSec = Math.max(0, Math.floor((Date.now() - timestampMs) / 1000));
+                if (diffSec < 2) return _('только что');
+                if (diffSec < 60) return `${diffSec} сек назад`;
+                const diffMin = Math.floor(diffSec / 60);
+                return `${diffMin} мин назад`;
+            }
+
+            function updateBannerContent() {
+                const banner = document.getElementById('diag-banner');
+                const content = document.getElementById('diag-banner-content');
+                if (!banner || !content) return;
+
+                const snap = window.cheburLastDiagSnapshot;
+                if (!snap) {
+                    content.textContent = _('● Проверка диагностических показателей...');
+                    return;
+                }
+
+                const relTime = formatRelativeTime(window.cheburLastDiagTime);
+                const pList = Object.values(window.cheburProblems || {});
+
+                if (snap.healthy && pList.length === 0) {
+                    banner.style.background = 'rgba(74, 222, 128, 0.1)';
+                    banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
+                    banner.style.color = '#4ade80';
+                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 27}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
+                } else {
+                    const hasCrit = pList.some(p => p.severity === 'critical') || (snap.critical || 0) > 0;
+                    banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
+                    banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
+                    banner.style.color = hasCrit ? '#f87171' : '#fef08a';
+
+                    content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> (Критических: <strong>${snap.critical || 0}</strong>, Ошибок: <strong>${snap.errors || 0}</strong>) &middot; последняя проверка <strong>${relTime}</strong>`;
+                }
+            }
+
+            function executeProblemAction(action, btnEl) {
+                if (!action) return;
+                btnEl.disabled = true;
+                btnEl.textContent = _('Выполняется...');
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+                fetch('http://' + window.location.hostname + ':8088/api/v1/actions/' + action, {
+                    method: 'POST',
+                    signal: controller.signal
+                })
+                .then(r => {
+                    clearTimeout(timeoutId);
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(() => {
+                    btnEl.textContent = _('Запрос отправлен');
+                    setTimeout(() => {
+                        const subCtrl = new AbortController();
+                        const subTid = setTimeout(() => subCtrl.abort(), 4000);
+                        fetch('http://' + window.location.hostname + ':8088/api/v1/diagnostics', {
+                            signal: subCtrl.signal
+                        })
+                        .then(r => {
+                            clearTimeout(subTid);
+                            return r.json();
+                        })
+                        .then(renderDiagnosticSnapshot)
+                        .catch(() => {});
+                    }, 1200);
+                })
+                .catch(err => {
+                    clearTimeout(timeoutId);
+                    btnEl.disabled = false;
+                    btnEl.textContent = _('Ошибка');
+                    ui.addNotification(null, E('p', {}, _('Ошибка вызова действия: ') + err), 'error');
+                });
+            }
+
+            function renderProblemsCards() {
+                const container = document.getElementById('diag-problems-container');
+                if (!container) return;
+                container.innerHTML = '';
+
+                const pList = Object.values(window.cheburProblems || {});
+                if (pList.length === 0) return;
+
+                pList.forEach(prob => {
+                    const isCrit = prob.severity === 'critical';
+                    const cardBg = isCrit ? 'rgba(239, 68, 68, 0.08)' : 'rgba(234, 179, 8, 0.08)';
+                    const cardBorder = isCrit ? 'rgba(239, 68, 68, 0.3)' : 'rgba(234, 179, 8, 0.3)';
+
+                    let actionBtn = null;
+                    if (prob.recoverable && prob.action) {
+                        actionBtn = E('button', {
+                            'class': 'btn cbi-button-action',
+                            'style': 'margin: 0; font-size: 11px; padding: 4px 12px; white-space: nowrap;',
+                            'click': function(e) {
+                                e.preventDefault();
+                                executeProblemAction(prob.action, this);
+                            }
+                        }, _('Исправить'));
+                    }
+
+                    let symptomsBlock = null;
+                    if (prob.symptoms && Array.isArray(prob.symptoms)) {
+                        const cleanSymptoms = prob.symptoms.filter(s => s && s !== 'null' && typeof s === 'string');
+                        if (cleanSymptoms.length > 0) {
+                            symptomsBlock = E('div', {
+                                'style': 'margin-top: 6px; font-size: 11px; color: #a1a1aa; padding-left: 10px; border-left: 2px solid rgba(255,255,255,0.15);'
+                            }, [
+                                E('span', { 'style': 'font-weight: 500;' }, 'Подавленные сопутствующие симптомы: '),
+                                cleanSymptoms.join('; ')
+                            ]);
+                        }
+                    }
+
+                    const card = E('div', {
+                        'id': 'problem-card-' + prob.id,
+                        'style': `padding: 10px 14px; border-radius: 6px; background: ${cardBg}; border: 1px solid ${cardBorder}; display: flex; justify-content: space-between; align-items: center; gap: 15px;`
+                    }, [
+                        E('div', { 'style': 'display: flex; flex-direction: column;' }, [
+                            E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
+                                E('span', { 'style': `font-weight: bold; font-size: 13px; color: ${isCrit ? '#f87171' : '#fef08a'};` }, prob.message),
+                                E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.1); color: #d4d4d8;' }, prob.component)
+                            ]),
+                            symptomsBlock
+                        ]),
+                        actionBtn ? E('div', {}, [actionBtn]) : E('span')
+                    ]);
+
+                    container.appendChild(card);
+                });
+            }
+
+            function renderDiagnosticSnapshot(snap) {
+                if (!snap) return;
+
+                window.cheburLastDiagSnapshot = snap;
+                window.cheburLastDiagTime = snap.timestamp ? Date.parse(snap.timestamp) : Date.now();
+
+                window.cheburProblems = {};
+                if (snap.problems && Array.isArray(snap.problems)) {
+                    snap.problems.forEach(p => {
+                        window.cheburProblems[p.id] = p;
+                    });
+                }
+
+                updateBannerContent();
+                renderProblemsCards();
+            }
+
+            function handleWsEvent(msg) {
+                if (!msg || !msg.type) return;
+
+                if (msg.type === 'diagnostic.snapshot' && msg.snapshot) {
+                    renderDiagnosticSnapshot(msg.snapshot);
+                } else if (msg.type === 'diagnostic.problem_created' && msg.problem) {
+                    window.cheburProblems[msg.problem.id] = msg.problem;
+                    window.cheburLastDiagTime = Date.now();
+                    renderProblemsCards();
+                    updateBannerContent();
+                } else if (msg.type === 'diagnostic.problem_resolved' && msg.problem_id) {
+                    delete window.cheburProblems[msg.problem_id];
+                    window.cheburLastDiagTime = Date.now();
+                    renderProblemsCards();
+                    updateBannerContent();
+                }
+            }
+
+            const diagBanner = E('div', {
+                'id': 'diag-banner',
+                'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(74, 222, 128, 0.1); border: 1px solid rgba(74, 222, 128, 0.25); color: #4ade80; display: flex; align-items: center; justify-content: space-between;'
+            }, [
+                E('div', { 'id': 'diag-banner-content', 'style': 'font-size: 13px; font-weight: 500;' }, '● Проверка диагностических показателей...'),
+                E('button', {
+                    'class': 'btn cbi-button-neutral',
+                    'style': 'font-size: 11px; margin: 0; padding: 2px 10px;',
+                    'click': function(e) {
+                        e.preventDefault();
+                        const btn = this;
+                        const origText = btn.textContent;
+                        btn.textContent = _('Опрос...');
+                        btn.disabled = true;
+
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 4000);
+
+                        fetch('http://' + window.location.hostname + ':8088/api/v1/diagnostics', {
+                            signal: controller.signal
+                        })
+                        .then(r => {
+                            clearTimeout(timeoutId);
+                            if (!r.ok) throw new Error('HTTP ' + r.status);
+                            return r.json();
+                        })
+                        .then(snap => {
+                            renderDiagnosticSnapshot(snap);
+                        })
+                        .catch(err => {
+                            clearTimeout(timeoutId);
+                            ui.addNotification(null, E('p', {}, _('Ошибка опроса диагностики: ') + err), 'error');
+                        })
+                        .finally(() => {
+                            btn.textContent = origText;
+                            btn.disabled = false;
+                        });
+                    }
+                }, _('Опросить'))
+            ]);
+
+            const problemsContainer = E('div', {
+                'id': 'diag-problems-container',
+                'style': 'margin-bottom: 15px; display: flex; flex-direction: column; gap: 8px;'
+            });
+
             const updateBanner = E('div', {
                 'id': 'update-notification-banner',
                 'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); color: #fef08a;'
@@ -98,6 +318,8 @@ return view.extend({
             const badgeStyle = 'background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
 
             const viewContainer = E('div', { 'class': 'cbi-section' }, [
+                diagBanner,
+                problemsContainer,
                 updateBanner,
                 E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap;' }, [
                     E('div', { 'style': badgeStyle }, [
@@ -285,6 +507,20 @@ return view.extend({
                         if (ipEl) ipEl.textContent = 'Не определен';
                     });
 
+                const diagInitCtrl = new AbortController();
+                const diagInitTid = setTimeout(() => diagInitCtrl.abort(), 4000);
+                fetch('http://' + host + ':8088/api/v1/diagnostics', {
+                    signal: diagInitCtrl.signal
+                })
+                .then(r => {
+                    clearTimeout(diagInitTid);
+                    return r.json();
+                })
+                .then(renderDiagnosticSnapshot)
+                .catch(() => {
+                    clearTimeout(diagInitTid);
+                });
+
                 const ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
                 window.cheburWs = ws;
 
@@ -310,6 +546,8 @@ return view.extend({
                             showUpdateNotification(msg.data);
                             renderUpdateReport(msg.data);
                         }
+
+                        handleWsEvent(msg);
                     } catch (e) {}
                 };
 
@@ -331,6 +569,7 @@ return view.extend({
                 };
 
                 setInterval(syncClashDelays, 3000);
+                setInterval(updateBannerContent, 1000);
                 setTimeout(checkUpdates, 1200);
             }
 

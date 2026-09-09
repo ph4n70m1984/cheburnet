@@ -20,6 +20,7 @@ import (
 
 	"cheburnet/internal/api"
 	"cheburnet/internal/config"
+	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
 	"cheburnet/internal/subscription"
@@ -37,16 +38,18 @@ var (
 )
 
 type App struct {
-	state       *config.StateManager
-	singboxEng  *engine.SingBoxEngine
-	xrayEng     *engine.XrayEngine
-	activeEng   engine.Engine
-	hub         *telemetry.Hub
-	server      *api.Server
-	rulesLoader *network.CompressedRulesetLoader
-	rulesCron   *network.RulesetCron
-	mu          sync.RWMutex
-	engineOpMu  sync.Mutex
+	state         *config.StateManager
+	singboxEng    *engine.SingBoxEngine
+	xrayEng       *engine.XrayEngine
+	activeEng     engine.Engine
+	hub           *telemetry.Hub
+	server        *api.Server
+	rulesLoader   *network.CompressedRulesetLoader
+	rulesCron     *network.RulesetCron
+	healthTracker *engine.HealthTracker
+	diagEngine    *diagnostics.DiagnosticsEngine
+	mu            sync.RWMutex
+	engineOpMu    sync.Mutex
 }
 
 func showHelp() {
@@ -166,7 +169,6 @@ func main() {
 	}
 }
 
-// collectAllRuleSets собирает уникальные теги категорий из дефолтных правил и RoutePolicies
 func collectAllRuleSets(cfg *config.CheburConfig) []string {
 	unique := make(map[string]struct{})
 	for _, rs := range cfg.RuleSets {
@@ -319,15 +321,20 @@ func runDaemon() {
 	sbEngine := engine.NewSingBoxEngine()
 	xrEngine := engine.NewXrayEngine()
 	hub := telemetry.NewHub()
+	healthTracker := engine.NewHealthTracker()
+	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
+	hub.SetDiagnosticsEngine(diagEngine)
 
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
 
 	app := &App{
-		state:       state,
-		singboxEng:  sbEngine,
-		xrayEng:     xrEngine,
-		hub:         hub,
-		rulesLoader: rulesLoader,
+		state:         state,
+		singboxEng:    sbEngine,
+		xrayEng:       xrEngine,
+		hub:           hub,
+		rulesLoader:   rulesLoader,
+		healthTracker: healthTracker,
+		diagEngine:    diagEngine,
 	}
 
 	if initialConfig.Engine == "xray" {
@@ -369,6 +376,7 @@ func runDaemon() {
 		},
 	)
 	app.rulesCron.Start(daemonCtx)
+	diagEngine.StartBackgroundLoop(daemonCtx)
 
 	go hub.Run(daemonCtx, app.getCurrentEngine)
 
@@ -383,6 +391,52 @@ func runDaemon() {
 			return app.switchEngine(daemonCtx, name)
 		},
 		app.rulesCron,
+		diagEngine,
+		func(action string) error {
+			switch action {
+			case "restart_engine":
+				return app.restartActiveEngine(daemonCtx)
+			case "reload_firewall":
+				return exec.Command("fw4", "reload").Run()
+			case "fix_routing":
+				if err := network.SetupRouting(); err != nil {
+					return fmt.Errorf("setup routing: %w", err)
+				}
+				cfg := app.state.Get()
+				isGlobalMode := cfg.RoutingMode == "global"
+				sIface := cfg.SourceIface
+				if sIface == "" || sIface == "lan" {
+					sIface = "br-lan"
+				}
+				activeSets := collectAllRuleSets(&cfg)
+				subnets := append([]string(nil), cfg.CustomSubnets...)
+				for _, rp := range cfg.RoutePolicies {
+					if rp.Enabled && len(rp.Subnets) > 0 {
+						subnets = append(subnets, rp.Subnets...)
+					}
+				}
+				if len(activeSets) > 0 && app.rulesLoader != nil {
+					fetched := loadSubnetsFromCompressedStorage(app.rulesLoader, activeSets)
+					subnets = append(subnets, fetched...)
+				}
+				fpIPs := extractFullProxyIPs(cfg.ClientPolicies)
+				return network.ApplyNFTRules([]string{sIface}, subnets, fpIPs, cfg.TProxyPort, isGlobalMode)
+			case "switch_node":
+				if err := app.restartActiveEngine(daemonCtx); err != nil {
+					return err
+				}
+				if app.healthTracker != nil {
+					cfg := app.state.Get()
+					app.healthTracker.UpdateNetwork(true, true, 50, len(cfg.Nodes), len(cfg.Nodes))
+					if app.diagEngine != nil {
+						app.diagEngine.ProcessSnapshot(app.healthTracker.Snapshot())
+					}
+				}
+				return nil
+			default:
+				return nil
+			}
+		},
 	)
 	app.server = srv
 
@@ -482,6 +536,27 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 	}
 
 	return engine.SafeReload(ctx, eng, &cfg, targetPath)
+}
+
+func (a *App) restartActiveEngine(ctx context.Context) error {
+	a.engineOpMu.Lock()
+	defer a.engineOpMu.Unlock()
+
+	a.mu.RLock()
+	eng := a.activeEng
+	a.mu.RUnlock()
+
+	if eng == nil {
+		return fmt.Errorf("no active engine")
+	}
+
+	targetPath := RuntimeConfigPathSingBox
+	if eng.Name() == "xray" {
+		targetPath = RuntimeConfigPathXray
+	}
+
+	_ = eng.Stop()
+	return eng.Start(ctx, targetPath)
 }
 
 func (a *App) startActiveEngine(ctx context.Context) error {
@@ -638,8 +713,14 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			_ = currentEng.Stop()
 			if startErr := currentEng.Start(ctx, targetPath); startErr != nil {
 				log.Printf("[supervisor] ERROR: Engine %s restart failed: %v", currentEng.Name(), startErr)
+				if a.healthTracker != nil {
+					a.healthTracker.UpdateEngine(false, 0, false, true, true, true)
+				}
 			} else {
 				log.Printf("[supervisor] INFO: Engine %s successfully restarted", currentEng.Name())
+				if a.healthTracker != nil {
+					a.healthTracker.UpdateEngine(true, 0, true, true, true, false)
+				}
 			}
 		}
 		a.engineOpMu.Unlock()
@@ -664,11 +745,26 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			err := engine.VerifyEngineAlive(healthCtx, &cfg)
 			cancel()
 
+			isAlive := (err == nil)
+			if a.healthTracker != nil {
+				a.healthTracker.UpdateEngine(isAlive, 0, isAlive, true, false, !isAlive)
+				a.healthTracker.UpdateDNS(isAlive, isAlive, true, 20)
+				if a.diagEngine != nil {
+					a.diagEngine.ProcessSnapshot(a.healthTracker.Snapshot())
+				}
+			}
+
 			if err != nil {
 				l1Failures++
 				log.Printf("[supervisor] L1 Warning: Engine %s local check failed (%d/3): %v", eng.Name(), l1Failures, err)
 				if l1Failures >= 3 {
 					l1Failures = 0
+					if a.healthTracker != nil {
+						a.healthTracker.UpdateEngine(false, 0, false, true, false, true)
+						if a.diagEngine != nil {
+							a.diagEngine.ProcessSnapshot(a.healthTracker.Snapshot())
+						}
+					}
 					triggerRestart("L1_PROCESS_DEAD")
 				}
 			} else {
@@ -697,8 +793,18 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			}
 
 			trafficCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			startTraffic := time.Now()
 			err := engine.VerifyTraffic(trafficCtx, &cfg)
 			cancel()
+
+			e2eOk := (err == nil)
+			latency := time.Since(startTraffic).Milliseconds()
+			if a.healthTracker != nil {
+				a.healthTracker.UpdateNetwork(e2eOk, true, latency, len(cfg.Nodes), len(cfg.Nodes))
+				if a.diagEngine != nil {
+					a.diagEngine.ProcessSnapshot(a.healthTracker.Snapshot())
+				}
+			}
 
 			if err != nil {
 				l2Failures++

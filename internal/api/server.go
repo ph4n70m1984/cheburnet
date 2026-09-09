@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
 	"cheburnet/internal/subscription"
@@ -18,6 +19,8 @@ import (
 	"github.com/gofiber/websocket/v2"
 )
 
+type ActionCallback func(action string) error
+
 type Server struct {
 	app        *fiber.App
 	state      *config.StateManager
@@ -27,6 +30,8 @@ type Server struct {
 	getEngine  func() engine.Engine
 	swapEngine func(name string) error
 	rulesCron  *network.RulesetCron
+	diagEngine *diagnostics.DiagnosticsEngine
+	onAction   ActionCallback
 }
 
 func NewServer(
@@ -37,6 +42,8 @@ func NewServer(
 	getEngine func() engine.Engine,
 	swapEngine func(name string) error,
 	rulesCron *network.RulesetCron,
+	diagEngine *diagnostics.DiagnosticsEngine,
+	onAction ActionCallback,
 ) *Server {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
@@ -57,6 +64,8 @@ func NewServer(
 		getEngine:  getEngine,
 		swapEngine: swapEngine,
 		rulesCron:  rulesCron,
+		diagEngine: diagEngine,
+		onAction:   onAction,
 	}
 
 	s.setupRoutes()
@@ -66,14 +75,39 @@ func NewServer(
 func (s *Server) setupRoutes() {
 	api := s.app.Group("/api/v1")
 
-	// Системные эндпоинты
+	// Системные эндпоинты (обработчики в handlers.go)
 	api.Get("/status", s.handleStatus)
 	api.Post("/engine/switch", s.handleSwitchEngine)
 	api.Post("/reload", s.handleReloadConfig)
 	api.Get("/updates/check", s.handleCheckUpdates)
 	api.Post("/updates/upgrade", s.handlePerformUpdate)
 
-	// Ноды, подписки и источники
+	// Эндпоинты слоя диагностики и действий
+	api.Get("/diagnostics", func(c *fiber.Ctx) error {
+		if s.diagEngine != nil {
+			return c.JSON(s.diagEngine.Snapshot())
+		}
+		return c.JSON(fiber.Map{
+			"healthy":  true,
+			"problems": []interface{}{},
+		})
+	})
+
+	api.Post("/actions/:action", func(c *fiber.Ctx) error {
+		action := c.Params("action")
+		if s.onAction != nil {
+			if err := s.onAction(action); err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+			}
+		} else {
+			if action == "reload_firewall" {
+				_ = exec.Command("fw4", "reload").Run()
+			}
+		}
+		return c.JSON(fiber.Map{"status": "ok"})
+	})
+
+	// Ноды, подписки и источники (обработчики в handlers.go)
 	api.Get("/nodes", s.handleGetNodes)
 	api.Post("/nodes", s.handleAddNode)
 	api.Post("/nodes/add", s.handleAddNode)
