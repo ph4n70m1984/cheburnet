@@ -6,6 +6,10 @@
 
 Веб-интерфейс LuCI используется как управляющая панель, а взаимодействие с демоном выполняется через REST API и WebSocket.
 
+
+> **Текущий релиз: `v0.0.8.4`**  
+> Диагностика системы, event-driven WebSocket-события, hysteresis, root-cause correlation, безопасная работа подписчиков WebSocket, 16 реальных health-checks, улучшения UI и оптимизация Go runtime для OpenWrt.
+
 ---
 
 ## ✨ Основные возможности
@@ -593,6 +597,103 @@ WebSocket поддерживает двусторонний обмен сооб�
 
 ---
 
+# 🩺 Системная диагностика
+
+Начиная с `v0.0.8.1`, а в `v0.0.8.4` — с исправлениями конкурентного доступа и состояния,
+Chebur.NET имеет отдельный event-driven слой диагностики.
+
+Diagnostics не дублирует Supervisor: он анализирует уже собранные `HealthSnapshot`,
+определяет активные проблемы и передаёт события в LuCI. Supervisor остаётся владельцем
+операций восстановления engine.
+
+### 16 встроенных проверок
+
+Диагностика включает:
+
+**Engine**
+- `engine.process_down`
+- `engine.process_unstable`
+- `engine.port_unavailable`
+- `engine.config_invalid`
+
+**DNS**
+- `dns.listener_down`
+- `dns.proxy_unavailable`
+- `dns.bootstrap_failed`
+- `dns.high_latency`
+
+**Connectivity**
+- `connectivity.internet_unreachable`
+- `connectivity.proxy_e2e_failed`
+
+**Nodes**
+- `nodes.no_available`
+- `nodes.partial_unavailable`
+- `nodes.all_failed`
+
+**Routing / configuration**
+- `routing.ip_rule_missing`
+- `routing.nftables_invalid`
+- `config.drift`
+
+### Hysteresis
+
+Для предотвращения ложных срабатываний состояние проблемы не меняется после одного
+случайного сбоя.
+
+Используются политики с разным порогом:
+
+- normal — несколько последовательных failures/successes;
+- strict — для критических состояний;
+- soft — для нестабильных/latency-проверок.
+
+Это позволяет избежать мигания ошибок при кратковременных сетевых сбоях.
+
+### Root-cause correlation
+
+Если одна неисправность вызывает несколько вторичных симптомов, диагностика старается
+показать пользователю первопричину вместо списка одинаковых ошибок.
+
+Например:
+
+```text
+Engine process down
+        │
+        ├── proxy port unavailable
+        ├── DNS proxy unavailable
+        ├── proxy E2E failed
+        └── nodes unavailable
+```
+
+В UI при этом отображается основной incident, а зависимые симптомы используются
+для технической детализации.
+
+### WebSocket events
+
+LuCI получает диагностические события без постоянного polling:
+
+```text
+diagnostic.snapshot
+diagnostic.problem_created
+diagnostic.problem_resolved
+```
+
+При подключении клиент получает текущий snapshot, после чего получает только изменения
+состояния.
+
+Это уменьшает лишний WebSocket-трафик и позволяет интерфейсу обновлять incident cards
+сразу после изменения состояния.
+
+### Безопасность конкурентного доступа
+
+В `v0.0.8.4` исправлены важные race conditions:
+
+- snapshot проблем копируется глубоко;
+- карты `Details` не разделяются между внутренним состоянием и клиентом;
+- subscriber channel больше не закрывается конкурентно с broadcast;
+- неинициализированные health snapshots не создают ложный статус healthy;
+- число проверок в API/UI соответствует реальным 16 checks.
+
 # 📊 Telemetry
 
 Telemetry Hub позволяет нескольким клиентам одновременно получать состояние Chebur.NET.
@@ -729,6 +830,7 @@ LuCI предоставляет web-интерфейс управления Cheb
 - состояние Xray;
 - telemetry;
 - live WebSocket status.
+ - системная диагностика и incident cards;
 
 Интерфейс обновляется без необходимости перезапускать сам `cheburnetd`.
 
@@ -1068,6 +1170,11 @@ Local Health Check
 
 # 📦 Установка
 
+### Текущий релиз
+
+urlChebur.NET v0.0.8.4https://github.com/ph4n70m1984/cheburnet/releases/tag/v0.0.8.4
+
+
 Готовые пакеты публикуются в GitHub Releases:
 
 [GitHub Releases Chebur.NET](https://github.com/ph4n70m1984/cheburnet/releases?utm_source=chatgpt.com)
@@ -1295,18 +1402,29 @@ cheburnetd upgrade all
 
 # 🧪 Диагностика
 
-Chebur.NET проверяет не только факт запуска процесса, но и работоспособность локальной proxy-инфраструктуры.
+В `v0.0.8.4` диагностика использует 16 встроенных проверок состояния engine,
+DNS, connectivity, nodes, routing и configuration drift.
 
-Проверяются:
+Проверяется:
 
 - процесс engine;
 - proxy port;
-- DNS;
-- запуск нового engine;
-- конфигурация через native binary validation;
-- E2E connectivity;
-- состояние после reload;
-- восстановление после engine failure.
+- конфигурация engine;
+- локальный DNS;
+- bootstrap DNS;
+- DNS latency;
+- доступность внешнего Internet;
+- proxy E2E connectivity;
+- доступность proxy nodes;
+- `ip rule`;
+- nftables/TProxy;
+- drift сетевой конфигурации.
+
+Состояния проблем проходят через hysteresis, а связанные симптомы могут быть
+сгруппированы вокруг первопричины.
+
+Полный текущий snapshot доступен через REST API, а изменения состояния передаются
+через WebSocket events.
 
 ---
 
@@ -1389,41 +1507,80 @@ Go отвечает за:
 
 ---
 
-# 📌 Что нового по сравнению со старой версией README
+# 📌 Что нового в `v0.0.8.4`
 
-Текущая кодовая база уже содержит функции, которых не было в старой документации:
+Текущий README соответствует релизной кодовой базе `v0.0.8.4`.
 
-- `Route Policy` для маршрутизации отдельных сервисов;
-- ручные proxy-ноды;
-- regex-фильтрация нод подписки;
-- JSON-array profiles;
-- пользовательские destination ports;
-- диапазоны портов;
-- Discord UDP Voice/WebRTC routing;
-- расширенная Client Policy;
-- полноценный engine supervisor;
+### Диагностика и отказоустойчивость
+
+- отдельный `DiagnosticsEngine`;
+- **16 реальных системных health-checks**;
+- hysteresis для защиты от flapping;
+- root-cause correlation;
+- event-driven diagnostic WebSocket;
+- `diagnostic.snapshot`;
+- `diagnostic.problem_created`;
+- `diagnostic.problem_resolved`;
+- безопасная работа с WebSocket subscribers;
+- deep-copy диагностических snapshots;
+- корректная обработка неинициализированного health state;
+- реальные действия восстановления:
+  - `restart_engine`;
+  - `fix_routing`;
+  - `reload_firewall`;
+- неподдерживаемые diagnostic actions теперь возвращают ошибку вместо silent no-op.
+
+### Engine Supervisor
+
 - L1/L2 health checks;
-- exponential restart backoff;
-- transactional SafeReload;
-- automatic rollback;
-- native binary config validation;
-- controlled SIGTERM → SIGKILL process lifecycle;
-- WebSocket update operations;
-- встроенный Update Manager;
+- restart backoff;
+- cooldown;
+- контроль proxy-порта;
+- локальный DNS health check;
+- внешний E2E health check.
+
+### SafeReload
+
+- native binary validation;
+- backup рабочего состояния;
+- reload/restart;
+- post-start health check;
+- автоматический rollback при неуспешном применении.
+
+### Updater
+
+- native `.ipk` / `.apk` package selection;
+- raw binary fallback;
+- SHA256 verification;
+- сохранение пользовательского `/etc/config/cheburnet`;
 - CLI `check_updates`;
 - CLI `upgrade`;
-- SHA256 verification;
-- сохранение пользовательского UCI-конфига при обновлении;
-- различение установленных и отсутствующих proxy cores;
-- native `.ipk` / `.apk` package selection;
-- MIPS/MIPSel CI builds;
-- thread-safe telemetry;
-- immutable/thread-safe configuration snapshots;
-- compressed/atomic ruleset caching;
-- расширенная маршрутизация Xray;
-- синхронизация Xray и sing-box по основным routing/TProxy возможностям.
+- обновление Chebur.NET, sing-box и Xray-core.
 
----
+### Routing
+
+- Client Policy;
+- Route Policy;
+- custom domains;
+- custom subnets;
+- custom destination ports и диапазоны;
+- Discord UDP routing;
+- sing-box и Xray builders;
+- MIPS/MIPSel CI.
+
+### Runtime для OpenWrt
+
+В `v0.0.8.4` runtime-настройки Go были скорректированы для роутеров с ограниченными
+ресурсами:
+
+```text
+GOMEMLIMIT=48MiB
+GOGC=25
+GODEBUG=madvdontneed=1
+```
+
+При этом искусственное ограничение виртуального адресного пространства процесса было
+убрано, чтобы не создавать лишнее ограничение для Go runtime.
 
 # 📜 Лицензия
 
