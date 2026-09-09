@@ -84,7 +84,7 @@ return view.extend({
                     banner.style.background = 'rgba(74, 222, 128, 0.1)';
                     banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
                     banner.style.color = '#4ade80';
-                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 27}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
+                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 16}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
                 } else {
                     const hasCrit = pList.some(p => p.severity === 'critical') || (snap.critical || 0) > 0;
                     banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
@@ -165,11 +165,11 @@ return view.extend({
                     if (prob.symptoms && Array.isArray(prob.symptoms)) {
                         const cleanSymptoms = prob.symptoms.filter(s => s && s !== 'null' && typeof s === 'string');
                         if (cleanSymptoms.length > 0) {
-                            symptomsBlock = E('div', {
-                                'style': 'margin-top: 6px; font-size: 11px; color: #a1a1aa; padding-left: 10px; border-left: 2px solid rgba(255,255,255,0.15);'
-                            }, [
-                                E('span', { 'style': 'font-weight: 500;' }, 'Подавленные сопутствующие симптомы: '),
-                                cleanSymptoms.join('; ')
+                            symptomsBlock = E('details', { 'style': 'margin-top: 6px; font-size: 11px; color: #a1a1aa;' }, [
+                                E('summary', { 'style': 'cursor: pointer; user-select: none;' }, _('Сопутствующие симптомы (%d)').format(cleanSymptoms.length)),
+                                E('ul', { 'style': 'margin: 4px 0 0 16px; padding: 0;' },
+                                    cleanSymptoms.map(s => E('li', {}, s))
+                                )
                             ]);
                         }
                     }

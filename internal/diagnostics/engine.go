@@ -2,8 +2,11 @@ package diagnostics
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"time"
+
+	"cheburnet/internal/engine"
 )
 
 type DiagnosticsEngine struct {
@@ -16,11 +19,14 @@ type DiagnosticsEngine struct {
 }
 
 func NewEngine(expectedPort int) *DiagnosticsEngine {
+	// 13 проверок из HealthSnapshot + 3 из CheckSystemRouting = 16 активных проверок
+	const totalRealChecks = 16
+
 	e := &DiagnosticsEngine{
 		trackers:       make(map[string]*StateTracker),
 		activeProblems: make(map[string]*Problem),
 		subscribers:    make(map[chan DiagnosticEvent]struct{}),
-		totalChecks:    27,
+		totalChecks:    totalRealChecks,
 		expectedPort:   expectedPort,
 	}
 
@@ -29,22 +35,19 @@ func NewEngine(expectedPort int) *DiagnosticsEngine {
 	softPolicy := HysteresisPolicy{FailuresToOpen: 4, SuccessesToClose: 3}
 
 	checkPolicies := map[string]HysteresisPolicy{
-		"engine.process_down":        strictPolicy,
-		"engine.config_invalid":      strictPolicy,
-		"routing.ip_rule_missing":    strictPolicy,
-		"routing.nftables_invalid":   strictPolicy,
-		"subscription.update_failed": strictPolicy,
-		"dns.high_latency":           softPolicy,
+		"engine.process_down":      strictPolicy,
+		"engine.config_invalid":    strictPolicy,
+		"routing.ip_rule_missing":  strictPolicy,
+		"routing.nftables_invalid": strictPolicy,
+		"dns.high_latency":         softPolicy,
 	}
 
 	knownChecks := []string{
 		"engine.process_down", "engine.process_unstable", "engine.port_unavailable", "engine.config_invalid",
-		"engine.start_failed", "dns.listener_down", "dns.proxy_unavailable", "dns.bootstrap_failed",
-		"dns.external_resolution_failed", "dns.high_latency", "routing.ip_rule_missing", "routing.route_missing",
-		"routing.mark_broken", "routing.tproxy_unreachable", "routing.nftables_invalid", "connectivity.proxy_failed",
-		"connectivity.internet_unreachable", "connectivity.proxy_e2e_failed", "connectivity.high_latency",
-		"nodes.no_available", "nodes.partial_unavailable", "nodes.all_failed", "subscription.update_failed",
-		"subscription.empty", "subscription.expired", "ruleset.update_failed", "config.drift",
+		"dns.listener_down", "dns.proxy_unavailable", "dns.bootstrap_failed", "dns.high_latency",
+		"connectivity.internet_unreachable", "connectivity.proxy_e2e_failed",
+		"nodes.no_available", "nodes.partial_unavailable", "nodes.all_failed",
+		"routing.ip_rule_missing", "routing.nftables_invalid", "config.drift",
 	}
 
 	for _, id := range knownChecks {
@@ -68,7 +71,11 @@ func (e *DiagnosticsEngine) Report(res CheckResult) {
 	}
 }
 
-func (e *DiagnosticsEngine) ProcessSnapshot(s HealthSnapshot) {
+func (e *DiagnosticsEngine) ProcessSnapshot(s engine.HealthSnapshot) {
+	if !s.Initialized {
+		return
+	}
+
 	results := EvaluateSnapshot(s)
 	var events []DiagnosticEvent
 
@@ -85,7 +92,6 @@ func (e *DiagnosticsEngine) ProcessSnapshot(s HealthSnapshot) {
 	}
 }
 
-// internalProcessResult вызывается строго под e.mu.Lock() и НЕ вызывает broadcast
 func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEvent {
 	tracker, exists := e.trackers[res.CheckID]
 	if !exists {
@@ -123,6 +129,15 @@ func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEv
 		if p, ok := e.activeProblems[res.CheckID]; ok {
 			p.LastSeen = time.Now()
 			p.Occurrences++
+			if p.Message != res.Message || p.Severity != res.Severity {
+				p.Message = res.Message
+				p.Severity = res.Severity
+				p.Details = res.Details
+				return &DiagnosticEvent{
+					Type:    "diagnostic.problem_created",
+					Problem: p,
+				}
+			}
 		}
 	}
 
@@ -131,16 +146,25 @@ func (e *DiagnosticsEngine) internalProcessResult(res CheckResult) *DiagnosticEv
 
 func (e *DiagnosticsEngine) Snapshot() DiagnosticSnapshot {
 	e.mu.RLock()
-	// Копируем активные проблемы под RLock
-	shallowCopy := make(map[string]*Problem, len(e.activeProblems))
-	for k, v := range e.activeProblems {
-		shallowCopy[k] = v
+	// Полноценный Deep Copy под защитой RLock для исключения data race
+	deepCopies := make(map[string]*Problem, len(e.activeProblems))
+	for id, p := range e.activeProblems {
+		if p == nil {
+			continue
+		}
+		cp := *p
+		if p.Details != nil {
+			cp.Details = maps.Clone(p.Details)
+		}
+		if p.Symptoms != nil {
+			cp.Symptoms = append([]string(nil), p.Symptoms...)
+		}
+		deepCopies[id] = &cp
 	}
 	total := e.totalChecks
 	e.mu.RUnlock()
 
-	// Correlate вызывается вне блокировки
-	correlated := Correlate(shallowCopy)
+	correlated := Correlate(deepCopies)
 
 	var crits, errs, warns int
 	for _, p := range correlated {
@@ -171,7 +195,6 @@ func (e *DiagnosticsEngine) Subscribe() (<-chan DiagnosticEvent, func()) {
 	e.subscribers[ch] = struct{}{}
 	e.mu.Unlock()
 
-	// Snapshot генерируется без удержания Lock на subscribers
 	snap := e.Snapshot()
 	ch <- DiagnosticEvent{
 		Type:     "diagnostic.snapshot",
@@ -181,7 +204,7 @@ func (e *DiagnosticsEngine) Subscribe() (<-chan DiagnosticEvent, func()) {
 	unsubscribe := func() {
 		e.mu.Lock()
 		delete(e.subscribers, ch)
-		close(ch)
+		// close(ch) намеренно не вызывается, чтобы исключить send on closed channel при broadcast
 		e.mu.Unlock()
 	}
 

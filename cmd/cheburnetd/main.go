@@ -421,20 +421,8 @@ func runDaemon() {
 				}
 				fpIPs := extractFullProxyIPs(cfg.ClientPolicies)
 				return network.ApplyNFTRules([]string{sIface}, subnets, fpIPs, cfg.TProxyPort, isGlobalMode)
-			case "switch_node":
-				if err := app.restartActiveEngine(daemonCtx); err != nil {
-					return err
-				}
-				if app.healthTracker != nil {
-					cfg := app.state.Get()
-					app.healthTracker.UpdateNetwork(true, true, 50, len(cfg.Nodes), len(cfg.Nodes))
-					if app.diagEngine != nil {
-						app.diagEngine.ProcessSnapshot(app.healthTracker.Snapshot())
-					}
-				}
-				return nil
 			default:
-				return nil
+				return fmt.Errorf("action %s is not supported", action)
 			}
 		},
 	)

@@ -42,7 +42,6 @@ func VerifyEngineAlive(ctx context.Context, cfg *config.CheburConfig) error {
 		},
 	}
 
-	// Выполняем реальный запрос к локальному DNS-инбаунду ядра
 	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 

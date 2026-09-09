@@ -6,105 +6,101 @@ import (
 )
 
 type EngineHealth struct {
-	Running       bool      `json:"running"`
-	PID           int       `json:"pid"`
-	PortListening bool      `json:"port_listening"`
-	ConfigValid   bool      `json:"config_valid"`
-	LastStart     time.Time `json:"last_start"`
-	RestartCount  uint32    `json:"restart_count"`
-	CrashCount    uint32    `json:"crash_count"`
+	Running       bool
+	CrashCount    int
+	PortListening bool
+	ConfigValid   bool
+	LastRestart   time.Time
 }
 
 type DNSHealth struct {
-	ListenerAlive   bool  `json:"listener_alive"`
-	ProxyDNSWorking bool  `json:"proxy_dns_working"`
-	BootstrapAlive  bool  `json:"bootstrap_alive"`
-	LatencyMs       int64 `json:"latency_ms"`
+	ListenerAlive   bool
+	ProxyDNSWorking bool
+	BootstrapAlive  bool
+	LatencyMs       int64
 }
 
 type NetworkHealth struct {
-	E2EProxyWorking bool  `json:"e2e_proxy_working"`
-	InternetDirect  bool  `json:"internet_direct"`
-	LatencyMs       int64 `json:"latency_ms"`
-	AvailableNodes  int   `json:"available_nodes"`
-	TotalNodes      int   `json:"total_nodes"`
+	InternetDirect  bool
+	E2EProxyWorking bool
+	LatencyMs       int64
+	AvailableNodes  int
+	TotalNodes      int
 }
 
 type HealthSnapshot struct {
-	Timestamp time.Time     `json:"timestamp"`
-	Engine    EngineHealth  `json:"engine"`
-	DNS       DNSHealth     `json:"dns"`
-	Network   NetworkHealth `json:"network"`
+	Initialized bool
+	Timestamp   time.Time
+	Engine      EngineHealth
+	DNS         DNSHealth
+	Network     NetworkHealth
 }
 
-// HealthTracker хранит последнее известное состояние проверок L1/L2
 type HealthTracker struct {
-	mu       sync.RWMutex
-	snapshot HealthSnapshot
+	mu          sync.RWMutex
+	initialized bool
+	engine      EngineHealth
+	dns         DNSHealth
+	network     NetworkHealth
 }
 
 func NewHealthTracker() *HealthTracker {
 	return &HealthTracker{
-		snapshot: HealthSnapshot{
-			Timestamp: time.Now(),
-			Engine: EngineHealth{
-				ConfigValid: true,
-			},
-			DNS: DNSHealth{
-				BootstrapAlive: true,
-			},
-			Network: NetworkHealth{
-				InternetDirect: true,
-			},
+		initialized: false,
+		engine: EngineHealth{
+			ConfigValid: true,
+		},
+		dns: DNSHealth{
+			BootstrapAlive: true,
+		},
+		network: NetworkHealth{
+			InternetDirect: true,
 		},
 	}
 }
 
-func (ht *HealthTracker) Snapshot() HealthSnapshot {
-	ht.mu.RLock()
-	defer ht.mu.RUnlock()
-	return ht.snapshot
-}
-
-func (ht *HealthTracker) UpdateEngine(running bool, pid int, portOk, configOk bool, restartDelta bool, crashDelta bool) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-
-	ht.snapshot.Timestamp = time.Now()
-	ht.snapshot.Engine.Running = running
-	ht.snapshot.Engine.PID = pid
-	ht.snapshot.Engine.PortListening = portOk
-	ht.snapshot.Engine.ConfigValid = configOk
-
-	if restartDelta {
-		ht.snapshot.Engine.RestartCount++
-	}
-	if crashDelta {
-		ht.snapshot.Engine.CrashCount++
-	} else if running {
-		ht.snapshot.Engine.CrashCount = 0
+func (h *HealthTracker) UpdateEngine(running bool, crashes int, portListening bool, cfgValid bool, restartNow bool, isDead bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.initialized = true
+	h.engine.Running = running
+	h.engine.CrashCount = crashes
+	h.engine.PortListening = portListening
+	h.engine.ConfigValid = cfgValid
+	if restartNow {
+		h.engine.LastRestart = time.Now()
 	}
 }
 
-func (ht *HealthTracker) UpdateDNS(listenerAlive, proxyDNS, bootstrap bool, latency int64) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
-
-	ht.snapshot.Timestamp = time.Now()
-	ht.snapshot.DNS.ListenerAlive = listenerAlive
-	ht.snapshot.DNS.ProxyDNSWorking = proxyDNS
-	ht.snapshot.DNS.BootstrapAlive = bootstrap
-	ht.snapshot.DNS.LatencyMs = latency
+func (h *HealthTracker) UpdateDNS(listenerAlive, proxyDNSWorking, bootstrapAlive bool, latencyMs int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.initialized = true
+	h.dns.ListenerAlive = listenerAlive
+	h.dns.ProxyDNSWorking = proxyDNSWorking
+	h.dns.BootstrapAlive = bootstrapAlive
+	h.dns.LatencyMs = latencyMs
 }
 
-func (ht *HealthTracker) UpdateNetwork(e2eOk, directOk bool, latency int64, availableNodes, totalNodes int) {
-	ht.mu.Lock()
-	defer ht.mu.Unlock()
+func (h *HealthTracker) UpdateNetwork(e2eProxyWorking, internetDirect bool, latencyMs int64, availableNodes, totalNodes int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.initialized = true
+	h.network.E2EProxyWorking = e2eProxyWorking
+	h.network.InternetDirect = internetDirect
+	h.network.LatencyMs = latencyMs
+	h.network.AvailableNodes = availableNodes
+	h.network.TotalNodes = totalNodes
+}
 
-	ht.snapshot.Timestamp = time.Now()
-	ht.snapshot.Network.E2EProxyWorking = e2eOk
-	ht.snapshot.Network.InternetDirect = directOk
-	ht.snapshot.Network.LatencyMs = latency
-	ht.snapshot.Network.AvailableNodes = availableNodes
-	ht.snapshot.Network.TotalNodes = totalNodes
+func (h *HealthTracker) Snapshot() HealthSnapshot {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return HealthSnapshot{
+		Initialized: h.initialized,
+		Timestamp:   time.Now(),
+		Engine:      h.engine,
+		DNS:         h.dns,
+		Network:     h.network,
+	}
 }
