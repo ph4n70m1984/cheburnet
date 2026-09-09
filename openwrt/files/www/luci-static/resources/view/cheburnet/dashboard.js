@@ -6,6 +6,34 @@
 'require network';
 'require tools.widgets as widgets';
 
+const ALLOW_DOMAIN_CATEGORIES = [
+    { tag: 'anime',          title: 'Anime (44)' },
+    { tag: 'block',          title: 'Block (337)' },
+    { tag: 'cloudflare',     title: 'Cloudflare (4)' },
+    { tag: 'cloudfront',     title: 'CloudFront (1)' },
+    { tag: 'digitalocean',   title: 'DigitalOcean (1)' },
+    { tag: 'discord',        title: 'Discord (20)' },
+    { tag: 'geoblock',       title: 'Geoblock (466)' },
+    { tag: 'google-ai',      title: 'Google AI (28)' },
+    { tag: 'google-meet',    title: 'Google Meet (5)' },
+    { tag: 'google-play',    title: 'Google Play (12)' },
+    { tag: 'hdrezka',        title: 'HDRezka (17)' },
+    { tag: 'hetzner',        title: 'Hetzner (1)' },
+    { tag: 'hodca',          title: 'Hodca (251)' },
+    { tag: 'meta',           title: 'Meta (18)' },
+    { tag: 'news',           title: 'News (186)' },
+    { tag: 'ovh',            title: 'OVH (1)' },
+    { tag: 'porn',           title: 'Porn (51)' },
+    { tag: 'roblox',         title: 'Roblox (4)' },
+    { tag: 'russia-inside',  title: 'Russia Inside / РКН (1183)' },
+    { tag: 'russia-outside', title: 'Russia Outside (39)' },
+    { tag: 'telegram',       title: 'Telegram (20)' },
+    { tag: 'tiktok',         title: 'TikTok (16)' },
+    { tag: 'twitter',        title: 'Twitter / X (23)' },
+    { tag: 'ukraine-inside', title: 'Ukraine Inside (1551)' },
+    { tag: 'youtube',        title: 'YouTube (18)' }
+];
+
 return view.extend({
     load: function() {
         return Promise.all([
@@ -410,13 +438,12 @@ return view.extend({
         o.depends('auto_hwid', '0');
         o.placeholder = '00000000-0000-0000-0000-000000000000';
 
-        // --- ТАБЛИЦА ПОДПИСОК (CBI GridSection с поддержкой модального окна) ---
+        // --- ТАБЛИЦА ПОДПИСОК ---
         const subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
         subSec.sortable = true;
 
-        // 1. Поля в строке таблицы
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
         o.rmempty = false;
@@ -427,7 +454,7 @@ return view.extend({
         o.datatype = 'string';
         o.rmempty = false;
         o.editable = true;
-        o.renderWidget = function(/* ... */) {
+        o.renderWidget = function() {
             const node = form.Value.prototype.renderWidget.apply(this, arguments);
             const input = node.querySelector('input');
             if (input) {
@@ -437,7 +464,6 @@ return view.extend({
             return node;
         };
 
-        // 2. Поля, доступные только во всплывающем модальном окне при нажатии "Редактировать"
         o = subSec.option(form.Value, 'url', _('URL подписки'));
         o.placeholder = 'https://sub.domain.com/token';
         o.rmempty = false;
@@ -472,7 +498,7 @@ return view.extend({
         o.rmempty = true;
         o.modalonly = true;
 
-        // --- ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ (CLIENT POLICY) ---
+        // --- ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ ---
         const clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'),
             _('Индивидуальные правила маршрутизации для устройств локальной сети. Направляют трафик устройства мимо общих списков.'));
         clientSec.anonymous = true;
@@ -509,7 +535,7 @@ return view.extend({
         o.default = 'rules';
         o.editable = true;
 
-        // --- ТАБЛИЦА СЕКЦИЙ МАРШРУТИЗАЦИИ СЕРВИСОВ (ROUTE POLICIES) ---
+        // --- ТАБЛИЦА СЕКЦИЙ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
         const routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'),
             _('Выборочная привязка сервисных списков, доменов и подсетей к конкретным нодам выхода.'));
         routeSec.anonymous = true;
@@ -528,13 +554,9 @@ return view.extend({
 
         o = routeSec.option(form.DynamicList, 'rulesets', _('Сервисные списки'));
         o.placeholder = _('Выберите списки');
-        o.value('google_ai', 'google_ai (Gemini)');
-        o.value('youtube', 'youtube (Google Video)');
-        o.value('meta', 'meta (Instagram, Facebook)');
-        o.value('telegram', 'telegram (Telegram CDN & Calls)');
-        o.value('discord', 'discord');
-        o.value('twitter', 'twitter');
-        o.value('russia_inside', 'russia_inside (Россия / РКН)');
+        ALLOW_DOMAIN_CATEGORIES.forEach(cat => {
+            o.value(cat.tag, cat.tag + ' — ' + cat.title);
+        });
         o.editable = true;
 
         o = routeSec.option(form.ListValue, 'outbound', _('Сервер выхода (Outbound)'));
@@ -556,7 +578,6 @@ return view.extend({
             })
             .catch(() => {});
 
-        // Расширенные опции секции в модальном окне
         o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены секции'));
         o.rows = 4;
         o.wrap = 'off';
@@ -580,13 +601,9 @@ return view.extend({
 
         o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Service list (Предопределенные списки по умолчанию)'));
         o.depends('routing_mode', 'rules');
-        o.value('russia_inside', 'russia_inside (Россия / РКН)');
-        o.value('youtube', 'youtube (Google Video)');
-        o.value('meta', 'meta (Instagram, Facebook)');
-        o.value('telegram', 'telegram (Telegram CDN & Calls)');
-        o.value('google_ai', 'google_ai (Gemini)');
-        o.value('discord', 'discord');
-        o.value('twitter', 'twitter');
+        ALLOW_DOMAIN_CATEGORIES.forEach(cat => {
+            o.value(cat.tag, cat.tag + ' — ' + cat.title);
+        });
 
         o = s.taboption('routing_rules', form.ListValue, 'custom_domain_type', _('Тип пользовательского списка доменов'));
         o.depends('routing_mode', 'rules');
@@ -640,7 +657,6 @@ return view.extend({
             return node;
         };
 
-        // Пользовательский список портов
         o = s.taboption('routing_rules', form.ListValue, 'custom_port_type', _('Тип пользовательского списка портов'));
         o.depends('routing_mode', 'rules');
         o.value('text', _('Текстовый список'));

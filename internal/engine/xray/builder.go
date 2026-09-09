@@ -52,25 +52,15 @@ func parsePortsForXray(rawPorts []string) string {
 	return strings.Join(formatted, ",")
 }
 
-func getDomainsForRuleSet(rs string) []string {
-	switch rs {
-	case "youtube":
-		return []string{"domain:youtube.com", "domain:googlevideo.com", "domain:ytimg.com"}
-	case "meta":
-		return []string{"domain:instagram.com", "domain:facebook.com", "domain:cdninstagram.com"}
-	case "telegram":
-		return []string{"domain:t.me", "domain:telegram.org"}
-	case "discord":
-		return []string{"domain:discord.com", "domain:discord.gg", "domain:discordapp.com"}
-	case "twitter":
-		return []string{"domain:x.com", "domain:twitter.com", "domain:twimg.com"}
-	case "google_ai":
-		return []string{"domain:gemini.google.com", "domain:generativelanguage.googleapis.com", "domain:ai.google.dev"}
-	case "russia_inside":
-		return []string{"geosite:category-ru"}
-	default:
-		return nil
+func mapRuleSetToXrayGeosite(rs string) string {
+	rs = strings.ToLower(strings.TrimSpace(rs))
+	if rs == "" {
+		return ""
 	}
+	if strings.HasPrefix(rs, "geosite:") {
+		return rs
+	}
+	return "geosite:" + rs
 }
 
 func resolveTargetToCIDR(target string) string {
@@ -106,7 +96,6 @@ func resolveTargetToCIDR(target string) string {
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	isGlobal := cfg.RoutingMode == "global"
 
-	// 1. DNS конфигурация
 	var dnsServers []interface{}
 
 	dnsServerAddr := cfg.DNSServer
@@ -178,7 +167,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		tproxyPort = 1602
 	}
 
-	// 2. Inbounds (TProxy + DNS Inbound + Mixed Port + Dokodemo API)
 	inbounds := []map[string]interface{}{
 		{
 			"tag":      "api-in",
@@ -236,9 +224,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 	xrayConfig["inbounds"] = inbounds
 
-	// 3. Outbounds (Прямой выход, Блокировка, DNS и ноды)
 	sockopt := map[string]interface{}{
-		"mark": 2097152, // 0x200000 NFT SelfMark
+		"mark": 2097152,
 	}
 
 	outbounds := []map[string]interface{}{
@@ -281,7 +268,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 4. Балансировка (Observatory + Balancers)
 	var balancers []map[string]interface{}
 	primaryProxyTag := "direct"
 	balancerTagsMap := make(map[string]bool)
@@ -334,7 +320,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	xrayConfig["outbounds"] = outbounds
 
-	// Вспомогательная функция для назначения цели правила
 	setRuleDetour := func(rule map[string]interface{}, target string) {
 		if target == "PROXY" || target == "proxy-balancer" {
 			target = primaryProxyTag
@@ -346,7 +331,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 5. Маршрутизация (Routing Rules)
 	rules := []map[string]interface{}{
 		{
 			"type":        "field",
@@ -360,7 +344,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// --- ПРИОРИТЕТ 1: Client Policies ---
+	// 1. Клиенты
 	var directClients []string
 	var fullProxyClients []string
 
@@ -400,7 +384,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, rule)
 	}
 
-	// --- ПРИОРИТЕТ 2: Секции маршрутизации сервисов (Route Policies) ---
+	// 2. Секции маршрутизации
 	if !isGlobal {
 		for _, rp := range cfg.RoutePolicies {
 			if !rp.Enabled || rp.Outbound == "" {
@@ -409,10 +393,10 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 			outboundTarget := rp.Outbound
 
-			// 1. Подсети секции
 			totalPolicySubnets := append([]string(nil), rp.Subnets...)
 			for _, rs := range rp.RuleSets {
-				if subnets, err := b.rulesLoader.GetSubnets(rs); err == nil && len(subnets) > 0 {
+				cleanRS := strings.ToLower(strings.TrimSpace(rs))
+				if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 					totalPolicySubnets = append(totalPolicySubnets, subnets...)
 				}
 			}
@@ -427,7 +411,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				rules = append(rules, rule)
 			}
 
-			// 2. Домены секции (включая сопоставление service list)
 			var totalPolicyDomains []string
 			for _, d := range rp.Domains {
 				d = strings.TrimSpace(d)
@@ -436,7 +419,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 			}
 			for _, rs := range rp.RuleSets {
-				totalPolicyDomains = append(totalPolicyDomains, getDomainsForRuleSet(rs)...)
+				if geoCat := mapRuleSetToXrayGeosite(rs); geoCat != "" {
+					totalPolicyDomains = append(totalPolicyDomains, geoCat)
+				}
 			}
 
 			if len(totalPolicyDomains) > 0 {
@@ -451,7 +436,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// --- ПРИОРИТЕТ 3: Общие правила маршрутизации по умолчанию ---
+	// 3. Дефолтные правила
 	if primaryProxyTag != "direct" {
 		if isGlobal {
 			rule := map[string]interface{}{
@@ -463,16 +448,16 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		} else {
 			hasDiscord := false
 			for _, rs := range cfg.RuleSets {
-				if rs == "discord" {
+				if strings.ToLower(strings.TrimSpace(rs)) == "discord" {
 					hasDiscord = true
 					break
 				}
 			}
 
-			// Дефолтные подсети
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			for _, rs := range cfg.RuleSets {
-				subnets, err := b.rulesLoader.GetSubnets(rs)
+				cleanRS := strings.ToLower(strings.TrimSpace(rs))
+				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
 				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
@@ -488,7 +473,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				rules = append(rules, rule)
 			}
 
-			// Discord голосовые порты
 			if hasDiscord {
 				discordUdpRule := map[string]interface{}{
 					"type":       "field",
@@ -496,11 +480,10 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					"network":    "udp",
 					"port":       "443,50000-65535",
 				}
-				setRuleDetour(ruleTarget(discordUdpRule), primaryProxyTag)
+				setRuleDetour(discordUdpRule, primaryProxyTag)
 				rules = append(rules, discordUdpRule)
 			}
 
-			// Пользовательские порты и диапазоны (CustomPorts)
 			if len(cfg.CustomPorts) > 0 {
 				portStr := parsePortsForXray(cfg.CustomPorts)
 				if portStr != "" {
@@ -514,7 +497,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 			}
 
-			// Дефолтные домены
 			var totalDomains []string
 			for _, d := range cfg.CustomDomains {
 				d = strings.TrimSpace(d)
@@ -537,7 +519,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 
 			for _, rs := range cfg.RuleSets {
-				totalDomains = append(totalDomains, getDomainsForRuleSet(rs)...)
+				if geoCat := mapRuleSetToXrayGeosite(rs); geoCat != "" {
+					totalDomains = append(totalDomains, geoCat)
+				}
 			}
 
 			if len(totalDomains) > 0 {
@@ -552,7 +536,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// Mixed-in порт всегда направляется в прокси
 	if cfg.MixedPort > 0 && primaryProxyTag != "direct" {
 		rule := map[string]interface{}{
 			"type":       "field",
@@ -583,10 +566,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.WriteFile(outputPath, data, 0644)
 }
 
-func ruleTarget(m map[string]interface{}) map[string]interface{} {
-	return m
-}
-
 func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
 	out := map[string]interface{}{
 		"tag":      node.Tag,
@@ -594,7 +573,7 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 	}
 
 	sockopt := map[string]interface{}{
-		"mark": 2097152, // 0x200000 NFT SelfMark
+		"mark": 2097152,
 	}
 
 	switch node.Protocol {

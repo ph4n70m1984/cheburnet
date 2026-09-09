@@ -15,8 +15,9 @@ import (
 
 const (
 	RulesStorageDir = "/etc/cheburnet/rules"
+	XrayAssetDir    = "/usr/share/xray"
 	TempDownloadDir = "/tmp"
-	DownloadTimeout = 20 * time.Second
+	DownloadTimeout = 30 * time.Second
 )
 
 type CompressedRulesetLoader struct {
@@ -26,6 +27,7 @@ type CompressedRulesetLoader struct {
 
 func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	_ = os.MkdirAll(RulesStorageDir, 0755)
+	_ = os.MkdirAll(XrayAssetDir, 0755)
 	return &CompressedRulesetLoader{
 		storageDir: RulesStorageDir,
 		client: &http.Client{
@@ -34,14 +36,18 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	}
 }
 
-// GetSubnets сперва пытается прочитать локальный .gz кэш, если его нет — качает из сети
+// GetSubnets читает локальный .gz кэш или пробует скачать его при первом запуске
 func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, error) {
-	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", rulesetName))
+	normName := strings.ToLower(strings.TrimSpace(rulesetName))
+	if normName == "" {
+		return nil, nil
+	}
 
-	// Если архива нет локально (первый холодный старт) — пробуем скачать
+	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", normName))
+
 	if _, err := os.Stat(targetGz); os.IsNotExist(err) {
-		if err := l.downloadAndCompressAtomic(rulesetName, targetGz); err != nil {
-			// Если файла с подсетями нет (404), это штатная ситуация для чисто доменных сервисов
+		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
+			// 404 означает отсутствие IP-подсетей для данной категории (например, чистый geosite)
 			return nil, nil
 		}
 	}
@@ -49,15 +55,21 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 	return l.readCIDRsFromGz(targetGz)
 }
 
-// UpdateRuleset принудительно обновляет и перезаписывает .lst.gz при наличии сети
+// UpdateRuleset принудительно обновляет и упаковывает .lst.gz
 func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
-	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", rulesetName))
-	return l.downloadAndCompressAtomic(rulesetName, targetGz)
+	normName := strings.ToLower(strings.TrimSpace(rulesetName))
+	if normName == "" {
+		return nil
+	}
+	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", normName))
+	return l.downloadAndCompressAtomic(normName, targetGz)
 }
 
-// downloadAndCompressAtomic скачивает, упаковывает в .tmp.gz, проверяет и атомарно перемещает на Flash
+// downloadAndCompressAtomic запрашивает файл подсетей (в репозитории имена в UPPERCASE: DISCORD.lst)
 func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
-	url := fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.lst", rulesetName)
+	// В репозитории itdoginfo/allow-domains файлы в Subnets/IPv4/ названы в UPPERCASE
+	fileName := strings.ToUpper(rulesetName) + ".lst"
+	url := fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s", fileName)
 	tmpGz := filepath.Join(TempDownloadDir, fmt.Sprintf("%s.lst.gz.tmp", rulesetName))
 	defer os.Remove(tmpGz)
 
@@ -73,7 +85,6 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	}
 	defer resp.Body.Close()
 
-	// Если для списка нет IPv4 подсетей в репозитории (например, youtube, google_ai, russia_inside)
 	if resp.StatusCode == http.StatusNotFound {
 		_ = l.createEmptyGz(targetGz)
 		return fmt.Errorf("subnets not found (404)")
@@ -101,16 +112,67 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 		return fmt.Errorf("gzip stream copy failed: %w", err)
 	}
 
-	// Валидация распаковки и формата CIDR
 	if err := l.validateGzFile(tmpGz); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
-	// Атомарный перенос на Flash
 	return l.safeCopyToFlash(tmpGz, targetGz)
 }
 
-// createEmptyGz создает пустой сжатый файл-заглушку, чтобы не опрашивать 404 URL при каждом рестарте
+// UpdateGeositeDat скачивает актуальный geosite.dat для Xray
+func (l *CompressedRulesetLoader) UpdateGeositeDat() (bool, error) {
+	url := "https://github.com/itdoginfo/allow-domains/releases/latest/download/geosite.dat"
+	targetPath := filepath.Join(XrayAssetDir, "geosite.dat")
+	tmpPath := filepath.Join(TempDownloadDir, "geosite.dat.tmp")
+	defer os.Remove(tmpPath)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("User-Agent", "CheburNET-Daemon")
+
+	// Если файл уже есть, используем заголовок проверки изменения по дате
+	if fi, err := os.Stat(targetPath); err == nil {
+		req.Header.Set("If-Modified-Since", fi.ModTime().UTC().Format(http.TimeFormat))
+	}
+
+	resp, err := l.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("http get geosite: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		return false, nil // Файл не изменился
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("bad status downloading geosite.dat: %s", resp.Status)
+	}
+
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return false, fmt.Errorf("create tmp geosite: %w", err)
+	}
+
+	written, err := io.Copy(out, resp.Body)
+	_ = out.Close()
+	if err != nil {
+		return false, fmt.Errorf("stream copy geosite failed: %w", err)
+	}
+
+	if written < 1024 {
+		return false, fmt.Errorf("geosite.dat is too small (%d bytes)", written)
+	}
+
+	if err := l.safeCopyToFlash(tmpPath, targetPath); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 func (l *CompressedRulesetLoader) createEmptyGz(targetPath string) error {
 	f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -123,7 +185,6 @@ func (l *CompressedRulesetLoader) createEmptyGz(targetPath string) error {
 	return nil
 }
 
-// validateGzFile тестирует распаковку во временной памяти и корректность IP
 func (l *CompressedRulesetLoader) validateGzFile(filePath string) error {
 	subnets, err := l.readCIDRsFromGz(filePath)
 	if err != nil {
@@ -135,7 +196,6 @@ func (l *CompressedRulesetLoader) validateGzFile(filePath string) error {
 	return nil
 }
 
-// readCIDRsFromGz распаковывает поток .gz на лету в RAM
 func (l *CompressedRulesetLoader) readCIDRsFromGz(filePath string) ([]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -157,7 +217,6 @@ func (l *CompressedRulesetLoader) readCIDRsFromGz(filePath string) ([]string, er
 			continue
 		}
 
-		// Нормализация одиночных IP в CIDR /32
 		if !strings.Contains(line, "/") {
 			if ip := net.ParseIP(line); ip != nil && ip.To4() != nil {
 				line += "/32"
@@ -170,7 +229,6 @@ func (l *CompressedRulesetLoader) readCIDRsFromGz(filePath string) ([]string, er
 	return subnets, scanner.Err()
 }
 
-// safeCopyToFlash копирует файл через staging-файл с синхронизацией fsync
 func (l *CompressedRulesetLoader) safeCopyToFlash(src, dst string) error {
 	dstTmp := dst + ".new"
 

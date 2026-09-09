@@ -18,7 +18,6 @@ type RulesetCron struct {
 	ticker         *time.Ticker
 }
 
-// ParseInterval безопасно разбирает строковый интервал обновления
 func ParseInterval(val string) time.Duration {
 	switch val {
 	case "24h", "1d":
@@ -26,7 +25,7 @@ func ParseInterval(val string) time.Duration {
 	case "72h", "3d":
 		return 72 * time.Hour
 	case "168h", "1w", "7d":
-		return 7 * 24 * time.Hour // 1 неделя
+		return 7 * 24 * time.Hour
 	default:
 		d, err := time.ParseDuration(val)
 		if err == nil && d >= time.Hour {
@@ -45,7 +44,6 @@ func NewRulesetCron(loader *CompressedRulesetLoader, rulesets []string, interval
 	}
 }
 
-// SetInterval динамически обновляет период таймера при перезагрузке конфига
 func (c *RulesetCron) SetInterval(intervalStr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,14 +56,12 @@ func (c *RulesetCron) SetInterval(intervalStr string) {
 	}
 }
 
-// UpdateRulesets обновляет список отслеживаемых наборов
 func (c *RulesetCron) UpdateRulesets(rulesets []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rulesets = rulesets
 }
 
-// Start запускает цикл обновления в фоновом режиме
 func (c *RulesetCron) Start(ctx context.Context) {
 	go func() {
 		c.mu.Lock()
@@ -86,17 +82,28 @@ func (c *RulesetCron) Start(ctx context.Context) {
 				log.Println("[ruleset-cron] starting scheduled update...")
 				updatedAny := false
 
+				// 1. Проверка и обновление geosite.dat для Xray
+				if updatedGeo, err := c.loader.UpdateGeositeDat(); err != nil {
+					log.Printf("[ruleset-cron] failed to update geosite.dat: %v", err)
+				} else if updatedGeo {
+					log.Println("[ruleset-cron] geosite.dat successfully updated")
+					updatedAny = true
+				}
+
+				// 2. Обновление локальных подсетей .lst.gz
 				for _, rs := range currentSets {
 					if err := c.loader.UpdateRuleset(rs); err != nil {
-						log.Printf("[ruleset-cron] failed to update %s: %v", rs, err)
+						// 404 для подсетей — штатно для сервисов, содержащих только домены
+						log.Printf("[ruleset-cron] ruleset %s: %v", rs, err)
 					} else {
-						log.Printf("[ruleset-cron] successfully updated and compressed %s", rs)
+						log.Printf("[ruleset-cron] successfully updated and compressed subnets for %s", rs)
 						updatedAny = true
 					}
 				}
 
+				// 3. Перезагрузка ядра при наличии изменений
 				if updatedAny && c.reloadCallback != nil {
-					log.Println("[ruleset-cron] applying updated subnets into running engine...")
+					log.Println("[ruleset-cron] applying updated rulesets into running engine...")
 					if err := c.reloadCallback(); err != nil {
 						log.Printf("[ruleset-cron] engine reload failed: %v", err)
 					}

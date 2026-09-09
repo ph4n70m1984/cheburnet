@@ -166,6 +166,33 @@ func main() {
 	}
 }
 
+// collectAllRuleSets собирает уникальные теги категорий из дефолтных правил и RoutePolicies
+func collectAllRuleSets(cfg *config.CheburConfig) []string {
+	unique := make(map[string]struct{})
+	for _, rs := range cfg.RuleSets {
+		norm := strings.ToLower(strings.TrimSpace(rs))
+		if norm != "" {
+			unique[norm] = struct{}{}
+		}
+	}
+	for _, rp := range cfg.RoutePolicies {
+		if rp.Enabled {
+			for _, rs := range rp.RuleSets {
+				norm := strings.ToLower(strings.TrimSpace(rs))
+				if norm != "" {
+					unique[norm] = struct{}{}
+				}
+			}
+		}
+	}
+
+	result := make([]string, 0, len(unique))
+	for tag := range unique {
+		result = append(result, tag)
+	}
+	return result
+}
+
 func loadSubnetsFromCompressedStorage(loader *network.CompressedRulesetLoader, ruleSets []string) []string {
 	var subnets []string
 	for _, rs := range ruleSets {
@@ -185,7 +212,6 @@ func extractFullProxyIPs(policies []config.ClientPolicy) []string {
 		}
 		target := strings.TrimSpace(p.Target)
 
-		// Преобразование MAC-адреса в IP через DHCP leases
 		if strings.Contains(target, ":") && !strings.Contains(target, ".") {
 			file, err := os.Open("/tmp/dhcp.leases")
 			if err == nil {
@@ -274,11 +300,17 @@ func runDaemon() {
 	log.Printf("[INFO] Total active nodes initialized: %d (source mode: %s)", len(initialConfig.Nodes), initialConfig.SourceMode)
 
 	rulesLoader := network.NewCompressedRulesetLoader()
+	allRuleSets := collectAllRuleSets(initialConfig)
 
-	allSubnets := initialConfig.CustomSubnets
-	if len(initialConfig.RuleSets) > 0 {
-		log.Printf("[INFO] Loading cached subnets for rulesets: %v", initialConfig.RuleSets)
-		fetched := loadSubnetsFromCompressedStorage(rulesLoader, initialConfig.RuleSets)
+	allSubnets := append([]string(nil), initialConfig.CustomSubnets...)
+	for _, rp := range initialConfig.RoutePolicies {
+		if rp.Enabled && len(rp.Subnets) > 0 {
+			allSubnets = append(allSubnets, rp.Subnets...)
+		}
+	}
+	if len(allRuleSets) > 0 {
+		log.Printf("[INFO] Loading cached subnets for all rulesets: %v", allRuleSets)
+		fetched := loadSubnetsFromCompressedStorage(rulesLoader, allRuleSets)
 		allSubnets = append(allSubnets, fetched...)
 		log.Printf("[INFO] Total subnets loaded for direct routing: %d", len(allSubnets))
 	}
@@ -330,7 +362,7 @@ func runDaemon() {
 
 	app.rulesCron = network.NewRulesetCron(
 		rulesLoader,
-		initialConfig.RuleSets,
+		allRuleSets,
 		initialConfig.RulesetUpdateInterval,
 		func() error {
 			return app.reloadActiveEngine(daemonCtx)
@@ -421,14 +453,26 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
+	allRuleSets := collectAllRuleSets(&cfg)
+
+	if a.rulesCron != nil {
+		a.rulesCron.UpdateRulesets(allRuleSets)
+	}
+
 	isGlobal := cfg.RoutingMode == "global"
 	sourceIface := cfg.SourceIface
 	if sourceIface == "" || sourceIface == "lan" {
 		sourceIface = "br-lan"
 	}
-	allSubnets := cfg.CustomSubnets
-	if len(cfg.RuleSets) > 0 && a.rulesLoader != nil {
-		fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, cfg.RuleSets)
+
+	allSubnets := append([]string(nil), cfg.CustomSubnets...)
+	for _, rp := range cfg.RoutePolicies {
+		if rp.Enabled && len(rp.Subnets) > 0 {
+			allSubnets = append(allSubnets, rp.Subnets...)
+		}
+	}
+	if len(allRuleSets) > 0 && a.rulesLoader != nil {
+		fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, allRuleSets)
 		allSubnets = append(allSubnets, fetched...)
 	}
 

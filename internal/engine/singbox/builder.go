@@ -151,15 +151,20 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	isGlobal := cfg.RoutingMode == "global"
 
-	// Сбор всех задействованных RuleSets
 	activeRuleSetsMap := make(map[string]bool)
 	for _, rs := range cfg.RuleSets {
-		activeRuleSetsMap[rs] = true
+		norm := strings.ToLower(strings.TrimSpace(rs))
+		if norm != "" {
+			activeRuleSetsMap[norm] = true
+		}
 	}
 	for _, rp := range cfg.RoutePolicies {
 		if rp.Enabled {
 			for _, rs := range rp.RuleSets {
-				activeRuleSetsMap[rs] = true
+				norm := strings.ToLower(strings.TrimSpace(rs))
+				if norm != "" {
+					activeRuleSetsMap[norm] = true
+				}
 			}
 		}
 	}
@@ -372,7 +377,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// 1. Клиентские политики (Client Policy)
+	// 1. Клиентские политики
 	var directClients []string
 	var fullProxyClients []string
 
@@ -420,15 +425,21 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"outbound": activeOutboundTag,
 			})
 		} else {
-			// Секции маршрутизации по сервисам (Route Policies) имеют наивысший приоритет
+			// Приоритетные Route Policies
 			for _, rp := range cfg.RoutePolicies {
 				if !rp.Enabled || rp.Outbound == "" {
 					continue
 				}
 
 				totalPolicySubnets := append([]string(nil), rp.Subnets...)
+				var policyRuleSets []string
 				for _, rs := range rp.RuleSets {
-					if subnets, err := b.rulesLoader.GetSubnets(rs); err == nil && len(subnets) > 0 {
+					cleanRS := strings.ToLower(strings.TrimSpace(rs))
+					if cleanRS == "" {
+						continue
+					}
+					policyRuleSets = append(policyRuleSets, cleanRS)
+					if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 						totalPolicySubnets = append(totalPolicySubnets, subnets...)
 					}
 				}
@@ -451,25 +462,31 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					})
 				}
 
-				if len(rp.RuleSets) > 0 {
+				if len(policyRuleSets) > 0 {
 					routeRules = append(routeRules, map[string]interface{}{
 						"action":   "route",
 						"inbound":  []string{"tproxy-in"},
 						"outbound": rp.Outbound,
-						"rule_set": rp.RuleSets,
+						"rule_set": policyRuleSets,
 					})
 				}
 			}
 
-			// Глобальные динамические подсети и правила по умолчанию
+			// Дефолтные правила
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
-
+			var defaultRuleSets []string
 			hasDiscord := false
+
 			for _, rs := range cfg.RuleSets {
-				if rs == "discord" {
+				cleanRS := strings.ToLower(strings.TrimSpace(rs))
+				if cleanRS == "" {
+					continue
+				}
+				defaultRuleSets = append(defaultRuleSets, cleanRS)
+				if cleanRS == "discord" {
 					hasDiscord = true
 				}
-				subnets, err := b.rulesLoader.GetSubnets(rs)
+				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
 				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
@@ -484,7 +501,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Явный перехват голосовых UDP портов Discord (WebRTC & Handshake)
 			if hasDiscord {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":     "route",
@@ -496,7 +512,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Пользовательские порты и диапазоны
 			if len(cfg.CustomPorts) > 0 {
 				singlePorts, portRanges := parsePortsAndRanges(cfg.CustomPorts)
 				if len(singlePorts) > 0 || len(portRanges) > 0 {
@@ -524,12 +539,12 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			if len(cfg.RuleSets) > 0 {
+			if len(defaultRuleSets) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
 					"inbound":  []string{"tproxy-in"},
 					"outbound": activeOutboundTag,
-					"rule_set": cfg.RuleSets,
+					"rule_set": defaultRuleSets,
 				})
 			}
 		}
