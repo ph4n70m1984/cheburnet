@@ -83,6 +83,7 @@ type CheburConfig struct {
 	RuleSets              []string             `json:"rule_sets"`
 	CustomDomains         []string             `json:"custom_domains"`   // Введенные вручную домены
 	CustomSubnets         []string             `json:"custom_subnets"`   // Введенные вручную IP/CIDR
+	CustomPorts           []string             `json:"custom_ports"`     // Введенные вручную порты и диапазоны
 	LocalListFiles        []string             `json:"local_list_files"` // Пути к .lst файлам на роутере
 	ClientPolicies        []ClientPolicy       `json:"client_policies"`  // Правила маршрутизации по клиентам
 }

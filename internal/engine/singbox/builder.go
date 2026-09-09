@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"cheburnet/internal/config"
@@ -21,6 +22,37 @@ func NewBuilder() *Builder {
 	return &Builder{
 		rulesLoader: network.NewCompressedRulesetLoader(),
 	}
+}
+
+func parsePortsAndRanges(rawPorts []string) ([]uint16, []string) {
+	var singlePorts []uint16
+	var portRanges []string
+
+	for _, p := range rawPorts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+
+		if strings.Contains(p, ":") || strings.Contains(p, "-") {
+			normalized := strings.ReplaceAll(p, "-", ":")
+			parts := strings.Split(normalized, ":")
+			if len(parts) == 2 {
+				start, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+				end, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+				if err1 == nil && err2 == nil && start > 0 && end <= 65535 && start <= end {
+					portRanges = append(portRanges, fmt.Sprintf("%d:%d", start, end))
+				}
+			}
+			continue
+		}
+
+		if val, err := strconv.Atoi(p); err == nil && val > 0 && val <= 65535 {
+			singlePorts = append(singlePorts, uint16(val))
+		}
+	}
+
+	return singlePorts, portRanges
 }
 
 func resolveTargetToCIDR(target string) string {
@@ -119,7 +151,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	isGlobal := cfg.RoutingMode == "global"
 
-	// В режиме global все домены резолвятся через FakeIP для последующего проксирования
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
@@ -357,14 +388,12 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	// 2. Общие правила маршрутизации
 	if activeOutboundTag != "direct-out" {
 		if isGlobal {
-			// В режиме Global весь трафик уходит в прокси
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},
 				"outbound": activeOutboundTag,
 			})
 		} else {
-			// Режим Rules: динамические подсети из архивов и пользовательских списков
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 
 			hasDiscord := false
@@ -397,6 +426,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					"port_range": []string{"50000:65535"},
 					"outbound":   activeOutboundTag,
 				})
+			}
+
+			// Пользовательские порты и диапазоны
+			if len(cfg.CustomPorts) > 0 {
+				singlePorts, portRanges := parsePortsAndRanges(cfg.CustomPorts)
+				if len(singlePorts) > 0 || len(portRanges) > 0 {
+					portRule := map[string]interface{}{
+						"action":   "route",
+						"inbound":  []string{"tproxy-in"},
+						"outbound": activeOutboundTag,
+					}
+					if len(singlePorts) > 0 {
+						portRule["port"] = singlePorts
+					}
+					if len(portRanges) > 0 {
+						portRule["port_range"] = portRanges
+					}
+					routeRules = append(routeRules, portRule)
+				}
 			}
 
 			if len(cfg.CustomDomains) > 0 {

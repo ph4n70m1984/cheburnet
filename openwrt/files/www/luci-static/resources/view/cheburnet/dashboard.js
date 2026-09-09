@@ -416,7 +416,7 @@ return view.extend({
         subSec.addremove = true;
         subSec.sortable = true;
 
-        // 1. Поля, отображаемые в строке таблицы
+        // 1. Поля в строке таблицы
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
         o.rmempty = false;
@@ -564,6 +564,34 @@ return view.extend({
         o.rows = 6;
         o.wrap = 'off';
         o.placeholder = '185.252.177.39\n104.16.0.0/12\n1.1.1.1/32';
+        o.renderWidget = function() {
+            const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
+            const textarea = node.querySelector('textarea');
+            if (textarea) {
+                textarea.style.fontFamily = 'monospace, "Courier New", Courier';
+                textarea.style.fontSize = '12px';
+                textarea.style.backgroundColor = '#181a1f';
+                textarea.style.color = '#e5c07b';
+                textarea.style.borderRadius = '4px';
+                textarea.style.padding = '8px';
+                textarea.style.lineHeight = '1.4';
+                textarea.style.border = '1px solid #3c4049';
+            }
+            return node;
+        };
+
+        // Пользовательский список портов
+        o = s.taboption('routing_rules', form.ListValue, 'custom_port_type', _('Тип пользовательского списка портов'));
+        o.depends('routing_mode', 'rules');
+        o.value('text', _('Текстовый список'));
+        o.default = 'text';
+
+        o = s.taboption('routing_rules', form.TextValue, 'custom_ports', _('Список пользовательских портов'));
+        o.depends('routing_mode', 'rules');
+        o.rows = 5;
+        o.wrap = 'off';
+        o.placeholder = '443\n50000:65535\n8080-8090';
+        o.description = _('Укажите одиночные порты или диапазоны (через двоеточие или дефис), которые нужно перенаправлять в прокси.');
         o.renderWidget = function() {
             const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
             const textarea = node.querySelector('textarea');

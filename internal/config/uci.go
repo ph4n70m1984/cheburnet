@@ -102,9 +102,10 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
 	}
 
-	// Чтение кастомных доменов и подсетей
+	// Чтение кастомных доменов, подсетей и портов
 	cfg.CustomDomains = parseTextLines(u.get("cheburnet.main.custom_domains", ""))
 	cfg.CustomSubnets = parseTextLines(u.get("cheburnet.main.custom_subnets", ""))
+	cfg.CustomPorts = parseTextLines(u.get("cheburnet.main.custom_ports", ""))
 
 	// Чтение путей к локальным файлам .lst
 	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.local_list_files").Output(); err == nil {
@@ -156,7 +157,6 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 			}
 		}
 
-		// Очищаем ключ от индекса списка (например: exclude_regex[0] -> exclude_regex)
 		propName := keyParts[2]
 		if idx := strings.Index(propName, "["); idx != -1 {
 			propName = propName[:idx]
@@ -174,7 +174,6 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 		case "enabled":
 			secMap[secID].Enabled = (val == "1" || val == "true")
 		case "exclude_regex":
-			// Обработка как одиночного значения, так и склеенных списков вида 'val1' 'val2'
 			rawRight := parts[1]
 			if strings.Contains(rawRight, "'") {
 				tokens := strings.Split(rawRight, "'")
