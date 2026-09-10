@@ -453,19 +453,22 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	if cfg.MixedPort > 0 {
-		inbounds := xrayConfig["inbounds"].([]map[string]interface{})
-		xrayConfig["inbounds"] = append(inbounds, map[string]interface{}{
-			"tag":      "mixed-in",
-			"listen":   "127.0.0.1",
-			"port":     cfg.MixedPort,
-			"protocol": "socks",
-			"settings": map[string]interface{}{
-				"auth": "noauth",
-				"udp":  true,
-			},
-		})
+	healthPort := cfg.MixedPort
+	if healthPort <= 0 {
+		healthPort = 4534
 	}
+
+	inbounds := xrayConfig["inbounds"].([]map[string]interface{})
+	xrayConfig["inbounds"] = append(inbounds, map[string]interface{}{
+		"tag":      "mixed-in",
+		"listen":   "127.0.0.1",
+		"port":     healthPort,
+		"protocol": "socks",
+		"settings": map[string]interface{}{
+			"auth": "noauth",
+			"udp":  true,
+		},
+	})
 
 	if len(allNodeTags) > 0 {
 		checkURL := "https://www.gstatic.com/generate_204"
