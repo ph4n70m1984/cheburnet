@@ -513,12 +513,26 @@ return view.extend({
                         .then(data => {
                             if (!data || !data.proxies) return;
                             Object.entries(data.proxies).forEach(([tag, info]) => {
-                                if (info.history && info.history.length > 0) {
-                                    const last = info.history[info.history.length - 1];
-                                    if (last && last.delay !== undefined && last.delay > 0) {
-                                        updateNodeUI(tag, last.delay);
-                                    }
-                                }
+                                // Игнорируем служебные группы
+                                if (['DIRECT', 'REJECT', 'PROXY', 'GLOBAL'].includes(tag)) return;
+
+                                // Запрашиваем индивидуальный пинг для каждого тега
+                                fetch('http://' + host + ':9090/proxies/' + encodeURIComponent(tag) + '/delay?url=https://www.gstatic.com/generate_204&timeout=5000')
+                                    .then(res => res.json())
+                                    .then(delayData => {
+                                        if (delayData && delayData.delay !== undefined) {
+                                            updateNodeUI(tag, delayData.delay);
+                                        }
+                                    })
+                                    .catch(() => {
+                                        // Фолбек на историю из общего ответа, если индивидуальный запрос недоступен
+                                        if (info.history && info.history.length > 0) {
+                                            const last = info.history[info.history.length - 1];
+                                            if (last && last.delay !== undefined) {
+                                                updateNodeUI(tag, last.delay);
+                                            }
+                                        }
+                                    });
                             });
                         })
                         .catch(() => {});
