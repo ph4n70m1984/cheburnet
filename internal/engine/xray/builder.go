@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -80,21 +79,6 @@ func (b *Builder) ValidateConfig(configPath string) error {
 		return fmt.Errorf("xray test failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
-}
-
-func detectXrayMajorVersion() int {
-	out, err := exec.Command("xray", "-version").CombinedOutput()
-	if err != nil {
-		return 0
-	}
-	re := regexp.MustCompile(`Xray\s+(\d+)`)
-	matches := re.FindStringSubmatch(string(out))
-	if len(matches) >= 2 {
-		if ver, err := strconv.Atoi(matches[1]); err == nil {
-			return ver
-		}
-	}
-	return 0
 }
 
 func parsePortsForXray(rawPorts []string) string {
@@ -222,12 +206,11 @@ func formatDNSServerForXray(rawAddr, protocol string) string {
 
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	isGlobal := cfg.RoutingMode == "global"
-	xrayVersion := detectXrayMajorVersion()
 
 	var nodeOutbounds []map[string]interface{}
 	var allNodeTags []string
 	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutbound(node, xrayVersion)
+		ob, err := b.buildNodeOutbound(node)
 		if err == nil {
 			nodeOutbounds = append(nodeOutbounds, ob)
 			allNodeTags = append(allNodeTags, node.Tag)
@@ -441,7 +424,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"port":     tproxyPort,
 				"protocol": "dokodemo-door",
 				"settings": map[string]interface{}{
-					"network": "tcp,udp",
+					"network":        "tcp,udp",
+					"followRedirect": true,
 				},
 				"streamSettings": map[string]interface{}{
 					"sockopt": map[string]interface{}{
@@ -452,7 +436,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					"enabled":      true,
 					"destOverride": []string{"fakedns", "http", "tls", "quic"},
 					"metadataOnly": false,
-					"routeOnly":    false,
+					"routeOnly":    true,
 				},
 			},
 			{
@@ -519,36 +503,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 1. Приоритетный безусловный перехват Telegram DC IP (AS44907, AS62041)
-	// Добавляется ПЕРВЫМ правилом, направляется напрямую на физическую ноду без ожидания observatory
-	// telegramCIDRs := []string{
-	// 	"194.221.0.0/16",
-	// 	"91.108.4.0/22",
-	// 	"91.108.8.0/21",
-	// 	"91.108.12.0/22",
-	// 	"91.108.16.0/21",
-	// 	"91.108.20.0/22",
-	// 	"91.108.56.0/22",
-	// 	"149.154.160.0/20",
-	// 	"149.154.164.0/22",
-	// 	"149.154.168.0/22",
-	// 	"149.154.172.0/22",
-	// 	"91.105.192.0/23",
-	// 	"185.76.151.0/24",
-	// }
+	telegramCIDRs := []string{
+		"194.221.0.0/16",
+		"91.108.4.0/22",
+		"91.108.8.0/21",
+		"91.108.12.0/22",
+		"91.108.16.0/21",
+		"91.108.20.0/22",
+		"91.108.56.0/22",
+		"149.154.160.0/20",
+		"149.154.164.0/22",
+		"149.154.168.0/22",
+		"149.154.172.0/22",
+		"91.105.192.0/23",
+		"185.76.151.0/24",
+	}
 
 	var rules []map[string]interface{}
 
-	// if primaryProxyTag != "direct" {
-	// 	tgRule := map[string]interface{}{
-	// 		"type":       "field",
-	// 		"inboundTag": []string{"tproxy-in"},
-	// 		"ip":         telegramCIDRs,
-	// 	}
-	// 	setRuleDetour(tgRule, primaryProxyTag)
-	// 	rules = append([]map[string]interface{}{tgRule}, rules...)
-	// }
-
+	// 1. Системные инбоунды API и локального DNS
 	rules = append(rules,
 		map[string]interface{}{
 			"type":        "field",
@@ -562,7 +535,28 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	)
 
-	// 2. DNS сервер
+	// 2. Блокируем UDP к Telegram, чтобы клиент не зависал на UDP/QUIC рукопожатии
+	rules = append(rules, map[string]interface{}{
+		"type":        "field",
+		"inboundTag":  []string{"tproxy-in"},
+		"ip":          telegramCIDRs,
+		"network":     "udp",
+		"outboundTag": "block",
+	})
+
+	// 3. Безусловно заворачиваем весь TCP трафик Telegram в активный балансировщик/прокси
+	if primaryProxyTag != "direct" {
+		tgRule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"tproxy-in"},
+			"ip":         telegramCIDRs,
+			"network":    "tcp",
+		}
+		setRuleDetour(tgRule, primaryProxyTag)
+		rules = append(rules, tgRule)
+	}
+
+	// 4. Маршрутизация DNS сервера
 	if primaryProxyTag != "direct" && formattedDNS != "" {
 		cleanHost := dnsServerAddr
 		if strings.Contains(cleanHost, "://") {
@@ -581,7 +575,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 3. Доменные правила (SNI / FakeDNS)
+	// 5. Доменные правила (SNI / FakeDNS)
 	if primaryProxyTag != "direct" && len(proxyDomains) > 0 {
 		domainRule := map[string]interface{}{
 			"type":       "field",
@@ -592,7 +586,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, domainRule)
 	}
 
-	// 4. UDP порты
+	// 6. Общие UDP порты
 	if primaryProxyTag != "direct" {
 		udpRule := map[string]interface{}{
 			"type":       "field",
@@ -604,7 +598,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, udpRule)
 	}
 
-	// 5. Пользовательские подсети и подсети сервисных списков
+	// 7. Пользовательские подсети и подсети сервисных списков
 	if !isGlobal {
 		totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 		for _, rs := range cfg.RuleSets {
@@ -626,7 +620,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 6. Перехват диапазона FakeDNS
+	// 8. Перехват диапазона FakeDNS
 	if primaryProxyTag != "direct" {
 		fakeDnsRule := map[string]interface{}{
 			"type":       "field",
@@ -637,7 +631,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, fakeDnsRule)
 	}
 
-	// 7. Mixed порт
+	// 9. Mixed порт
 	if cfg.MixedPort > 0 && primaryProxyTag != "direct" {
 		rule := map[string]interface{}{
 			"type":       "field",
@@ -647,7 +641,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, rule)
 	}
 
-	// 8. Дефолтный безусловный перехватчик tproxy-in
+	// 10. Дефолтный безусловный перехватчик tproxy-in
 	if primaryProxyTag != "direct" {
 		defaultTProxyRule := map[string]interface{}{
 			"type":       "field",
@@ -679,14 +673,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.WriteFile(outputPath, data, 0644)
 }
 
-func (b *Builder) buildNodeOutbound(node *config.GenericNode, xrayVersion int) (map[string]interface{}, error) {
+func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
 	proto := strings.ToLower(node.Protocol)
-
-	if proto == "hysteria2" || proto == "hysteria" {
-		if xrayVersion < 26 {
-			return nil, fmt.Errorf("hysteria/hysteria2 requires xray >= 26 (detected: %d), skipped", xrayVersion)
-		}
-	}
 
 	out := map[string]interface{}{
 		"tag":      node.Tag,
@@ -763,25 +751,28 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode, xrayVersion int) (
 			authPass = node.UUID
 		}
 
-		serverName := node.SNI
+		serverName := strings.TrimSpace(node.SNI)
 		if serverName == "" {
-			serverName = node.Address
+			serverName = strings.TrimSpace(node.Address)
 		}
 
 		out["protocol"] = "hysteria"
 		out["settings"] = map[string]interface{}{
-			"version": 2,
 			"address": node.Address,
 			"port":    node.Port,
+			"version": 2,
 		}
 
 		tlsSettings := map[string]interface{}{
-			"serverName":    serverName,
-			"allowInsecure": node.Insecure,
-			"alpn":          []string{"h3"},
+			"serverName":              serverName,
+			"allowInsecure":           node.Insecure,
+			"enableSessionResumption": false,
+			"alpn":                    []string{"h3"},
 		}
 		if node.Fingerprint != "" {
 			tlsSettings["fingerprint"] = node.Fingerprint
+		} else {
+			tlsSettings["fingerprint"] = "chrome"
 		}
 
 		hysteriaSettings := map[string]interface{}{

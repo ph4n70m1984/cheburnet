@@ -123,7 +123,6 @@ func mapToSRSName(rs string) string {
 	case "google_play", "google-play":
 		return "google_play"
 	default:
-		// В allow-domains почти все составные имена идут с подчёркиванием
 		return strings.ReplaceAll(rs, "-", "_")
 	}
 }

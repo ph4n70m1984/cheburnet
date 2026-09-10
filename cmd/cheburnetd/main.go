@@ -34,6 +34,7 @@ var (
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
 	RuntimeConfigPathXray    = "/tmp/run/cheburnet/xray.json"
 	DefaultAPIBind           = "0.0.0.0:8088"
+	DefaultClashShimPort     = 9090
 	PIDFile                  = "/var/run/cheburnetd.pid"
 )
 
@@ -44,6 +45,7 @@ type App struct {
 	activeEng     engine.Engine
 	hub           *telemetry.Hub
 	server        *api.Server
+	clashShim     *api.ClashShimServer
 	rulesLoader   *network.CompressedRulesetLoader
 	rulesCron     *network.RulesetCron
 	healthTracker *engine.HealthTracker
@@ -380,6 +382,9 @@ func runDaemon() {
 		}
 	}
 
+	// Запуск Clash API Shim для поддержки панелей управления (Yacd / Metacubexd на 9090) при работе Xray
+	app.syncClashShim(daemonCtx)
+
 	app.rulesCron = network.NewRulesetCron(
 		rulesLoader,
 		allRuleSets,
@@ -471,11 +476,76 @@ func runDaemon() {
 
 	log.Println("[INFO] Shutting down Chebur.NET...")
 	_ = srv.Shutdown()
+	app.stopClashShim()
 	app.stopActiveEngine()
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
 	log.Println("[INFO] Stopped.")
+}
+
+func (a *App) syncClashShim(ctx context.Context) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	eng := a.activeEng
+	if eng == nil {
+		return
+	}
+
+	if eng.Name() == "xray" {
+		if a.clashShim == nil {
+			cfg := a.state.Get()
+			shim := api.NewClashShimServer(&cfg, func(nodeTag string) error {
+				log.Printf("[clash-shim] User selected node: %s", nodeTag)
+				var targetNode *config.GenericNode
+				for _, n := range cfg.Nodes {
+					if n.Tag == nodeTag {
+						targetNode = n
+						break
+					}
+				}
+				if targetNode == nil {
+					return fmt.Errorf("node with tag '%s' not found", nodeTag)
+				}
+
+				var reordered []*config.GenericNode
+				reordered = append(reordered, targetNode)
+				for _, n := range cfg.Nodes {
+					if n.Tag != nodeTag {
+						reordered = append(reordered, n)
+					}
+				}
+
+				a.state.Update(func(c *config.CheburConfig) {
+					c.Nodes = reordered
+				})
+
+				return a.reloadActiveEngine(ctx)
+			})
+
+			if err := shim.Start(DefaultClashShimPort); err != nil {
+				log.Printf("[WARN] Failed to start Clash API shim on port %d: %v", DefaultClashShimPort, err)
+			} else {
+				a.clashShim = shim
+			}
+		}
+	} else {
+		if a.clashShim != nil {
+			log.Println("[INFO] Stopping Clash API shim (sing-box provides native clash API on port 9090)")
+			_ = a.clashShim.Stop()
+			a.clashShim = nil
+		}
+	}
+}
+
+func (a *App) stopClashShim() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.clashShim != nil {
+		_ = a.clashShim.Stop()
+		a.clashShim = nil
+	}
 }
 
 func stopDaemon() {
@@ -735,6 +805,9 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	a.mu.Lock()
 	a.activeEng = newEng
 	a.mu.Unlock()
+
+	// 6. Синхронизируем состояние встроенного Clash API Shim для веб-панелей
+	a.syncClashShim(ctx)
 
 	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
 	return nil

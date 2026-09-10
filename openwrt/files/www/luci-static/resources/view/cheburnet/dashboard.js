@@ -441,7 +441,7 @@ return view.extend({
                             Object.entries(data.proxies).forEach(([tag, info]) => {
                                 if (info.history && info.history.length > 0) {
                                     const last = info.history[info.history.length - 1];
-                                    if (last && last.delay !== undefined) {
+                                    if (last && last.delay !== undefined && last.delay > 0) {
                                         updateNodeUI(tag, last.delay);
                                     }
                                 }
@@ -544,7 +544,9 @@ return view.extend({
 
                         if (msg.node_latencies) {
                             for (const [tag, latency] of Object.entries(msg.node_latencies)) {
-                                updateNodeUI(tag, latency);
+                                if (latency && latency > 0) {
+                                    updateNodeUI(tag, latency);
+                                }
                             }
                         }
 
