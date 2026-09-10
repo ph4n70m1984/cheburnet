@@ -14,9 +14,9 @@ const ALLOW_DOMAIN_CATEGORIES = [
     { tag: 'digitalocean',   title: 'DigitalOcean (1)' },
     { tag: 'discord',        title: 'Discord (20)' },
     { tag: 'geoblock',       title: 'Geoblock (466)' },
-    { tag: 'google-ai',      title: 'Google AI (28)' },
-    { tag: 'google-meet',    title: 'Google Meet (5)' },
-    { tag: 'google-play',    title: 'Google Play (12)' },
+    { tag: 'google_ai',      title: 'Google AI (28)' },
+    { tag: 'google_meet',    title: 'Google Meet (5)' },
+    { tag: 'google_play',    title: 'Google Play (12)' },
     { tag: 'hdrezka',        title: 'HDRezka (17)' },
     { tag: 'hetzner',        title: 'Hetzner (1)' },
     { tag: 'hodca',          title: 'Hodca (251)' },
@@ -25,12 +25,12 @@ const ALLOW_DOMAIN_CATEGORIES = [
     { tag: 'ovh',            title: 'OVH (1)' },
     { tag: 'porn',           title: 'Porn (51)' },
     { tag: 'roblox',         title: 'Roblox (4)' },
-    { tag: 'russia-inside',  title: 'Russia Inside / РКН (1183)' },
-    { tag: 'russia-outside', title: 'Russia Outside (39)' },
+    { tag: 'russia_inside',  title: 'Russia Inside / РКН (1183)' },
+    { tag: 'russia_outside', title: 'Russia Outside (39)' },
     { tag: 'telegram',       title: 'Telegram (20)' },
     { tag: 'tiktok',         title: 'TikTok (16)' },
     { tag: 'twitter',        title: 'Twitter / X (23)' },
-    { tag: 'ukraine-inside', title: 'Ukraine Inside (1551)' },
+    { tag: 'ukraine_inside', title: 'Ukraine Inside (1551)' },
     { tag: 'youtube',        title: 'YouTube (18)' }
 ];
 

@@ -2,11 +2,16 @@ package xray
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -22,6 +27,74 @@ func NewBuilder() *Builder {
 	return &Builder{
 		rulesLoader: network.NewCompressedRulesetLoader(),
 	}
+}
+
+func (b *Builder) EnsureAssets(ctx context.Context) error {
+	assetDir := os.Getenv("XRAY_LOCATION_ASSET")
+	if assetDir == "" {
+		assetDir = "/usr/share/xray"
+	}
+
+	geositePath := filepath.Join(assetDir, "geosite.dat")
+	if _, err := os.Stat(geositePath); err == nil {
+		return nil
+	}
+
+	if err := os.MkdirAll(assetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create asset dir: %w", err)
+	}
+
+	url := "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create download request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download geosite.dat failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download geosite.dat returned status: %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(geositePath)
+	if err != nil {
+		return fmt.Errorf("create geosite.dat file: %w", err)
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("save geosite.dat failed: %w", err)
+	}
+
+	return nil
+}
+
+func (b *Builder) ValidateConfig(configPath string) error {
+	cmd := exec.Command("xray", "run", "-test", "-c", configPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("xray test failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func detectXrayMajorVersion() int {
+	out, err := exec.Command("xray", "-version").CombinedOutput()
+	if err != nil {
+		return 0
+	}
+	re := regexp.MustCompile(`Xray\s+(\d+)`)
+	matches := re.FindStringSubmatch(string(out))
+	if len(matches) >= 2 {
+		if ver, err := strconv.Atoi(matches[1]); err == nil {
+			return ver
+		}
+	}
+	return 0
 }
 
 func parsePortsForXray(rawPorts []string) string {
@@ -58,8 +131,9 @@ func mapRuleSetToXrayGeosite(rs string) string {
 		return ""
 	}
 	if strings.HasPrefix(rs, "geosite:") {
-		return rs
+		rs = strings.TrimPrefix(rs, "geosite:")
 	}
+	rs = strings.ReplaceAll(rs, "_", "-")
 	return "geosite:" + rs
 }
 
@@ -93,44 +167,231 @@ func resolveTargetToCIDR(target string) string {
 	return target
 }
 
+func formatDNSServerForXray(rawAddr, protocol string) string {
+	rawAddr = strings.TrimSpace(rawAddr)
+	if rawAddr == "" {
+		return ""
+	}
+
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+
+	switch protocol {
+	case "doh", "https":
+		if !strings.HasPrefix(rawAddr, "https://") && !strings.HasPrefix(rawAddr, "http://") {
+			return fmt.Sprintf("https://%s/dns-query", rawAddr)
+		}
+		return rawAddr
+
+	case "dot", "tls":
+		cleanAddr := rawAddr
+		if idx := strings.Index(cleanAddr, "://"); idx != -1 {
+			cleanAddr = cleanAddr[idx+3:]
+		}
+		if _, _, err := net.SplitHostPort(cleanAddr); err != nil {
+			cleanAddr = net.JoinHostPort(cleanAddr, "853")
+		}
+		return fmt.Sprintf("tcp://%s", cleanAddr)
+
+	case "tcp":
+		cleanAddr := rawAddr
+		if idx := strings.Index(cleanAddr, "://"); idx != -1 {
+			cleanAddr = cleanAddr[idx+3:]
+		}
+		if _, _, err := net.SplitHostPort(cleanAddr); err != nil {
+			cleanAddr = net.JoinHostPort(cleanAddr, "53")
+		}
+		return fmt.Sprintf("tcp://%s", cleanAddr)
+
+	default: // udp
+		cleanAddr := rawAddr
+		if idx := strings.Index(cleanAddr, "://"); idx != -1 {
+			cleanAddr = cleanAddr[idx+3:]
+		}
+
+		host, port, err := net.SplitHostPort(cleanAddr)
+		if err == nil {
+			if port == "53" {
+				return host
+			}
+			return fmt.Sprintf("udp://%s", net.JoinHostPort(host, port))
+		}
+
+		return cleanAddr
+	}
+}
+
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	isGlobal := cfg.RoutingMode == "global"
+	xrayVersion := detectXrayMajorVersion()
 
-	var dnsServers []interface{}
+	var nodeOutbounds []map[string]interface{}
+	var allNodeTags []string
+	for _, node := range cfg.Nodes {
+		ob, err := b.buildNodeOutbound(node, xrayVersion)
+		if err == nil {
+			nodeOutbounds = append(nodeOutbounds, ob)
+			allNodeTags = append(allNodeTags, node.Tag)
+		}
+	}
+
+	sockopt := map[string]interface{}{
+		"mark": 2097152,
+	}
+
+	var outbounds []map[string]interface{}
+	outbounds = append(outbounds,
+		map[string]interface{}{
+			"tag":      "direct",
+			"protocol": "freedom",
+			"streamSettings": map[string]interface{}{
+				"sockopt": sockopt,
+			},
+		},
+		map[string]interface{}{
+			"tag":      "direct-out",
+			"protocol": "freedom",
+			"streamSettings": map[string]interface{}{
+				"sockopt": sockopt,
+			},
+		},
+		map[string]interface{}{
+			"tag":      "block",
+			"protocol": "blackhole",
+			"settings": map[string]interface{}{
+				"response": map[string]string{"type": "none"},
+			},
+		},
+		map[string]interface{}{
+			"tag":      "dns-out",
+			"protocol": "dns",
+			"streamSettings": map[string]interface{}{
+				"sockopt": sockopt,
+			},
+		},
+	)
+	outbounds = append(outbounds, nodeOutbounds...)
+
+	existingOutbounds := make(map[string]bool)
+	for _, ob := range outbounds {
+		if tag, ok := ob["tag"].(string); ok {
+			existingOutbounds[tag] = true
+		}
+	}
+
+	var balancers []map[string]interface{}
+	primaryProxyTag := "direct"
+	balancerTagsMap := make(map[string]bool)
+
+	firstNodeFallback := ""
+	if len(allNodeTags) > 0 {
+		firstNodeFallback = allNodeTags[0]
+	}
+
+	if len(cfg.Groups) > 0 {
+		for _, grp := range cfg.Groups {
+			var validGroupNodes []string
+			for _, nTag := range grp.Nodes {
+				for _, validTag := range allNodeTags {
+					if nTag == validTag {
+						validGroupNodes = append(validGroupNodes, nTag)
+						break
+					}
+				}
+			}
+
+			if len(validGroupNodes) == 0 {
+				continue
+			}
+
+			bStrategy := map[string]interface{}{
+				"type": "leastPing",
+			}
+			if len(validGroupNodes) > 0 {
+				bStrategy["fallbackTag"] = validGroupNodes[0]
+			}
+
+			balancers = append(balancers, map[string]interface{}{
+				"tag":      grp.Tag,
+				"selector": validGroupNodes,
+				"strategy": bStrategy,
+			})
+			balancerTagsMap[grp.Tag] = true
+			if primaryProxyTag == "direct" {
+				primaryProxyTag = grp.Tag
+			}
+		}
+	} else if len(allNodeTags) > 0 {
+		bStrategy := map[string]interface{}{
+			"type": "leastPing",
+		}
+		if firstNodeFallback != "" {
+			bStrategy["fallbackTag"] = firstNodeFallback
+		}
+
+		balancers = append(balancers, map[string]interface{}{
+			"tag":      "proxy-balancer",
+			"selector": allNodeTags,
+			"strategy": bStrategy,
+		})
+		balancerTagsMap["proxy-balancer"] = true
+		balancerTagsMap["PROXY"] = true
+		primaryProxyTag = "proxy-balancer"
+	}
+
+	var proxyDomains []string
+	hasTelegram := false
+	for _, d := range cfg.CustomDomains {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			proxyDomains = append(proxyDomains, "domain:"+d)
+		}
+	}
+	for _, filePath := range cfg.LocalListFiles {
+		if f, err := os.Open(filePath); err == nil {
+			sc := bufio.NewScanner(f)
+			for sc.Scan() {
+				l := strings.TrimSpace(sc.Text())
+				if l != "" && !strings.HasPrefix(l, "#") {
+					proxyDomains = append(proxyDomains, "domain:"+l)
+				}
+			}
+			f.Close()
+		}
+	}
+	for _, rs := range cfg.RuleSets {
+		if geoCat := mapRuleSetToXrayGeosite(rs); geoCat != "" {
+			proxyDomains = append(proxyDomains, geoCat)
+			if strings.Contains(geoCat, "telegram") {
+				hasTelegram = true
+			}
+		}
+	}
+	if !hasTelegram {
+		proxyDomains = append(proxyDomains, "geosite:telegram")
+	}
 
 	dnsServerAddr := cfg.DNSServer
 	if dnsServerAddr == "" {
 		dnsServerAddr = "8.8.8.8"
 	}
+	formattedDNS := formatDNSServerForXray(dnsServerAddr, cfg.DNSProtocol)
 
-	switch cfg.DNSProtocol {
-	case "doh", "https":
-		if !strings.HasPrefix(dnsServerAddr, "https://") {
-			dnsServerAddr = fmt.Sprintf("https://%s/dns-query", dnsServerAddr)
-		}
-		dnsServers = append(dnsServers, dnsServerAddr)
-	case "dot", "tls":
-		if !strings.HasPrefix(dnsServerAddr, "tcp+local://") {
-			dnsServers = append(dnsServers, fmt.Sprintf("tcp://%s:853", dnsServerAddr))
-		}
-	default:
-		if !strings.Contains(dnsServerAddr, ":") {
-			dnsServers = append(dnsServers, dnsServerAddr+":53")
-		} else {
-			dnsServers = append(dnsServers, dnsServerAddr)
-		}
-	}
-
-	if cfg.BootstrapDNS != "" {
-		bootstrap := cfg.BootstrapDNS
-		if !strings.Contains(bootstrap, ":") {
-			bootstrap += ":53"
-		}
-		dnsServers = append(dnsServers, bootstrap)
-	}
+	var dnsServers []interface{}
+	dnsServers = append(dnsServers, map[string]interface{}{
+		"address": "fakedns",
+		"domains": proxyDomains,
+	})
 
 	if !isGlobal {
 		dnsServers = append(dnsServers, "localhost")
+	}
+	if formattedDNS != "" {
+		dnsServers = append(dnsServers, formattedDNS)
+	}
+
+	tproxyPort := cfg.TProxyPort
+	if tproxyPort == 0 {
+		tproxyPort = 1602
 	}
 
 	xrayConfig := map[string]interface{}{
@@ -140,6 +401,10 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"api": map[string]interface{}{
 			"tag":      "api",
 			"services": []string{"StatsService"},
+		},
+		"fakedns": map[string]interface{}{
+			"ipPool":   "198.18.0.0/15",
+			"poolSize": 65535,
 		},
 		"stats": map[string]interface{}{},
 		"policy": map[string]interface{}{
@@ -160,58 +425,53 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"servers":       dnsServers,
 			"queryStrategy": "UseIPv4",
 		},
-	}
-
-	tproxyPort := cfg.TProxyPort
-	if tproxyPort == 0 {
-		tproxyPort = 1602
-	}
-
-	inbounds := []map[string]interface{}{
-		{
-			"tag":      "api-in",
-			"listen":   "127.0.0.1",
-			"port":     10085,
-			"protocol": "dokodemo-door",
-			"settings": map[string]interface{}{
-				"address": "127.0.0.1",
-			},
-		},
-		{
-			"tag":      "tproxy-in",
-			"listen":   "0.0.0.0",
-			"port":     tproxyPort,
-			"protocol": "dokodemo-door",
-			"settings": map[string]interface{}{
-				"network":        "tcp,udp",
-				"followRedirect": true,
-			},
-			"streamSettings": map[string]interface{}{
-				"sockopt": map[string]interface{}{
-					"tproxy": "tproxy",
+		"inbounds": []map[string]interface{}{
+			{
+				"tag":      "api-in",
+				"listen":   "127.0.0.1",
+				"port":     10085,
+				"protocol": "dokodemo-door",
+				"settings": map[string]interface{}{
+					"address": "127.0.0.1",
 				},
 			},
-			"sniffing": map[string]interface{}{
-				"enabled":      true,
-				"destOverride": []string{"http", "tls", "quic"},
-				"routeOnly":    true,
+			{
+				"tag":      "tproxy-in",
+				"listen":   "0.0.0.0",
+				"port":     tproxyPort,
+				"protocol": "dokodemo-door",
+				"settings": map[string]interface{}{
+					"network": "tcp,udp",
+				},
+				"streamSettings": map[string]interface{}{
+					"sockopt": map[string]interface{}{
+						"tproxy": "tproxy",
+					},
+				},
+				"sniffing": map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"fakedns", "http", "tls", "quic"},
+					"metadataOnly": false,
+					"routeOnly":    false,
+				},
 			},
-		},
-		{
-			"tag":      "dns-in",
-			"listen":   "127.0.0.42",
-			"port":     cfg.DNSPort,
-			"protocol": "dokodemo-door",
-			"settings": map[string]interface{}{
-				"network": "tcp,udp",
-				"address": "127.0.0.1",
-				"port":    53,
+			{
+				"tag":      "dns-in",
+				"listen":   "127.0.0.42",
+				"port":     cfg.DNSPort,
+				"protocol": "dokodemo-door",
+				"settings": map[string]interface{}{
+					"network": "tcp,udp",
+					"address": "127.0.0.1",
+					"port":    53,
+				},
 			},
 		},
 	}
 
 	if cfg.MixedPort > 0 {
-		inbounds = append(inbounds, map[string]interface{}{
+		inbounds := xrayConfig["inbounds"].([]map[string]interface{})
+		xrayConfig["inbounds"] = append(inbounds, map[string]interface{}{
 			"tag":      "mixed-in",
 			"listen":   "127.0.0.1",
 			"port":     cfg.MixedPort,
@@ -222,100 +482,18 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			},
 		})
 	}
-	xrayConfig["inbounds"] = inbounds
 
-	sockopt := map[string]interface{}{
-		"mark": 2097152,
-	}
-
-	outbounds := []map[string]interface{}{
-		{
-			"tag":      "direct",
-			"protocol": "freedom",
-			"streamSettings": map[string]interface{}{
-				"sockopt": sockopt,
-			},
-		},
-		{
-			"tag":      "direct-out",
-			"protocol": "freedom",
-			"streamSettings": map[string]interface{}{
-				"sockopt": sockopt,
-			},
-		},
-		{
-			"tag":      "block",
-			"protocol": "blackhole",
-			"settings": map[string]interface{}{
-				"response": map[string]string{"type": "none"},
-			},
-		},
-		{
-			"tag":      "dns-out",
-			"protocol": "dns",
-			"streamSettings": map[string]interface{}{
-				"sockopt": sockopt,
-			},
-		},
-	}
-
-	var allNodeTags []string
-	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutbound(node)
-		if err == nil {
-			outbounds = append(outbounds, ob)
-			allNodeTags = append(allNodeTags, node.Tag)
-		}
-	}
-
-	var balancers []map[string]interface{}
-	primaryProxyTag := "direct"
-	balancerTagsMap := make(map[string]bool)
-
-	if len(cfg.Groups) > 0 {
-		for _, grp := range cfg.Groups {
-			balancers = append(balancers, map[string]interface{}{
-				"tag":      grp.Tag,
-				"selector": grp.Nodes,
-				"strategy": map[string]interface{}{
-					"type": "leastPing",
-				},
-			})
-			balancerTagsMap[grp.Tag] = true
-			if primaryProxyTag == "direct" {
-				primaryProxyTag = grp.Tag
-			}
-		}
-
+	if len(allNodeTags) > 0 {
 		checkURL := "https://www.gstatic.com/generate_204"
-		if cfg.Groups[0].TargetURL != "" {
+		if len(cfg.Groups) > 0 && cfg.Groups[0].TargetURL != "" {
 			checkURL = cfg.Groups[0].TargetURL
 		}
-
 		xrayConfig["observatory"] = map[string]interface{}{
 			"subjectSelector":   allNodeTags,
 			"probeUrl":          checkURL,
-			"probeInterval":     "3m",
+			"probeInterval":     "15s",
 			"enableConcurrency": true,
 		}
-	} else if len(allNodeTags) > 0 {
-		balancers = append(balancers, map[string]interface{}{
-			"tag":      "proxy-balancer",
-			"selector": allNodeTags,
-			"strategy": map[string]interface{}{
-				"type": "leastPing",
-			},
-		})
-		balancerTagsMap["proxy-balancer"] = true
-		balancerTagsMap["PROXY"] = true
-
-		xrayConfig["observatory"] = map[string]interface{}{
-			"subjectSelector":   allNodeTags,
-			"probeUrl":          "https://www.gstatic.com/generate_204",
-			"probeInterval":     "3m",
-			"enableConcurrency": true,
-		}
-		primaryProxyTag = "proxy-balancer"
 	}
 
 	xrayConfig["outbounds"] = outbounds
@@ -324,218 +502,142 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		if target == "PROXY" || target == "proxy-balancer" {
 			target = primaryProxyTag
 		}
+
+		delete(rule, "balancerTag")
+		delete(rule, "outboundTag")
+
 		if balancerTagsMap[target] {
 			rule["balancerTag"] = target
-		} else {
+		} else if existingOutbounds[target] {
 			rule["outboundTag"] = target
+		} else {
+			if balancerTagsMap[primaryProxyTag] {
+				rule["balancerTag"] = primaryProxyTag
+			} else {
+				rule["outboundTag"] = primaryProxyTag
+			}
 		}
 	}
 
-	rules := []map[string]interface{}{
-		{
+	// 1. Приоритетный безусловный перехват Telegram DC IP (AS44907, AS62041)
+	// Добавляется ПЕРВЫМ правилом, направляется напрямую на физическую ноду без ожидания observatory
+	// telegramCIDRs := []string{
+	// 	"194.221.0.0/16",
+	// 	"91.108.4.0/22",
+	// 	"91.108.8.0/21",
+	// 	"91.108.12.0/22",
+	// 	"91.108.16.0/21",
+	// 	"91.108.20.0/22",
+	// 	"91.108.56.0/22",
+	// 	"149.154.160.0/20",
+	// 	"149.154.164.0/22",
+	// 	"149.154.168.0/22",
+	// 	"149.154.172.0/22",
+	// 	"91.105.192.0/23",
+	// 	"185.76.151.0/24",
+	// }
+
+	var rules []map[string]interface{}
+
+	// if primaryProxyTag != "direct" {
+	// 	tgRule := map[string]interface{}{
+	// 		"type":       "field",
+	// 		"inboundTag": []string{"tproxy-in"},
+	// 		"ip":         telegramCIDRs,
+	// 	}
+	// 	setRuleDetour(tgRule, primaryProxyTag)
+	// 	rules = append([]map[string]interface{}{tgRule}, rules...)
+	// }
+
+	rules = append(rules,
+		map[string]interface{}{
 			"type":        "field",
 			"inboundTag":  []string{"api-in"},
 			"outboundTag": "api",
 		},
-		{
+		map[string]interface{}{
 			"type":        "field",
 			"inboundTag":  []string{"dns-in"},
 			"outboundTag": "dns-out",
 		},
-	}
+	)
 
-	// 1. Клиенты
-	var directClients []string
-	var fullProxyClients []string
-
-	for _, cp := range cfg.ClientPolicies {
-		if !cp.Enabled || cp.Target == "" {
-			continue
+	// 2. DNS сервер
+	if primaryProxyTag != "direct" && formattedDNS != "" {
+		cleanHost := dnsServerAddr
+		if strings.Contains(cleanHost, "://") {
+			cleanHost = strings.Split(cleanHost, "://")[1]
 		}
-		cidr := resolveTargetToCIDR(cp.Target)
-		if cidr == "" {
-			continue
-		}
+		cleanHost = strings.Split(cleanHost, "/")[0]
+		cleanHost = strings.Split(cleanHost, ":")[0]
 
-		switch cp.Mode {
-		case config.ClientModeDirect:
-			directClients = append(directClients, cidr)
-		case config.ClientModeFullProxy:
-			fullProxyClients = append(fullProxyClients, cidr)
+		if net.ParseIP(cleanHost) != nil {
+			dnsRouteRule := map[string]interface{}{
+				"type": "field",
+				"ip":   []string{cleanHost},
+			}
+			setRuleDetour(dnsRouteRule, primaryProxyTag)
+			rules = append(rules, dnsRouteRule)
 		}
 	}
 
-	if len(directClients) > 0 {
-		rules = append(rules, map[string]interface{}{
-			"type":        "field",
-			"inboundTag":  []string{"tproxy-in"},
-			"source":      directClients,
-			"outboundTag": "direct",
-		})
-	}
-
-	if len(fullProxyClients) > 0 && primaryProxyTag != "direct" {
-		rule := map[string]interface{}{
+	// 3. Доменные правила (SNI / FakeDNS)
+	if primaryProxyTag != "direct" && len(proxyDomains) > 0 {
+		domainRule := map[string]interface{}{
 			"type":       "field",
 			"inboundTag": []string{"tproxy-in"},
-			"source":     fullProxyClients,
+			"domain":     proxyDomains,
 		}
-		setRuleDetour(rule, primaryProxyTag)
-		rules = append(rules, rule)
+		setRuleDetour(domainRule, primaryProxyTag)
+		rules = append(rules, domainRule)
 	}
 
-	// 2. Секции маршрутизации
-	if !isGlobal {
-		for _, rp := range cfg.RoutePolicies {
-			if !rp.Enabled || rp.Outbound == "" {
-				continue
-			}
-
-			outboundTarget := rp.Outbound
-
-			totalPolicySubnets := append([]string(nil), rp.Subnets...)
-			for _, rs := range rp.RuleSets {
-				cleanRS := strings.ToLower(strings.TrimSpace(rs))
-				if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
-					totalPolicySubnets = append(totalPolicySubnets, subnets...)
-				}
-			}
-
-			if len(totalPolicySubnets) > 0 {
-				rule := map[string]interface{}{
-					"type":       "field",
-					"inboundTag": []string{"tproxy-in"},
-					"ip":         totalPolicySubnets,
-				}
-				setRuleDetour(rule, outboundTarget)
-				rules = append(rules, rule)
-			}
-
-			var totalPolicyDomains []string
-			for _, d := range rp.Domains {
-				d = strings.TrimSpace(d)
-				if d != "" {
-					totalPolicyDomains = append(totalPolicyDomains, "domain:"+d)
-				}
-			}
-			for _, rs := range rp.RuleSets {
-				if geoCat := mapRuleSetToXrayGeosite(rs); geoCat != "" {
-					totalPolicyDomains = append(totalPolicyDomains, geoCat)
-				}
-			}
-
-			if len(totalPolicyDomains) > 0 {
-				rule := map[string]interface{}{
-					"type":       "field",
-					"inboundTag": []string{"tproxy-in"},
-					"domain":     totalPolicyDomains,
-				}
-				setRuleDetour(rule, outboundTarget)
-				rules = append(rules, rule)
-			}
-		}
-	}
-
-	// 3. Дефолтные правила
+	// 4. UDP порты
 	if primaryProxyTag != "direct" {
-		if isGlobal {
+		udpRule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"tproxy-in"},
+			"network":    "udp",
+			"port":       "50000-65535",
+		}
+		setRuleDetour(udpRule, primaryProxyTag)
+		rules = append(rules, udpRule)
+	}
+
+	// 5. Пользовательские подсети и подсети сервисных списков
+	if !isGlobal {
+		totalSubnets := append([]string(nil), cfg.CustomSubnets...)
+		for _, rs := range cfg.RuleSets {
+			cleanRS := strings.ToLower(strings.TrimSpace(rs))
+			subnets, err := b.rulesLoader.GetSubnets(cleanRS)
+			if err == nil && len(subnets) > 0 {
+				totalSubnets = append(totalSubnets, subnets...)
+			}
+		}
+
+		if len(totalSubnets) > 0 && primaryProxyTag != "direct" {
 			rule := map[string]interface{}{
 				"type":       "field",
 				"inboundTag": []string{"tproxy-in"},
+				"ip":         totalSubnets,
 			}
 			setRuleDetour(rule, primaryProxyTag)
 			rules = append(rules, rule)
-		} else {
-			hasDiscord := false
-			for _, rs := range cfg.RuleSets {
-				if strings.ToLower(strings.TrimSpace(rs)) == "discord" {
-					hasDiscord = true
-					break
-				}
-			}
-
-			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
-			for _, rs := range cfg.RuleSets {
-				cleanRS := strings.ToLower(strings.TrimSpace(rs))
-				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
-				if err == nil && len(subnets) > 0 {
-					totalSubnets = append(totalSubnets, subnets...)
-				}
-			}
-
-			if len(totalSubnets) > 0 {
-				rule := map[string]interface{}{
-					"type":       "field",
-					"inboundTag": []string{"tproxy-in"},
-					"ip":         totalSubnets,
-				}
-				setRuleDetour(rule, primaryProxyTag)
-				rules = append(rules, rule)
-			}
-
-			if hasDiscord {
-				discordUdpRule := map[string]interface{}{
-					"type":       "field",
-					"inboundTag": []string{"tproxy-in"},
-					"network":    "udp",
-					"port":       "443,50000-65535",
-				}
-				setRuleDetour(discordUdpRule, primaryProxyTag)
-				rules = append(rules, discordUdpRule)
-			}
-
-			if len(cfg.CustomPorts) > 0 {
-				portStr := parsePortsForXray(cfg.CustomPorts)
-				if portStr != "" {
-					portRule := map[string]interface{}{
-						"type":       "field",
-						"inboundTag": []string{"tproxy-in"},
-						"port":       portStr,
-					}
-					setRuleDetour(portRule, primaryProxyTag)
-					rules = append(rules, portRule)
-				}
-			}
-
-			var totalDomains []string
-			for _, d := range cfg.CustomDomains {
-				d = strings.TrimSpace(d)
-				if d != "" {
-					totalDomains = append(totalDomains, "domain:"+d)
-				}
-			}
-
-			for _, filePath := range cfg.LocalListFiles {
-				if f, err := os.Open(filePath); err == nil {
-					sc := bufio.NewScanner(f)
-					for sc.Scan() {
-						l := strings.TrimSpace(sc.Text())
-						if l != "" && !strings.HasPrefix(l, "#") {
-							totalDomains = append(totalDomains, "domain:"+l)
-						}
-					}
-					f.Close()
-				}
-			}
-
-			for _, rs := range cfg.RuleSets {
-				if geoCat := mapRuleSetToXrayGeosite(rs); geoCat != "" {
-					totalDomains = append(totalDomains, geoCat)
-				}
-			}
-
-			if len(totalDomains) > 0 {
-				rule := map[string]interface{}{
-					"type":       "field",
-					"inboundTag": []string{"tproxy-in"},
-					"domain":     totalDomains,
-				}
-				setRuleDetour(rule, primaryProxyTag)
-				rules = append(rules, rule)
-			}
 		}
 	}
 
+	// 6. Перехват диапазона FakeDNS
+	if primaryProxyTag != "direct" {
+		fakeDnsRule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"tproxy-in"},
+			"ip":         []string{"198.18.0.0/15"},
+		}
+		setRuleDetour(fakeDnsRule, primaryProxyTag)
+		rules = append(rules, fakeDnsRule)
+	}
+
+	// 7. Mixed порт
 	if cfg.MixedPort > 0 && primaryProxyTag != "direct" {
 		rule := map[string]interface{}{
 			"type":       "field",
@@ -545,8 +647,19 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		rules = append(rules, rule)
 	}
 
+	// 8. Дефолтный безусловный перехватчик tproxy-in
+	if primaryProxyTag != "direct" {
+		defaultTProxyRule := map[string]interface{}{
+			"type":       "field",
+			"inboundTag": []string{"tproxy-in"},
+		}
+		setRuleDetour(defaultTProxyRule, primaryProxyTag)
+		rules = append(rules, defaultTProxyRule)
+	}
+
 	routingObj := map[string]interface{}{
-		"domainStrategy": "IPIfNonMatch",
+		"domainStrategy": "AsIs",
+		"domainMatcher":  "hybrid",
 		"rules":          rules,
 	}
 	if len(balancers) > 0 {
@@ -566,7 +679,15 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.WriteFile(outputPath, data, 0644)
 }
 
-func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
+func (b *Builder) buildNodeOutbound(node *config.GenericNode, xrayVersion int) (map[string]interface{}, error) {
+	proto := strings.ToLower(node.Protocol)
+
+	if proto == "hysteria2" || proto == "hysteria" {
+		if xrayVersion < 26 {
+			return nil, fmt.Errorf("hysteria/hysteria2 requires xray >= 26 (detected: %d), skipped", xrayVersion)
+		}
+	}
+
 	out := map[string]interface{}{
 		"tag":      node.Tag,
 		"protocol": node.Protocol,
@@ -576,7 +697,7 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 		"mark": 2097152,
 	}
 
-	switch node.Protocol {
+	switch proto {
 	case "vless":
 		vnextUser := map[string]interface{}{
 			"id":         node.UUID,
@@ -636,25 +757,53 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 
 		out["streamSettings"] = streamSettings
 
-	case "hysteria2":
-		out["protocol"] = "hysteria2"
-		out["settings"] = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"address":  node.Address,
-					"port":     node.Port,
-					"password": node.Password,
-				},
-			},
+	case "hysteria2", "hysteria":
+		authPass := node.Password
+		if authPass == "" {
+			authPass = node.UUID
 		}
+
+		serverName := node.SNI
+		if serverName == "" {
+			serverName = node.Address
+		}
+
+		out["protocol"] = "hysteria"
+		out["settings"] = map[string]interface{}{
+			"version": 2,
+			"address": node.Address,
+			"port":    node.Port,
+		}
+
+		tlsSettings := map[string]interface{}{
+			"serverName":    serverName,
+			"allowInsecure": node.Insecure,
+			"alpn":          []string{"h3"},
+		}
+		if node.Fingerprint != "" {
+			tlsSettings["fingerprint"] = node.Fingerprint
+		}
+
+		hysteriaSettings := map[string]interface{}{
+			"version": 2,
+			"auth":    authPass,
+		}
+		if node.PortRange != "" {
+			hysteriaSettings["ports"] = node.PortRange
+		}
+		if node.ObfsType != "" {
+			hysteriaSettings["obfs"] = map[string]string{
+				"type":     node.ObfsType,
+				"password": node.ObfsPassword,
+			}
+		}
+
 		out["streamSettings"] = map[string]interface{}{
-			"network":  "udp",
-			"security": "tls",
-			"tlsSettings": map[string]interface{}{
-				"serverName":    node.SNI,
-				"allowInsecure": node.Insecure,
-			},
-			"sockopt": sockopt,
+			"network":          "hysteria",
+			"security":         "tls",
+			"tlsSettings":      tlsSettings,
+			"hysteriaSettings": hysteriaSettings,
+			"sockopt":          sockopt,
 		}
 
 	case "shadowsocks":
@@ -674,11 +823,13 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 
 	case "trojan":
 		out["settings"] = map[string]interface{}{
-			"servers": []map[string]interface{}{
-				{
-					"address":  node.Address,
-					"port":     node.Port,
-					"password": node.Password,
+			"settings": map[string]interface{}{
+				"servers": []map[string]interface{}{
+					{
+						"address":  node.Address,
+						"port":     node.Port,
+						"password": node.Password,
+					},
 				},
 			},
 		}

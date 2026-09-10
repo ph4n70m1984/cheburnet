@@ -107,6 +107,27 @@ func getRouterLANIP() string {
 	return "0.0.0.0"
 }
 
+func mapToSRSName(rs string) string {
+	rs = strings.ToLower(strings.TrimSpace(rs))
+	switch rs {
+	case "google_ai", "google-ai":
+		return "google_ai"
+	case "russia_inside", "russia-inside":
+		return "russia_inside"
+	case "russia_outside", "russia-outside":
+		return "russia_outside"
+	case "ukraine_inside", "ukraine-inside":
+		return "ukraine_inside"
+	case "google_meet", "google-meet":
+		return "google_meet"
+	case "google_play", "google-play":
+		return "google_play"
+	default:
+		// В allow-domains почти все составные имена идут с подчёркиванием
+		return strings.ReplaceAll(rs, "-", "_")
+	}
+}
+
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	routerIP := getRouterLANIP()
 	clashController := fmt.Sprintf("%s:9090", routerIP)
@@ -377,7 +398,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// 1. Клиентские политики
 	var directClients []string
 	var fullProxyClients []string
 
@@ -416,7 +436,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
-	// 2. Общие правила маршрутизации
 	if activeOutboundTag != "direct-out" {
 		if isGlobal {
 			routeRules = append(routeRules, map[string]interface{}{
@@ -425,7 +444,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"outbound": activeOutboundTag,
 			})
 		} else {
-			// Приоритетные Route Policies
 			for _, rp := range cfg.RoutePolicies {
 				if !rp.Enabled || rp.Outbound == "" {
 					continue
@@ -472,7 +490,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 			}
 
-			// Дефолтные правила
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			var defaultRuleSets []string
 			hasDiscord := false
@@ -559,12 +576,13 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
+			srsName := mapToSRSName(rs)
 			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
 				"type":            "remote",
 				"tag":             rs,
 				"format":          "binary",
-				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", rs),
-				"download_detour": activeOutboundTag,
+				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
+				"download_detour": "direct-out",
 				"update_interval": "1d",
 			})
 		}

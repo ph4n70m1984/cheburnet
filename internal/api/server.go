@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os/exec"
+	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -75,14 +76,48 @@ func NewServer(
 func (s *Server) setupRoutes() {
 	api := s.app.Group("/api/v1")
 
-	// Системные эндпоинты (обработчики в handlers.go)
 	api.Get("/status", s.handleStatus)
-	api.Post("/engine/switch", s.handleSwitchEngine)
+
+	// Всеядный обработчик переключения: читает и engine, и name
+	api.Post("/engine/switch", func(c *fiber.Ctx) error {
+		var req struct {
+			Engine string `json:"engine"`
+			Name   string `json:"name"`
+		}
+
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "invalid request payload",
+			})
+		}
+
+		target := strings.ToLower(strings.TrimSpace(req.Engine))
+		if target == "" {
+			target = strings.ToLower(strings.TrimSpace(req.Name))
+		}
+
+		if target != "sing-box" && target != "xray" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "engine must be sing-box or xray",
+			})
+		}
+
+		if err := s.swapEngine(target); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": err.Error(),
+			})
+		}
+
+		return c.JSON(fiber.Map{
+			"status":        "ok",
+			"active_engine": target,
+		})
+	})
+
 	api.Post("/reload", s.handleReloadConfig)
 	api.Get("/updates/check", s.handleCheckUpdates)
 	api.Post("/updates/upgrade", s.handlePerformUpdate)
 
-	// Эндпоинты слоя диагностики и действий
 	api.Get("/diagnostics", func(c *fiber.Ctx) error {
 		if s.diagEngine != nil {
 			return c.JSON(s.diagEngine.Snapshot())
@@ -107,7 +142,6 @@ func (s *Server) setupRoutes() {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	// Ноды, подписки и источники (обработчики в handlers.go)
 	api.Get("/nodes", s.handleGetNodes)
 	api.Post("/nodes", s.handleAddNode)
 	api.Post("/nodes/add", s.handleAddNode)
@@ -115,7 +149,6 @@ func (s *Server) setupRoutes() {
 	api.Post("/sources/add", s.handleAddSource)
 	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
 
-	// WebSocket телеметрия и интерактивное управление
 	s.app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()

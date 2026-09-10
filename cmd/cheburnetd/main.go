@@ -121,7 +121,8 @@ func main() {
 			fmt.Println("Error: engine name required (sing-box or xray)")
 			os.Exit(1)
 		}
-		body := fmt.Sprintf(`{"engine":"%s"}`, os.Args[2])
+		targetEngine := strings.ToLower(strings.TrimSpace(os.Args[2]))
+		body := fmt.Sprintf(`{"engine":"%s","name":"%s"}`, targetEngine, targetEngine)
 		callAPI(http.MethodPost, "/api/v1/engine/switch", strings.NewReader(body))
 
 	case "check_proxy":
@@ -363,8 +364,20 @@ func runDaemon() {
 	daemonCtx, daemonCancel := context.WithCancel(context.Background())
 	defer daemonCancel()
 
+	// Гарантированный безопасный запуск с предпроверкой ассетов и валидацией
 	if err := app.startActiveEngine(daemonCtx); err != nil {
-		log.Printf("[WARN] Initial proxy engine failed to start: %v", err)
+		log.Printf("[WARN] Selected engine %s failed to start: %v", app.activeEng.Name(), err)
+		fallbackEngineName := "sing-box"
+		if app.activeEng.Name() == "sing-box" {
+			fallbackEngineName = "xray"
+		}
+		log.Printf("[INFO] Initiating automatic fallback to alternative engine: %s...", fallbackEngineName)
+		if fbErr := app.switchEngine(daemonCtx, fallbackEngineName); fbErr != nil {
+			log.Printf("[CRITICAL] Fallback to %s failed: %v", fallbackEngineName, fbErr)
+		} else {
+			log.Printf("[INFO] Fallback recovery successful: %s is now running", fallbackEngineName)
+			_ = uciStorage.SaveEngine(fallbackEngineName)
+		}
 	}
 
 	app.rulesCron = network.NewRulesetCron(
@@ -399,8 +412,12 @@ func runDaemon() {
 		updManager,
 		app.getCurrentEngine,
 		func(name string) error {
-			_ = uciStorage.SaveEngine(name)
-			return app.switchEngine(daemonCtx, name)
+			target := strings.ToLower(strings.TrimSpace(name))
+			if err := app.switchEngine(daemonCtx, target); err != nil {
+				return err
+			}
+			_ = uciStorage.SaveEngine(target)
+			return nil
 		},
 		app.rulesCron,
 		diagEngine,
@@ -479,13 +496,14 @@ func (a *App) getCurrentEngine() engine.Engine {
 }
 
 func (a *App) getEngineByName(name string) (engine.Engine, string, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
 	switch name {
 	case "xray":
 		return a.xrayEng, RuntimeConfigPathXray, nil
 	case "sing-box":
 		return a.singboxEng, RuntimeConfigPathSingBox, nil
 	default:
-		return nil, "", fmt.Errorf("unknown engine %s", name)
+		return nil, "", fmt.Errorf("unknown engine '%s'", name)
 	}
 }
 
@@ -500,6 +518,15 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	if eng == nil {
 		return fmt.Errorf("no active engine")
+	}
+
+	targetEngine := strings.ToLower(strings.TrimSpace(cfg.Engine))
+	if eng.Name() != targetEngine {
+		log.Printf("[INFO] Engine change detected in config (current: %s, target: %s), switching...", eng.Name(), targetEngine)
+		a.engineOpMu.Unlock()
+		err := a.switchEngine(ctx, targetEngine)
+		a.engineOpMu.Lock()
+		return err
 	}
 
 	targetPath := RuntimeConfigPathSingBox
@@ -577,8 +604,31 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
+	// 1. Проверяем и гарантируем наличие ассетов при любом старте
+	if eng.Name() == "xray" {
+		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
+			return fmt.Errorf("ensure assets for xray failed: %w", err)
+		}
+	} else if eng.Name() == "sing-box" {
+		if err := a.singboxEng.EnsureAssets(ctx); err != nil {
+			return fmt.Errorf("ensure assets for sing-box failed: %w", err)
+		}
+	}
+
+	// 2. Генерируем конфигурацию
 	if err := eng.BuildConfig(&cfg, targetPath); err != nil {
-		return fmt.Errorf("build %s config: %w", eng.Name(), err)
+		return fmt.Errorf("build %s config failed: %w", eng.Name(), err)
+	}
+
+	// 3. Выполняем валидацию
+	if eng.Name() == "xray" {
+		if err := a.xrayEng.ValidateConfig(targetPath); err != nil {
+			return fmt.Errorf("xray validate config failed: %w", err)
+		}
+	} else if eng.Name() == "sing-box" {
+		if err := a.singboxEng.ValidateConfig(targetPath); err != nil {
+			return fmt.Errorf("sing-box validate config failed: %w", err)
+		}
 	}
 
 	return eng.Start(ctx, targetPath)
@@ -598,6 +648,7 @@ func (a *App) stopActiveEngine() {
 }
 
 func (a *App) switchEngine(ctx context.Context, name string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
 	newEng, newTargetPath, err := a.getEngineByName(name)
 	if err != nil {
 		return err
@@ -612,13 +663,49 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	a.mu.RUnlock()
 
 	if oldEng != nil && oldEng.Name() == newEng.Name() {
+		log.Printf("[INFO] Engine '%s' is already active", name)
 		return nil
 	}
 
-	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
-		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine kept running)", name, err)
+	log.Printf("[INFO] Initiating safe pre-flight switch to %s...", name)
+
+	// 1. Предварительная загрузка и проверка ассетов
+	switch name {
+	case "xray":
+		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
+			return fmt.Errorf("xray asset preparation failed (geosite.dat): %w", err)
+		}
+	case "sing-box":
+		if err := a.singboxEng.EnsureAssets(ctx); err != nil {
+			return fmt.Errorf("sing-box asset preparation failed: %w", err)
+		}
 	}
 
+	// 2. Генерация конфигурации под целевое ядро
+	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
+		oldName := "none"
+		if oldEng != nil {
+			oldName = oldEng.Name()
+		}
+		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine %s kept running)", name, err, oldName)
+	}
+
+	// 3. Предстартовая валидация конфигурации нового ядра
+	switch name {
+	case "xray":
+		if err := a.xrayEng.ValidateConfig(newTargetPath); err != nil {
+			return fmt.Errorf("xray validation failed: %w (switch aborted, active engine preserved)", err)
+		}
+		log.Println("[INFO] Pre-flight: xray -test passed successfully")
+
+	case "sing-box":
+		if err := a.singboxEng.ValidateConfig(newTargetPath); err != nil {
+			return fmt.Errorf("sing-box validation failed: %w (switch aborted, active engine preserved)", err)
+		}
+		log.Println("[INFO] Pre-flight: sing-box check passed successfully")
+	}
+
+	// 4. Остановка старого ядра ТОЛЬКО после успешных тестов нового
 	oldTargetPath := ""
 	if oldEng != nil {
 		if oldEng.Name() == "xray" {
@@ -626,21 +713,23 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		} else {
 			oldTargetPath = RuntimeConfigPathSingBox
 		}
+		log.Printf("[INFO] Stopping previous engine %s...", oldEng.Name())
 		_ = oldEng.Stop()
 	}
 
+	// 5. Запуск проверенного ядра с rollback при сбое
 	if err := newEng.Start(ctx, newTargetPath); err != nil {
-		log.Printf("[ERROR] Failed to start new engine %s: %v. Initiating rollback...", name, err)
+		log.Printf("[ERROR] Failed to start verified engine %s: %v. Initiating rollback...", name, err)
 
 		if oldEng != nil && oldTargetPath != "" {
 			if rbErr := oldEng.Start(ctx, oldTargetPath); rbErr != nil {
 				log.Printf("[CRITICAL] Rollback failed! Both engines down: %v", rbErr)
-				return fmt.Errorf("switch failed: %w; rollback failed: %v", err, rbErr)
+				return fmt.Errorf("switch to %s failed: %w; rollback to %s failed: %v", name, err, oldEng.Name(), rbErr)
 			}
-			log.Printf("[INFO] Rollback successful: restored previous engine %s", oldEng.Name())
+			log.Printf("[INFO] Rollback successful: recovered active engine %s", oldEng.Name())
 		}
 
-		return fmt.Errorf("failed to start %s, rolled back: %w", name, err)
+		return fmt.Errorf("failed to start %s, safely rolled back: %w", name, err)
 	}
 
 	a.mu.Lock()

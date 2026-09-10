@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"cheburnet/internal/config"
@@ -16,6 +17,8 @@ import (
 type SingBoxEngine struct {
 	builder *singbox.Builder
 	cmd     *exec.Cmd
+	cfg     *config.CheburConfig
+	mu      sync.Mutex
 }
 
 func NewSingBoxEngine() *SingBoxEngine {
@@ -28,7 +31,15 @@ func (s *SingBoxEngine) Name() string {
 	return "sing-box"
 }
 
+// EnsureAssets проверяет наличие необходимых баз/ассетов для sing-box (no-op при встроенных базах)
+func (s *SingBoxEngine) EnsureAssets(ctx context.Context) error {
+	return nil
+}
+
 func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string) error {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
 	return s.builder.Build(cfg, targetPath)
 }
 
@@ -42,11 +53,21 @@ func (s *SingBoxEngine) ValidateConfig(configPath string) error {
 }
 
 func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.EnsureAssets(ctx); err != nil {
+		return fmt.Errorf("sing-box assets check failed: %w", err)
+	}
+
 	s.cmd = NewIsolatedCmd(ctx, "sing-box", "run", "-c", configPath)
 	return s.cmd.Start()
 }
 
 func (s *SingBoxEngine) Stop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.cmd != nil {
 		err := TerminateCmd(s.cmd)
 		s.cmd = nil
