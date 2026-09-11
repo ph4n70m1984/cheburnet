@@ -2,13 +2,11 @@
 
 **Chebur.NET** — модульный демон прозрачного проксирования и выборочной маршрутизации сетевого трафика для роутеров под управлением OpenWrt.
 
-Основная логика работает внутри компактного Go-демона `cheburnetd`: загрузка и фильтрация подписок, разбор прокси-нод, генерация конфигураций sing-box/Xray, маршрутизация, Client Policy, Route Policy, контроль состояния ядер, безопасная перезагрузка, автоматическое восстановление и обновление компонентов.
+Основная логика работает внутри компактного Go-демона `cheburnetd`: загрузка и фильтрация подписок, разбор proxy-нод, генерация конфигураций `sing-box` / `Xray`, маршрутизация, Client Policy, Route Policy, контроль состояния ядер, безопасная перезагрузка, автоматическое восстановление, диагностика и обновление компонентов.
 
 Веб-интерфейс LuCI используется как управляющая панель, а взаимодействие с демоном выполняется через REST API и WebSocket.
 
-
-> **Текущий релиз: `v0.0.8.4`**  
-> Диагностика системы, event-driven WebSocket-события, hysteresis, root-cause correlation, безопасная работа подписчиков WebSocket, 16 реальных health-checks, улучшения UI и оптимизация Go runtime для OpenWrt.
+> **Текущий релиз: `v0.8.12`**
 
 ---
 
@@ -16,12 +14,12 @@
 
 ### 🔥 Два прокси-ядра
 
-Chebur.NET поддерживает два независимых движка:
+Chebur.NET поддерживает два независимых proxy engine:
 
 - **sing-box**
 - **Xray-core**
 
-Оба ядра работают через единый интерфейс `Engine`, поэтому основная логика Chebur.NET не привязана к конкретному прокси-движку.
+Оба ядра работают через единый интерфейс `Engine`, поэтому основная логика Chebur.NET не привязана к конкретному движку.
 
 Поддерживаются:
 
@@ -31,8 +29,8 @@ Chebur.NET поддерживает два независимых движка:
 - безопасная перезагрузка;
 - проверка состояния после запуска;
 - автоматическое восстановление при отказе;
-- сбор состояния и метрик;
-- переключение ядра через LuCI.
+- сбор состояния и health-метрик;
+- переключение engine через LuCI.
 
 Xray builder постепенно приведён к функциональному паритету с sing-box для основных режимов маршрутизации и TProxy.
 
@@ -50,7 +48,7 @@ Xray builder постепенно приведён к функционально
 - **Shadowsocks**
 - **SOCKS5**
 
-Также сохраняются дополнительные параметры нод:
+Дополнительные параметры нод сохраняются при обработке:
 
 - UUID;
 - password;
@@ -74,53 +72,49 @@ Xray builder постепенно приведён к функционально
 
 # 🧩 Источники нод
 
-Chebur.NET поддерживает несколько источников прокси-нод.
-
 ## Подписки
 
-Поддерживаются подписки из современных панелей и клиентов в форматах:
+Поддерживаются современные форматы:
 
 - Base64;
 - Clash YAML;
 - JSON;
 - JSON-массивы профилей.
 
-Поддерживаются источники, встречающиеся в экосистемах:
+Совместимы источники, используемые в экосистемах:
 
 - 3X-UI;
 - Remnawave;
 - Marzban;
 - Xray-подобные JSON API;
 - Happ;
-- Clash/ClashMeta;
+- Clash / ClashMeta;
 - другие совместимые JSON/YAML профили.
 
-Для HTTP-запросов подписки можно задавать собственный `User-Agent`.
+Для каждой HTTP-подписки можно задавать собственный `User-Agent`.
 
 ---
 
 ## Несколько подписок одновременно
 
-Можно использовать несколько независимых `subscription` секций.
+Можно использовать несколько независимых секций `subscription`.
 
-Каждая подписка имеет собственные:
+Каждая подписка может иметь собственные:
 
 - имя;
 - URL;
 - User-Agent;
 - HWID;
-- статус enabled/disabled;
-- набор regex-фильтров.
+- enabled/disabled;
+- regex-фильтры.
 
-Это позволяет объединять несколько провайдеров и фильтровать их ноды независимо друг от друга.
+Подписки могут использоваться одновременно с ручными нодами.
 
 ---
 
 ## Ручные ноды
 
-Помимо подписок поддерживается **ручное добавление URI нод**.
-
-Например:
+Помимо подписок поддерживается ручное добавление URI:
 
 ```text
 vless://...
@@ -130,21 +124,19 @@ ss://...
 socks5://...
 ```
 
-Ручные ноды хранятся отдельно от подписок и могут использоваться одновременно с ними.
-
-Это удобно для:
+Ручные ноды могут использоваться для:
 
 - собственных серверов;
-- тестовых нод;
 - резервных подключений;
+- тестирования;
 - локальных прокси;
-- нод, которые отсутствуют в подписке.
+- нод, отсутствующих в подписке.
 
 ---
 
-# 🧹 Фильтрация подписок через регулярные выражения
+# 🧹 Фильтрация подписок
 
-Для каждой подписки можно задать `exclude_regex`.
+Для каждой подписки можно задавать `exclude_regex`.
 
 Нода исключается, если регулярное выражение совпадает с её:
 
@@ -152,7 +144,7 @@ socks5://...
 - outbound tag;
 - remark/profile name.
 
-Пример:
+Например:
 
 ```text
 exclude_regex:
@@ -162,9 +154,7 @@ exclude_regex:
   - "backup"
 ```
 
-Это позволяет автоматически исключать ненужные ноды непосредственно после загрузки подписки.
-
-Фильтрация выполняется до построения конфигурации прокси-ядра.
+Фильтрация выполняется до построения конфигурации proxy engine.
 
 ---
 
@@ -172,7 +162,7 @@ exclude_regex:
 
 Chebur.NET позволяет управлять маршрутизацией отдельных устройств локальной сети.
 
-Для каждого клиента можно указать:
+Для клиента можно указать:
 
 - IP;
 - MAC;
@@ -184,10 +174,10 @@ Chebur.NET позволяет управлять маршрутизацией о
 
 ### `rules`
 
-Обычная маршрутизация по правилам и ruleset.
+Обычная маршрутизация через ruleset:
 
 ```text
-Клиент
+Client
    ↓
 rules
    ↓
@@ -196,56 +186,57 @@ rules
 
 ### `full_proxy`
 
-Весь трафик конкретного клиента направляется через прокси.
+Весь трафик устройства направляется через proxy:
 
 ```text
-Устройство
-     ↓
+Device
+   ↓
 full_proxy
-     ↓
+   ↓
 Proxy Engine
-     ↓
+   ↓
 VPN / Proxy
 ```
 
 ### `direct`
 
-Клиент полностью исключается из проксирования.
+Устройство полностью исключается из проксирования:
 
 ```text
-Устройство
-     ↓
+Device
+   ↓
 direct
-     ↓
+   ↓
 Internet
 ```
 
-Цель политики может быть задана IP или MAC.
+Цель политики может задаваться IP или MAC.
 
 ---
 
 # 🛣️ Route Policy
 
-В отличие от `Client Policy`, которая определяет поведение устройства, **Route Policy позволяет создавать отдельные правила маршрутизации для сервисов**.
+`Client Policy` определяет поведение устройства.
+
+`Route Policy` позволяет отдельно управлять маршрутизацией сервисов и типов трафика.
 
 Например:
 
-```text
-AI
-YouTube
-Telegram
-Discord
-Google
-Рабочие сервисы
-```
+- AI;
+- YouTube;
+- Telegram;
+- Discord;
+- Google;
+- рабочие сервисы.
 
-Каждая секция может содержать:
+Каждая политика может содержать:
 
 - имя;
 - enabled;
 - rulesets;
 - пользовательские домены;
 - пользовательские подсети;
+- custom ports;
 - конкретный outbound.
 
 Пример:
@@ -261,13 +252,11 @@ config route_policy
     list custom_domains 'openai.com'
 ```
 
-Таким образом, разные сервисы могут направляться через разные прокси-ноды или балансировщики.
-
 ---
 
 # 🌐 Пользовательские домены и подсети
 
-Помимо готовых ruleset можно вручную добавить:
+Помимо готовых ruleset можно добавлять собственные правила.
 
 ### Домены
 
@@ -277,22 +266,27 @@ api.example.com
 *.example.com
 ```
 
-### Подсети
+### CIDR
 
 ```text
 1.2.3.0/24
 10.20.30.0/24
 ```
 
-Они могут использоваться как в основной маршрутизации, так и внутри отдельных `Route Policy`.
+Правила могут использоваться:
+
+- в основной маршрутизации;
+- внутри `Route Policy`;
+- для отдельных сервисов;
+- в клиентских политиках.
 
 ---
 
-# 🔌 Пользовательские порты и диапазоны
+# 🔌 Пользовательские порты
 
-Chebur.NET поддерживает маршрутизацию по destination port.
+Поддерживается маршрутизация по destination port.
 
-Можно указать:
+Можно указывать:
 
 ```text
 443
@@ -301,25 +295,17 @@ Chebur.NET поддерживает маршрутизацию по destination 
 50000:50100
 ```
 
-Поддерживаются как отдельные TCP/UDP-порты, так и диапазоны.
+Поддерживаются отдельные TCP/UDP-порты и диапазоны.
 
-Это позволяет создавать правила для приложений, которые невозможно корректно определить только по доменам или IP.
-
-Например:
-
-```text
-443
-3478
-50000-65535
-```
+Это особенно полезно для приложений, которые невозможно надёжно определить только по доменам или IP.
 
 ---
 
 # 🎮 Discord / WebRTC UDP routing
 
-Для Discord добавлена специальная обработка UDP-трафика.
+Для Discord предусмотрена дополнительная обработка UDP-трафика.
 
-При включении Discord ruleset Chebur.NET создаёт дополнительные правила для:
+При использовании Discord ruleset могут создаваться правила для:
 
 - UDP `443`;
 - UDP `50000-65535`.
@@ -330,17 +316,16 @@ Chebur.NET поддерживает маршрутизацию по destination 
 - WebRTC media;
 - UDP handshake traffic.
 
-Маршрутизация выполняется через правила движка, без необходимости жёстко прописывать IP-диапазоны Discord.
+Работает с обоими engine:
 
-Работает для **sing-box и Xray**.
+- sing-box;
+- Xray-core.
 
 ---
 
 # 📚 Ruleset
 
-Chebur.NET умеет использовать локальные ruleset и списки подсетей.
-
-Поддерживаются:
+Chebur.NET поддерживает:
 
 - системные ruleset;
 - динамические ruleset;
@@ -349,27 +334,25 @@ Chebur.NET умеет использовать локальные ruleset и с�
 - пользовательские CIDR;
 - пользовательские порты.
 
-Ruleset могут использоваться:
+Ruleset могут использоваться в:
 
-- в основной маршрутизации;
-- в `Route Policy`;
-- для отдельных сервисов;
-- для Discord;
-- для клиентских политик.
+- основной маршрутизации;
+- `Route Policy`;
+- клиентских политиках;
+- правилах отдельных сервисов;
+- Discord routing.
 
 ---
 
 # 💾 Локальные списки
 
-Можно указывать пути к локальным `.lst` файлам.
-
-Например:
+Можно использовать собственные `.lst` файлы:
 
 ```text
 /usr/share/cheburnet/lists/custom.lst
 ```
 
-Это позволяет использовать собственные списки адресов без изменения исходного кода.
+Это позволяет добавлять локальные списки без изменения исходного кода.
 
 ---
 
@@ -380,12 +363,12 @@ Chebur.NET поддерживает группы выходных нод.
 Группа может содержать:
 
 - список нод;
-- стратегию;
+- стратегию выбора;
 - URL проверки;
 - интервал проверки;
 - tolerance.
 
-Например:
+Пример:
 
 ```text
 AUTO
@@ -395,58 +378,58 @@ AUTO
  └── node-4
 ```
 
-Для автоматического выбора используется проверка доступности/задержки.
+Для автоматического выбора используются проверки доступности и задержки.
 
 ---
 
-# 🧠 Thread-safe состояние и immutable snapshots
+# 🧠 Immutable snapshots
 
-Конфигурационное состояние демона организовано через безопасные снимки состояния.
+Конфигурационное состояние демона организовано через безопасные snapshots.
 
 Это позволяет:
 
-- читать конфигурацию без блокировки долгих операций;
-- строить новый конфиг из согласованного snapshot;
+- читать состояние без долгих блокировок;
+- строить конфигурацию из согласованного snapshot;
 - избегать частично изменённого состояния;
-- безопасно выполнять параллельные операции API, telemetry и engine lifecycle.
+- безопасно выполнять параллельные API, telemetry и engine операции.
 
-Изменение состояния выполняется отдельно от применения конфигурации к прокси-ядру.
+Изменение состояния отделено от применения конфигурации к proxy engine.
 
 ---
 
-# 🔄 Безопасная перезагрузка
+# 🔄 Safe Reload и Rollback
 
 Изменение конфигурации не выполняется по принципу:
 
 ```text
-перезапустить → надеяться, что заработало
+restart → надеяться, что заработало
 ```
 
 Используется последовательность:
 
 ```text
 UCI / API
-    ↓
+   ↓
 State Snapshot
-    ↓
-BuildConfig
-    ↓
-ValidateConfig
-    ↓
+   ↓
+Build Config
+   ↓
+Validate Config
+   ↓
 Backup
-    ↓
-Reload
-    ↓
-Start
-    ↓
+   ↓
+Reload / Restart
+   ↓
 Health Check
-    ↓
-OK ───────────────→ новый конфиг активен
-    │
-    └── FAIL ──────→ Rollback
+   ↓
+      OK ─────→ новый конфиг активен
+       │
+      FAIL
+       ↓
+    Rollback
 ```
 
-Перед запуском новый конфиг проверяется непосредственно соответствующим бинарником:
+Перед запуском конфигурация проверяется непосредственно соответствующим бинарником:
 
 ```text
 sing-box check
@@ -460,37 +443,35 @@ xray -test
 
 Если конфигурация не проходит проверку, рабочий процесс не затрагивается.
 
-При ошибке запуска или health check выполняется автоматический rollback к предыдущей конфигурации.
+При ошибке запуска или health check выполняется автоматический rollback.
 
 ---
 
-# 🛡️ Защита рабочего процесса
+# 🛡️ Защита процесса
 
-Остановка прокси-ядра реализована через контролируемый lifecycle.
+Lifecycle proxy engine контролируется демоном.
 
-`TerminateCmd`:
+При завершении процесса:
 
-1. отправляет `SIGTERM`;
-2. ожидает штатного завершения;
-3. через timeout применяет `SIGKILL`;
-4. ожидает фактического завершения процесса.
+1. отправляется `SIGTERM`;
+2. ожидается штатное завершение;
+3. после timeout применяется `SIGKILL`;
+4. ожидается фактическое завершение процесса.
 
 Это предотвращает:
 
 - zombie processes;
 - зависшие процессы;
 - занятые TProxy-порты;
-- проблемы при повторном запуске.
+- проблемы повторного запуска.
 
-Дочерний процесс также получает `Pdeathsig`, поэтому при аварийном завершении родительского процесса ядро не должно оставаться запущенным отдельно.
+Дочерний процесс получает `Pdeathsig`, поэтому при аварийном завершении родительского процесса engine не должен оставаться запущенным отдельно.
 
 ---
 
 # ❤️ Engine Supervisor
 
-В Chebur.NET появился отдельный supervisor для прокси-ядра.
-
-Он контролирует состояние запущенного двигателя и автоматически пытается восстановить работу при сбое.
+Supervisor контролирует состояние proxy engine и автоматически восстанавливает работу при сбоях.
 
 Используются два уровня проверки.
 
@@ -499,16 +480,14 @@ xray -test
 Проверяется:
 
 - наличие процесса;
-- доступность локального proxy-порта;
-- реальный DNS-запрос через локальный DNS endpoint.
+- доступность proxy-порта;
+- DNS через локальный endpoint.
 
-Проверка выполняется примерно каждые 10 секунд.
+Проверка выполняется периодически.
 
-### L2 — E2E проверка
+### L2 — E2E
 
 Проверяется реальный внешний HTTP-трафик через proxy.
-
-Проверка выполняется примерно каждые 60 секунд.
 
 Это позволяет отличить:
 
@@ -522,9 +501,7 @@ xray -test
 proxy реально передаёт трафик
 ```
 
-При повторяющихся ошибках supervisor выполняет restart с backoff.
-
-Используется ступенчатая задержка восстановления:
+При повторяющихся ошибках используется restart с backoff:
 
 ```text
 0s
@@ -538,11 +515,9 @@ proxy реально передаёт трафик
 
 ---
 
-# 🌐 DNS без утечек
+# 🌐 DNS
 
-DNS вынесен в отдельный inbound.
-
-По умолчанию используется:
+DNS вынесен в отдельный inbound, по умолчанию:
 
 ```text
 1053
@@ -558,7 +533,7 @@ DNS вынесен в отдельный inbound.
 - bootstrap DNS;
 - TTL.
 
-DNS diagnostics выполняются непосредственно из Go без зависимости от `nslookup`.
+DNS diagnostics выполняются непосредственно из Go.
 
 ---
 
@@ -566,7 +541,7 @@ DNS diagnostics выполняются непосредственно из Go б
 
 Chebur.NET умеет автоматически генерировать HWID на основе MAC-адреса устройства.
 
-Это используется для VLESS Reality и других конфигураций, где сервер ожидает уникальный идентификатор клиента.
+Это используется для конфигураций, где сервер ожидает уникальный идентификатор клиента.
 
 Можно также задать собственный HWID.
 
@@ -586,73 +561,88 @@ WebSocket используется для:
 
 - live telemetry;
 - статусов;
-- задержек;
-- обновлений;
-- событий supervisor;
-- операций updater.
+- latency;
+- engine events;
+- supervisor events;
+- diagnostics;
+- updater operations.
 
 WebSocket поддерживает двусторонний обмен сообщениями.
-
-Это позволяет LuCI не только получать состояние, но и инициировать операции непосредственно через WebSocket.
 
 ---
 
 # 🩺 Системная диагностика
 
-Начиная с `v0.0.8.1`, а в `v0.0.8.4` — с исправлениями конкурентного доступа и состояния,
 Chebur.NET имеет отдельный event-driven слой диагностики.
 
-Diagnostics не дублирует Supervisor: он анализирует уже собранные `HealthSnapshot`,
-определяет активные проблемы и передаёт события в LuCI. Supervisor остаётся владельцем
-операций восстановления engine.
+Diagnostics анализирует состояние системы и уже собранные health snapshots.
 
-### 16 встроенных проверок
+Supervisor при этом остаётся владельцем операций восстановления engine.
 
-Диагностика включает:
+## 16 встроенных checks
 
-**Engine**
-- `engine.process_down`
-- `engine.process_unstable`
-- `engine.port_unavailable`
-- `engine.config_invalid`
+### Engine
 
-**DNS**
-- `dns.listener_down`
-- `dns.proxy_unavailable`
-- `dns.bootstrap_failed`
-- `dns.high_latency`
+```text
+engine.process_down
+engine.process_unstable
+engine.port_unavailable
+engine.config_invalid
+```
 
-**Connectivity**
-- `connectivity.internet_unreachable`
-- `connectivity.proxy_e2e_failed`
+### DNS
 
-**Nodes**
-- `nodes.no_available`
-- `nodes.partial_unavailable`
-- `nodes.all_failed`
+```text
+dns.listener_down
+dns.proxy_unavailable
+dns.bootstrap_failed
+dns.high_latency
+```
 
-**Routing / configuration**
-- `routing.ip_rule_missing`
-- `routing.nftables_invalid`
-- `config.drift`
+### Connectivity
 
-### Hysteresis
+```text
+connectivity.internet_unreachable
+connectivity.proxy_e2e_failed
+```
 
-Для предотвращения ложных срабатываний состояние проблемы не меняется после одного
-случайного сбоя.
+### Nodes
 
-Используются политики с разным порогом:
+```text
+nodes.no_available
+nodes.partial_unavailable
+nodes.all_failed
+```
 
-- normal — несколько последовательных failures/successes;
-- strict — для критических состояний;
-- soft — для нестабильных/latency-проверок.
+### Routing / configuration
 
-Это позволяет избежать мигания ошибок при кратковременных сетевых сбоях.
+```text
+routing.ip_rule_missing
+routing.nftables_invalid
+config.drift
+```
 
-### Root-cause correlation
+---
 
-Если одна неисправность вызывает несколько вторичных симптомов, диагностика старается
-показать пользователю первопричину вместо списка одинаковых ошибок.
+## Hysteresis
+
+Для защиты от кратковременных сбоев применяется hysteresis.
+
+Состояние проблемы не меняется после одного случайного failure.
+
+Используются разные политики:
+
+- `normal`;
+- `strict`;
+- `soft`.
+
+Это предотвращает постоянное появление и исчезновение ошибок при нестабильной сети.
+
+---
+
+## Root-cause correlation
+
+Если одна неисправность вызывает несколько вторичных симптомов, диагностика старается показать пользователю первопричину.
 
 Например:
 
@@ -665,12 +655,15 @@ Engine process down
         └── nodes unavailable
 ```
 
-В UI при этом отображается основной incident, а зависимые симптомы используются
-для технической детализации.
+В интерфейсе отображается основной incident, а вторичные симптомы используются для технической детализации.
 
-### WebSocket events
+---
 
-LuCI получает диагностические события без постоянного polling:
+## Event-driven WebSocket diagnostics
+
+LuCI не обязан постоянно опрашивать состояние.
+
+Используются события:
 
 ```text
 diagnostic.snapshot
@@ -678,34 +671,25 @@ diagnostic.problem_created
 diagnostic.problem_resolved
 ```
 
-При подключении клиент получает текущий snapshot, после чего получает только изменения
-состояния.
+При подключении клиент получает текущий snapshot, после чего получает только изменения.
 
-Это уменьшает лишний WebSocket-трафик и позволяет интерфейсу обновлять incident cards
-сразу после изменения состояния.
+Это уменьшает лишний WebSocket-трафик и позволяет UI сразу отображать новые проблемы.
 
-### Безопасность конкурентного доступа
-
-В `v0.0.8.4` исправлены важные race conditions:
-
-- snapshot проблем копируется глубоко;
-- карты `Details` не разделяются между внутренним состоянием и клиентом;
-- subscriber channel больше не закрывается конкурентно с broadcast;
-- неинициализированные health snapshots не создают ложный статус healthy;
-- число проверок в API/UI соответствует реальным 16 checks.
+---
 
 # 📊 Telemetry
 
 Telemetry Hub позволяет нескольким клиентам одновременно получать состояние Chebur.NET.
 
-Передаются данные о:
+Передаются:
 
-- текущем engine;
-- состоянии процессов;
-- нодах;
+- текущий engine;
+- состояние процессов;
+- ноды;
 - latency;
-- статусах;
-- обновлениях.
+- статусы;
+- updater events;
+- supervisor events.
 
 Запись в WebSocket соединения выполняется потокобезопасно.
 
@@ -713,9 +697,9 @@ Telemetry Hub позволяет нескольким клиентам одно�
 
 # 🔄 Менеджер обновлений
 
-В Chebur.NET появился встроенный updater.
+Chebur.NET содержит встроенный updater.
 
-Он может проверять обновления:
+Он работает с:
 
 ```text
 Chebur.NET
@@ -746,38 +730,42 @@ cheburnetd upgrade [target]
 
 ---
 
-# 📦 OpenWrt package updater
+# 📦 Multi-architecture Xray updater
 
-Updater определяет:
+Начиная с `v0.8.12`, updater автоматически сопоставляет архитектуру устройства с соответствующим официальным архивом Xray-core.
 
-- используемый пакетный менеджер;
-- архитектуру устройства;
-- доступный формат пакета.
+Поддерживаются:
 
-Для OpenWrt используются native packages:
+| GOARCH | Xray asset |
+|---|---|
+| `arm64` | `Xray-linux-arm64-v8a.zip` |
+| `amd64` | `Xray-linux-64.zip` |
+| `386` | `Xray-linux-32.zip` |
+| `arm` | ARMv5 / ARMv7 |
+| `mipsle` | `Xray-linux-mips32le-softfloat.zip` |
+| `mips` | `Xray-linux-mips32-softfloat.zip` |
+| `mips64le` | `Xray-linux-mips64le-softfloat.zip` |
+| `mips64` | `Xray-linux-mips64-softfloat.zip` |
 
-```text
-.ipk
-.apk
-```
+Для ARM дополнительно учитывается вариант архитектуры (`v5`, `arm9` и т.д.).
 
-Если подходящего пакета нет, используется fallback на бинарное обновление.
+Если архитектура не поддерживается, updater возвращает явную ошибку вместо выбора неправильного бинарника.
 
-Это особенно важно для разных архитектур роутеров.
+Xray устанавливается из **pinned version**, а перед заменой выполняется проверка контрольной суммы.
 
 ---
 
-# 🔒 SHA256 проверка обновлений
+# 🔒 SHA256 verification
 
-Перед установкой загруженного пакета или бинарника выполняется SHA256-проверка.
+Перед установкой загруженного компонента выполняется SHA256-проверка.
 
-CI публикует единый файл:
+CI публикует:
 
 ```text
 sha256sums.txt
 ```
 
-Таким образом, повреждённый или несовпадающий файл не должен устанавливаться как корректное обновление.
+Несовпадающий файл не должен устанавливаться как корректное обновление.
 
 ---
 
@@ -789,21 +777,21 @@ sha256sums.txt
 /etc/config/cheburnet
 ```
 
-Для этого реализована защита конфигурации:
+Для этого используются:
 
 ### OPKG
 
-Используется `conffiles`.
+`conffiles`
 
 ### APK
 
-Используются pre-install/post-install hooks.
+pre-install / post-install hooks.
 
 ### Updater
 
-Дополнительно существует backup/restore fallback на уровне самого updater.
+Дополнительно существует backup/restore fallback.
 
-Таким образом, обновление Chebur.NET отделено от пользовательской конфигурации роутера.
+Таким образом, обновление компонентов отделено от пользовательской конфигурации роутера.
 
 ---
 
@@ -814,7 +802,7 @@ LuCI предоставляет web-интерфейс управления Cheb
 Основные возможности:
 
 - выбор engine;
-- управление routing mode;
+- routing mode;
 - подписки;
 - ручные ноды;
 - Client Policy;
@@ -825,14 +813,15 @@ LuCI предоставляет web-интерфейс управления Cheb
 - custom ports;
 - HWID;
 - DNS;
-- обновления;
+- updater;
 - состояние sing-box;
 - состояние Xray;
 - telemetry;
-- live WebSocket status.
- - системная диагностика и incident cards;
+- live WebSocket status;
+- системная диагностика;
+- incident cards.
 
-Интерфейс обновляется без необходимости перезапускать сам `cheburnetd`.
+Интерфейс работает поверх REST API и WebSocket демона.
 
 ---
 
@@ -849,42 +838,50 @@ LuCI предоставляет web-интерфейс управления Cheb
              └──────────────┬──────────────┘
                             │
                             ▼
-                  ┌─────────────────────┐
-                  │     cheburnetd      │
-                  │       Go daemon     │
-                  └──────────┬──────────┘
-                             │
-       ┌─────────────────────┼─────────────────────┐
-       │                     │                     │
-       ▼                     ▼                     ▼
- Subscription             Routing              Telemetry
+                  ┌───────────────────┐
+                  │    cheburnetd     │
+                  │      Go daemon    │
+                  └─────────┬─────────┘
+                            │
+       ┌────────────────────┼────────────────────┐
+       │                    │                    │
+       ▼                    ▼                    ▼
+ Subscription             Routing             Telemetry
    Worker                  Engine                 API
-       │                     │                     │
-       │          ┌──────────┴──────────┐          │
-       │          │                     │          │
-       ▼          ▼                     ▼          ▼
-   Node URI   sing-box               Xray       WebSocket
-   parser     builder                builder
-       │          │                     │
-       └──────────┴──────────┬──────────┘
-                             │
-                             ▼
-                     Engine Supervisor
-                             │
-                   ┌─────────┴─────────┐
-                   │                   │
-                   ▼                   ▼
-               L1 health             L2 E2E
-                   │                   │
-                   └─────────┬─────────┘
-                             │
-                             ▼
+       │                    │                    │
+       ▼             ┌──────┴──────┐             ▼
+   Node parser       │             │         WebSocket
+                     ▼             ▼
+                 sing-box        Xray
+                     │             │
+                     └──────┬──────┘
+                            ▼
+                    Engine Supervisor
+                            │
+                    ┌───────┴───────┐
+                    ▼               ▼
+                  L1 health       L2 E2E
+                    │               │
+                    └───────┬───────┘
+                            ▼
                        Linux Network
-                             │
-               ┌─────────────┼─────────────┐
-               │             │             │
-             nftables      ip rule       TProxy
+                            │
+                ┌───────────┼───────────┐
+                ▼           ▼           ▼
+             nftables     ip rule     TProxy
 ```
+
+Chebur.NET сознательно не реализует собственный proxy data plane.
+
+Go-демон является **control plane**, а непосредственную передачу трафика выполняют:
+
+- sing-box;
+- Xray-core;
+- Linux kernel;
+- nftables;
+- TProxy.
+
+Это позволяет не нагружать Go-демон обработкой каждого сетевого пакета.
 
 ---
 
@@ -893,88 +890,77 @@ LuCI предоставляет web-интерфейс управления Cheb
 ```text
 ├── cmd/
 │   └── cheburnetd/
-│       └── main.go                    # Точка входа демона
-│
+│       └── main.go
+
 ├── internal/
 │   ├── api/
-│   │   └── server.go                   # REST + WebSocket API
-│   │
+│   │   └── server.go
+
 │   ├── config/
-│   │   ├── models.go                   # Модели конфигурации
-│   │   └── uci.go                      # Чтение/запись UCI
-│   │
+│   │   ├── models.go
+│   │   └── uci.go
+
 │   ├── engine/
-│   │   ├── engine.go                   # Общий Engine interface
-│   │   ├── process.go                  # Управление процессами
-│   │   ├── reload.go                   # SafeReload + rollback
-│   │   ├── health.go                   # Health checks
-│   │   ├── singbox.go                  # Lifecycle sing-box
-│   │   ├── xray.go                     # Lifecycle Xray
-│   │   │
+│   │   ├── engine.go
+│   │   ├── process.go
+│   │   ├── reload.go
+│   │   ├── health.go
+│   │   ├── singbox.go
+│   │   ├── xray.go
 │   │   ├── singbox/
-│   │   │   └── builder.go              # Генератор sing-box config
-│   │   │
+│   │   │   └── builder.go
 │   │   └── xray/
-│   │       └── builder.go               # Генератор Xray config
-│   │
+│   │       └── builder.go
+
 │   ├── network/
-│   │   └── ...                          # nftables / TProxy routing
-│   │
+│   │   └── ...
+
 │   ├── rules/
-│   │   └── ...                          # Ruleset/cache
-│   │
+│   │   └── ...
+
 │   ├── subscription/
-│   │   └── worker.go                   # Загрузка/парсинг подписок
-│   │
+│   │   └── worker.go
+
 │   ├── telemetry/
-│   │   └── hub.go                      # WebSocket telemetry
-│   │
+│   │   └── hub.go
+
 │   └── updater/
-│       └── manager.go                   # Update manager
-│
+│       └── manager.go
+
 ├── pkg/
 │   ├── hwid/
-│   │   └── ...                          # HWID generator
-│   │
 │   └── uri/
-│       └── ...                          # Proxy URI decoder
-│
+
 ├── openwrt/
 │   └── files/
 │       ├── etc/
 │       │   ├── config/
-│       │   │   └── cheburnet             # UCI configuration
+│       │   │   └── cheburnet
 │       │   └── init.d/
-│       │       └── cheburnet             # procd service
-│       │
+│       │       └── cheburnet
 │       ├── usr/share/luci/
-│       │   └── ...                       # LuCI menu
-│       │
 │       └── www/luci-static/
-│           └── resources/view/cheburnet/
-│               └── dashboard.js          # LuCI UI
-│
+
 ├── .github/
 │   └── workflows/
-│       └── build-packages.yml             # CI/CD packages
-│
+│       └── build-packages.yml
+
 ├── Makefile
 ├── go.mod
 ├── go.sum
+├── sha256sums.txt
 └── README.md
 ```
 
 ---
 
-# ⚙️ Конфигурационная модель
+# ⚙️ Конфигурация
 
-Основной конфигурационный файл:
+Основной файл:
 
 ```text
 /etc/config/cheburnet
 ```
-
-Chebur.NET использует UCI как источник конфигурации OpenWrt.
 
 Основные секции:
 
@@ -985,9 +971,7 @@ config client_rule
 config route_policy
 ```
 
----
-
-# 📝 Пример конфигурации
+Пример:
 
 ```text
 config cheburnet 'main'
@@ -1023,33 +1007,23 @@ config cheburnet 'main'
     list local_list_files '/usr/share/cheburnet/lists/custom.lst'
 
 
-# Подписка
 config subscription
     option name 'Provider 1'
     option enabled '1'
-
-    option user_agent 'Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)'
-
+    option user_agent 'Happ/4.1.3'
     option hwid ''
-
     option url 'https://example.com/api/v1/client/subscribe?token=xxx'
 
     list exclude_regex 'test'
     list exclude_regex 'expired'
-    list exclude_regex 'backup'
 
 
-# Ручная нода
-config cheburnet 'main'
-    list manual_nodes 'vless://...'
-
-
-# Client Policy
 config client_rule
     option enabled '1'
     option name 'Smart TV'
     option target '192.168.1.120'
     option mode 'full_proxy'
+
 
 config client_rule
     option enabled '1'
@@ -1058,7 +1032,6 @@ config client_rule
     option mode 'direct'
 
 
-# Route Policy
 config route_policy
     option enabled '1'
     option name 'AI'
@@ -1067,14 +1040,6 @@ config route_policy
     list rulesets 'google_ai'
     list custom_domains 'chatgpt.com'
     list custom_domains 'openai.com'
-
-
-config route_policy
-    option enabled '1'
-    option name 'YouTube'
-    option outbound 'AUTO'
-
-    list rulesets 'youtube'
 ```
 
 ---
@@ -1099,7 +1064,7 @@ LAN
 
 ## Client Policy
 
-Дополнительное переопределение маршрута для конкретных устройств:
+Переопределение маршрута для конкретного устройства:
 
 ```text
 Client
@@ -1111,7 +1076,7 @@ Client
 
 ## Route Policy
 
-Дополнительное переопределение для отдельных сервисов:
+Переопределение маршрута для отдельных сервисов:
 
 ```text
 Service
@@ -1127,59 +1092,15 @@ Service
 
 ---
 
-# 🔄 Жизненный цикл изменения конфигурации
-
-При изменении конфигурации Chebur.NET старается не затрагивать работающий engine до тех пор, пока новый конфиг не будет построен и проверен.
-
-```text
-UCI / LuCI / API
-       │
-       ▼
-State Update
-       │
-       ▼
-Immutable Snapshot
-       │
-       ▼
-Build Config
-       │
-       ▼
-Binary Validation
-       │
-       ▼
-Backup
-       │
-       ▼
-Engine Restart
-       │
-       ▼
-Local Health Check
-       │
-       ├────────────── OK
-       │               │
-       │               ▼
-       │           New Config
-       │
-       └──────────── FAIL
-                       │
-                       ▼
-                    Rollback
-```
-
----
-
 # 📦 Установка
 
-### Текущий релиз
+## Текущий релиз
 
-urlChebur.NET v0.0.8.4https://github.com/ph4n70m1984/cheburnet/releases/tag/v0.0.8.4
+**Chebur.NET `v0.8.12`**
 
+Готовые пакеты публикуются в GitHub Releases.
 
-Готовые пакеты публикуются в GitHub Releases:
-
-[GitHub Releases Chebur.NET](https://github.com/ph4n70m1984/cheburnet/releases?utm_source=chatgpt.com)
-
-Для OpenWrt с `opkg` используется:
+Для OpenWrt с `opkg`:
 
 ```text
 .ipk
@@ -1191,9 +1112,7 @@ Local Health Check
 .apk
 ```
 
----
-
-## OPKG
+### OPKG
 
 ```bash
 opkg update
@@ -1207,11 +1126,9 @@ opkg install sing-box
 opkg install luci-app-cheburnet_<version>_<arch>.ipk
 ```
 
----
+### APK
 
-## APK
-
-Перед установкой рекомендуется проверить SHA256 пакета по опубликованному:
+Перед установкой рекомендуется проверить SHA256 по:
 
 ```text
 sha256sums.txt
@@ -1222,7 +1139,8 @@ sha256sums.txt
 ```bash
 apk update
 
-apk add --allow-untrusted luci-app-cheburnet-<version>.<arch>.apk
+apk add --allow-untrusted \
+    luci-app-cheburnet-<version>.<arch>.apk
 ```
 
 ---
@@ -1258,15 +1176,13 @@ go build \
   ./cmd/cheburnetd
 ```
 
-## MIPS
-
-Поддержка MIPS/MIPSel также включена в CI/CD matrix проекта.
+CI/CD проекта также учитывает различные OpenWrt архитектуры.
 
 ---
 
 # 🗜️ UPX
 
-Для устройств с ограниченным flash/storage можно дополнительно использовать UPX:
+Для устройств с ограниченным flash/storage можно использовать:
 
 ```bash
 upx --best --lzma bin/cheburnetd
@@ -1274,7 +1190,7 @@ upx --best --lzma bin/cheburnetd
 
 ---
 
-# 🚀 Развёртывание вручную
+# 🚀 Ручное развёртывание
 
 ```bash
 ROUTER="root@192.168.1.1"
@@ -1300,7 +1216,7 @@ ssh $ROUTER \
     "chmod +x /etc/init.d/cheburnet"
 ```
 
-UCI configuration:
+UCI:
 
 ```bash
 scp openwrt/files/etc/config/cheburnet \
@@ -1330,13 +1246,7 @@ ssh $ROUTER \
 
 ```bash
 /etc/init.d/cheburnet start
-```
-
-```bash
 /etc/init.d/cheburnet stop
-```
-
-```bash
 /etc/init.d/cheburnet restart
 ```
 
@@ -1370,29 +1280,33 @@ logread -e xray
 
 ---
 
-# 🔄 Проверка обновлений через CLI
+# 🔄 Обновление через CLI
+
+Проверка:
 
 ```bash
 cheburnetd check_updates
 ```
 
-Обновление конкретного компонента:
+Обновление Chebur.NET:
 
 ```bash
 cheburnetd upgrade cheburnet
 ```
 
-или:
+sing-box:
 
 ```bash
 cheburnetd upgrade sing-box
 ```
 
+Xray:
+
 ```bash
 cheburnetd upgrade xray-core
 ```
 
-Для комплексного обновления:
+Все компоненты:
 
 ```bash
 cheburnetd upgrade all
@@ -1402,50 +1316,55 @@ cheburnetd upgrade all
 
 # 🧪 Диагностика
 
-В `v0.0.8.4` диагностика использует 16 встроенных проверок состояния engine,
-DNS, connectivity, nodes, routing и configuration drift.
+Diagnostics контролирует:
 
-Проверяется:
-
-- процесс engine;
+- engine process;
 - proxy port;
-- конфигурация engine;
+- engine configuration;
 - локальный DNS;
 - bootstrap DNS;
 - DNS latency;
-- доступность внешнего Internet;
+- Internet connectivity;
 - proxy E2E connectivity;
 - доступность proxy nodes;
 - `ip rule`;
 - nftables/TProxy;
-- drift сетевой конфигурации.
+- configuration drift.
 
-Состояния проблем проходят через hysteresis, а связанные симптомы могут быть
-сгруппированы вокруг первопричины.
+Используются:
 
-Полный текущий snapshot доступен через REST API, а изменения состояния передаются
-через WebSocket events.
+- hysteresis;
+- root-cause correlation;
+- event-driven WebSocket events.
+
+Основные события:
+
+```text
+diagnostic.snapshot
+diagnostic.problem_created
+diagnostic.problem_resolved
+```
 
 ---
 
 # 🏎️ Принцип производительности
 
-Chebur.NET сознательно не реализует собственный proxy data plane.
+Chebur.NET не реализует собственный proxy data plane.
 
 ```text
                     Chebur.NET
-                 Control Plane
-                       │
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-      UCI            Routing        Health
-        │              │              │
-        └──────────────┼──────────────┘
-                       ▼
-                sing-box / Xray
-                       │
-                       ▼
-                Linux kernel
+                     Control Plane
+                          │
+             ┌────────────┼────────────┐
+             ▼            ▼            ▼
+            UCI         Routing       Health
+             │            │            │
+             └────────────┼────────────┘
+                          ▼
+                   sing-box / Xray
+                          │
+                          ▼
+                     Linux kernel
 ```
 
 Go отвечает за:
@@ -1466,26 +1385,27 @@ Go отвечает за:
 - nftables;
 - TProxy.
 
-Это позволяет не нагружать Go-демон обработкой каждого сетевого пакета.
+Go-демон не участвует в обработке каждого сетевого пакета.
 
 ---
 
 # 🔐 Безопасность и отказоустойчивость
 
-Ключевые защитные механизмы:
+Ключевые механизмы:
 
-- проверка конфигурации до reload;
-- backup рабочего конфига;
+- validation конфигурации до reload;
+- backup рабочего состояния;
 - rollback;
-- health check после запуска;
-- supervisor;
+- post-start health check;
+- Engine Supervisor;
 - restart backoff;
+- cooldown;
 - защита от zombie processes;
-- Pdeathsig для дочерних процессов;
+- Pdeathsig;
 - SHA256 verification обновлений;
-- сохранение `/etc/config/cheburnet` при package upgrade;
+- сохранение `/etc/config/cheburnet`;
 - Safety Fallback для подписок;
-- разделение control plane и data plane.
+- разделение control plane / data plane.
 
 ---
 
@@ -1501,86 +1421,40 @@ Go отвечает за:
 | `dnsmasq` | системный DNS/LAN DHCP |
 | UCI | конфигурация OpenWrt |
 | LuCI | web-интерфейс |
-| WebSocket | live telemetry/control |
+| WebSocket | telemetry/control/events |
+| Supervisor | контроль proxy engine |
+| Diagnostics | диагностика проблем |
 | Updater | обновление компонентов |
-| Ruleset loader | загрузка/кэширование правил |
+| Ruleset loader | загрузка и кэширование правил |
 
 ---
 
-# 📌 Что нового в `v0.0.8.4`
+# 📌 Что нового в `v0.8.12`
 
-Текущий README соответствует релизной кодовой базе `v0.0.8.4`.
+### Xray updater
 
-### Диагностика и отказоустойчивость
+Основное изменение релиза:
 
-- отдельный `DiagnosticsEngine`;
-- **16 реальных системных health-checks**;
-- hysteresis для защиты от flapping;
-- root-cause correlation;
-- event-driven diagnostic WebSocket;
-- `diagnostic.snapshot`;
-- `diagnostic.problem_created`;
-- `diagnostic.problem_resolved`;
-- безопасная работа с WebSocket subscribers;
-- deep-copy диагностических snapshots;
-- корректная обработка неинициализированного health state;
-- реальные действия восстановления:
-  - `restart_engine`;
-  - `fix_routing`;
-  - `reload_firewall`;
-- неподдерживаемые diagnostic actions теперь возвращают ошибку вместо silent no-op.
+- добавлен multi-architecture resolver для Xray-core;
+- архитектура устройства автоматически сопоставляется с Xray asset;
+- поддержаны ARM64;
+- AMD64;
+- 386;
+- ARMv5;
+- ARMv7;
+- MIPS little-endian;
+- MIPS big-endian;
+- MIPS64 little-endian;
+- MIPS64 big-endian;
+- для MIPS учитывается soft-float;
+- для ARM учитывается вариант архитектуры;
+- при неподдерживаемой архитектуре updater возвращает явную ошибку;
+- pinned Xray version сохраняется;
+- SHA256 verification сохраняется.
 
-### Engine Supervisor
+Это делает встроенное обновление Xray существенно более пригодным для разных поколений OpenWrt-роутеров.
 
-- L1/L2 health checks;
-- restart backoff;
-- cooldown;
-- контроль proxy-порта;
-- локальный DNS health check;
-- внешний E2E health check.
-
-### SafeReload
-
-- native binary validation;
-- backup рабочего состояния;
-- reload/restart;
-- post-start health check;
-- автоматический rollback при неуспешном применении.
-
-### Updater
-
-- native `.ipk` / `.apk` package selection;
-- raw binary fallback;
-- SHA256 verification;
-- сохранение пользовательского `/etc/config/cheburnet`;
-- CLI `check_updates`;
-- CLI `upgrade`;
-- обновление Chebur.NET, sing-box и Xray-core.
-
-### Routing
-
-- Client Policy;
-- Route Policy;
-- custom domains;
-- custom subnets;
-- custom destination ports и диапазоны;
-- Discord UDP routing;
-- sing-box и Xray builders;
-- MIPS/MIPSel CI.
-
-### Runtime для OpenWrt
-
-В `v0.0.8.4` runtime-настройки Go были скорректированы для роутеров с ограниченными
-ресурсами:
-
-```text
-GOMEMLIMIT=48MiB
-GOGC=25
-GODEBUG=madvdontneed=1
-```
-
-При этом искусственное ограничение виртуального адресного пространства процесса было
-убрано, чтобы не создавать лишнее ограничение для Go runtime.
+---
 
 # 📜 Лицензия
 
@@ -1588,12 +1462,10 @@ GODEBUG=madvdontneed=1
 
 ---
 
-## Ссылки
+## 🔗 Ссылки
 
-**GitHub:**
+**GitHub:**  
+https://github.com/ph4n70m1984/cheburnet
 
-[github.com/ph4n70m1984/cheburnet](https://github.com/ph4n70m1984/cheburnet?utm_source=chatgpt.com)
-
-**Releases:**
-
-[Chebur.NET Releases](https://github.com/ph4n70m1984/cheburnet/releases?utm_source=chatgpt.com)
+**Releases:**  
+https://github.com/ph4n70m1984/cheburnet/releases
