@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -22,6 +23,7 @@ const (
 	XrayAssetDir       = "/etc/cheburnet/geo"
 	GeositePath        = "/etc/cheburnet/geo/geosite.dat"
 	GeositeDownloadURL = "https://github.com/itdoginfo/allow-domains/releases/latest/download/geosite.dat"
+	ProbePortBase      = 12000
 )
 
 type XrayEngine struct {
@@ -41,7 +43,6 @@ func (x *XrayEngine) Name() string {
 	return "xray"
 }
 
-// moveFileCrossDevice безопасно перемещает файл, выполняя fallback на потоковое копирование при ошибке EXDEV
 func moveFileCrossDevice(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
@@ -67,10 +68,7 @@ func moveFileCrossDevice(src, dst string) error {
 	return nil
 }
 
-// EnsureAssets проверяет наличие /etc/cheburnet/geo/geosite.dat и при отсутствии
-// скачивает его, создавая директорию при необходимости
 func (x *XrayEngine) EnsureAssets(ctx context.Context) error {
-	// Гарантируем наличие изолированного каталога
 	if err := os.MkdirAll(XrayAssetDir, 0755); err != nil {
 		return fmt.Errorf("failed to create asset directory %s: %w", XrayAssetDir, err)
 	}
@@ -81,7 +79,6 @@ func (x *XrayEngine) EnsureAssets(ctx context.Context) error {
 
 	log.Printf("[INFO] %s not found. Downloading asset from %s...", GeositePath, GeositeDownloadURL)
 
-	// Создаем временный файл в той же файловой системе для исключения межфайловых коллизий
 	tmpFile := filepath.Join(XrayAssetDir, "geosite.dat.tmp")
 	defer os.Remove(tmpFile)
 
@@ -185,15 +182,86 @@ func (x *XrayEngine) EnsureAssets(ctx context.Context) error {
 	return nil
 }
 
+func (x *XrayEngine) injectProbeInboundsAndRules(targetPath string, nodes []*config.GenericNode) error {
+	raw, err := os.ReadFile(targetPath)
+	if err != nil {
+		return err
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return err
+	}
+
+	inbounds, _ := parsed["inbounds"].([]interface{})
+	if inbounds == nil {
+		inbounds = []interface{}{}
+	}
+
+	routing, _ := parsed["routing"].(map[string]interface{})
+	if routing == nil {
+		routing = map[string]interface{}{}
+	}
+
+	rules, _ := routing["rules"].([]interface{})
+	if rules == nil {
+		rules = []interface{}{}
+	}
+
+	var probeRules []interface{}
+	for idx, node := range nodes {
+		port := ProbePortBase + idx
+		probeTag := fmt.Sprintf("probe-in-%d", idx)
+
+		inbounds = append(inbounds, map[string]interface{}{
+			"tag":      probeTag,
+			"listen":   "127.0.0.1",
+			"port":     port,
+			"protocol": "http",
+			"settings": map[string]interface{}{
+				"allowTransparent": false,
+			},
+		})
+
+		probeRules = append(probeRules, map[string]interface{}{
+			"type":        "field",
+			"inboundTag":  []string{probeTag},
+			"outboundTag": node.Tag,
+		})
+	}
+
+	routing["rules"] = append(probeRules, rules...)
+	parsed["inbounds"] = inbounds
+	parsed["routing"] = routing
+
+	finalJSON, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(targetPath, finalJSON, 0644)
+}
+
 func (x *XrayEngine) BuildConfig(cfg *config.CheburConfig, targetPath string) error {
 	x.mu.Lock()
 	x.cfg = cfg
 	x.mu.Unlock()
-	return x.builder.Build(cfg, targetPath)
+
+	if err := x.builder.Build(cfg, targetPath); err != nil {
+		return err
+	}
+
+	if len(cfg.Nodes) > 0 {
+		if err := x.injectProbeInboundsAndRules(targetPath, cfg.Nodes); err != nil {
+			log.Printf("[WARN] Failed to inject probe inbounds to Xray config: %v", err)
+		}
+	}
+
+	return nil
 }
 
 func (x *XrayEngine) ValidateConfig(configPath string) error {
-	cmd := exec.Command("xray", "run", "-test", "-c", configPath)
+	cmd := exec.Command("xray", "run", "-test", "-format", "json", "-c", configPath)
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+XrayAssetDir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

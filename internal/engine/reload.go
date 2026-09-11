@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -14,8 +15,9 @@ import (
 // гарантированно бэкапит рабочий конфиг, перезапускает процесс,
 // проводит проверку здоровья и выполняет автоматический откат при сбое.
 func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targetPath string) error {
-	stagingPath := targetPath + ".new"
-	backupPath := targetPath + ".bak"
+	// Сохраняем расширение .json, чтобы Xray и Sing-box корректно определяли формат
+	stagingPath := strings.TrimSuffix(targetPath, ".json") + ".new.json"
+	backupPath := strings.TrimSuffix(targetPath, ".json") + ".bak.json"
 
 	defer os.Remove(stagingPath)
 

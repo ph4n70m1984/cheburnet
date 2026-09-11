@@ -346,14 +346,22 @@ return view.extend({
                 const btnSb = document.getElementById('btn-switch-singbox');
                 const btnXr = document.getElementById('btn-switch-xray');
                 
+                const isXray = (activeEngine === 'xray');
+
                 if (label) {
-                    label.textContent = activeEngine === 'xray' ? 'Xray-core' : 'Sing-box';
+                    label.textContent = isXray ? 'Xray-core' : 'Sing-box';
+                    label.style.color = isXray ? '#a855f7' : '#38bdf8';
                 }
                 if (btnSb && btnXr) {
-                    btnSb.style.opacity = activeEngine === 'sing-box' ? '0.5' : '1';
-                    btnXr.style.opacity = activeEngine === 'xray' ? '0.5' : '1';
-                    btnSb.disabled = (activeEngine === 'sing-box');
-                    btnXr.disabled = (activeEngine === 'xray');
+                    btnSb.style.opacity = isXray ? '1' : '0.5';
+                    btnXr.style.opacity = isXray ? '0.5' : '1';
+                    btnSb.disabled = !isXray;
+                    btnXr.disabled = isXray;
+                }
+
+                const selectEl = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
+                if (selectEl && selectEl.value !== activeEngine) {
+                    selectEl.value = activeEngine;
                 }
             }
 
@@ -376,8 +384,14 @@ return view.extend({
 
                     uci.set('cheburnet', 'main', 'engine', targetEngine);
                     return uci.save().then(() => {
+                        // Вызываем нативный роутер демона вместо uci.apply(), чтобы избежать ubus тайм-аутов
+                        return fetch('http://' + host + ':8088/api/v1/reload', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }).then(() => {
                         updateEngineUI(targetEngine);
-                        const selectEl = document.getElementById('cbid.cheburnet.main.engine');
+                        const selectEl = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
                         if (selectEl) selectEl.value = targetEngine;
                         ui.hideIndicator('switching-engine');
                         ui.addNotification(null, E('p', {}, _('Движок успешно изменен на %s').format(targetEngine)), 'info');
@@ -657,6 +671,10 @@ return view.extend({
                     try {
                         const msg = JSON.parse(event.data);
 
+                        if (msg.engine) {
+                            updateEngineUI(msg.engine);
+                        }
+
                         if (msg.active_node) {
                             highlightActiveNode(msg.active_node);
                         }
@@ -756,10 +774,6 @@ return view.extend({
                         }
                         if (data.engine) {
                             updateEngineUI(data.engine);
-                            const selectEl = document.getElementById('cbid.cheburnet.main.engine');
-                            if (selectEl && selectEl.value !== data.engine) {
-                                selectEl.value = data.engine;
-                            }
                         }
                         if (data.active_node) {
                             highlightActiveNode(data.active_node);
@@ -1222,8 +1236,8 @@ return view.extend({
                     ui.hideIndicator('saving-cheburnet');
                     ui.showIndicator('reloading-cheburnet', _('Применение настроек в Chebur.NET...'));
 
-                    const engineField = document.getElementById('cbid.cheburnet.main.engine');
-                    const selectedEngine = engineField ? engineField.value : (uci.get('cheburnet', 'main', 'engine') || 'sing-box');
+                    const engineSelect = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
+                    const selectedEngine = engineSelect ? engineSelect.value : (uci.get('cheburnet', 'main', 'engine') || 'sing-box');
 
                     const host = window.location.hostname;
                     return fetch('http://' + host + ':8088/api/v1/engine/switch', {

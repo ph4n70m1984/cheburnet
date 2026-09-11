@@ -3,12 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -16,6 +16,8 @@ import (
 
 	"cheburnet/internal/config"
 )
+
+const ProbePortBase = 12000
 
 type XrayStatItem struct {
 	Name  string `json:"name"`
@@ -34,6 +36,7 @@ type ClashShimServer struct {
 	xrayAPIAddr  string
 	latencies    map[string]int
 	lastCheck    map[string]time.Time
+	cachedStats  map[string]int64
 	onSelect     func(nodeTag string) error
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -51,6 +54,7 @@ func NewClashShimServer(cfg *config.CheburConfig, onSelect func(nodeTag string) 
 		xrayAPIAddr:  "127.0.0.1:10085",
 		latencies:    make(map[string]int),
 		lastCheck:    make(map[string]time.Time),
+		cachedStats:  make(map[string]int64),
 		onSelect:     onSelect,
 		ctx:          ctx,
 		cancel:       cancel,
@@ -118,6 +122,7 @@ func (s *ClashShimServer) Start(port int) error {
 	}()
 
 	go s.backgroundPingLoop()
+	go s.backgroundStatsLoop()
 
 	return nil
 }
@@ -132,9 +137,42 @@ func (s *ClashShimServer) Stop() error {
 	return nil
 }
 
+func (s *ClashShimServer) backgroundStatsLoop() {
+	ticker := time.NewTicker(6 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(s.ctx, 2*time.Second)
+			cmd := exec.CommandContext(ctx, "xray", "api", "statsquery", "-s", s.xrayAPIAddr, "-pattern", "outbound>>>")
+			var stdout bytes.Buffer
+			cmd.Stdout = &stdout
+
+			if err := cmd.Run(); err == nil {
+				var resp XrayStatsResponse
+				if err := json.Unmarshal(stdout.Bytes(), &resp); err == nil {
+					newStats := make(map[string]int64, len(resp.Stat))
+					for _, item := range resp.Stat {
+						newStats[item.Name] = item.Value
+					}
+					s.mu.Lock()
+					s.cachedStats = newStats
+					s.mu.Unlock()
+				}
+			}
+			cancel()
+		}
+	}
+}
+
 func (s *ClashShimServer) backgroundPingLoop() {
+	time.Sleep(2 * time.Second)
 	s.pingAll()
-	ticker := time.NewTicker(15 * time.Second)
+
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -149,110 +187,86 @@ func (s *ClashShimServer) backgroundPingLoop() {
 
 func (s *ClashShimServer) pingAll() {
 	s.mu.RLock()
-	var nodes []*config.GenericNode
-	for _, n := range s.cfg.Nodes {
-		nodes = append(nodes, n)
-	}
+	nodesCount := len(s.cfg.Nodes)
 	s.mu.RUnlock()
 
+	if nodesCount == 0 {
+		return
+	}
+
+	semaphore := make(chan struct{}, 3)
 	var wg sync.WaitGroup
-	for _, n := range nodes {
+
+	for idx := 0; idx < nodesCount; idx++ {
+		s.mu.RLock()
+		if idx >= len(s.cfg.Nodes) {
+			s.mu.RUnlock()
+			break
+		}
+		node := s.cfg.Nodes[idx]
+		s.mu.RUnlock()
+
 		wg.Add(1)
-		go func(node *config.GenericNode) {
+		semaphore <- struct{}{}
+
+		go func(nodeIndex int, tag string) {
 			defer wg.Done()
-			delay := s.doPing(node)
+			defer func() { <-semaphore }()
+
+			delay := s.probeNodePort(nodeIndex)
 
 			s.mu.Lock()
-			s.latencies[node.Tag] = delay
-			s.lastCheck[node.Tag] = time.Now()
+			s.latencies[tag] = delay
+			s.lastCheck[tag] = time.Now()
 			s.mu.Unlock()
-		}(n)
+		}(idx, node.Tag)
 	}
+
 	wg.Wait()
 }
 
-func (s *ClashShimServer) doPing(targetNode *config.GenericNode) int {
-	protoLower := strings.ToLower(targetNode.Protocol)
-	addr := net.JoinHostPort(targetNode.Address, fmt.Sprintf("%d", targetNode.Port))
-
-	// 1. Для протоколов на базе UDP (Hysteria, Hysteria2, TUIC)
-	if strings.Contains(protoLower, "hysteria") || strings.Contains(protoLower, "tuic") {
-		udpAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			return 0
-		}
-
-		start := time.Now()
-		conn, err := net.DialUDP("udp", nil, udpAddr)
-		if err != nil {
-			return 0
-		}
-		defer conn.Close()
-
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		// Минимальный пакет QUIC Initial для замера сетевого ответа сокета
-		dummyPacket := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-		if _, err = conn.Write(dummyPacket); err != nil {
-			return 0
-		}
-
-		delayMs := int(time.Since(start).Milliseconds())
-		if delayMs <= 0 {
-			delayMs = 12
-		}
-		return delayMs
-	}
-
-	// 2. Для TCP-протоколов (VLESS, Trojan, Shadowsocks)
-	dialer := &net.Dialer{Timeout: 2500 * time.Millisecond}
-	start := time.Now()
-
-	var conn net.Conn
-	var err error
-
-	if targetNode.Security == "tls" || targetNode.Security == "reality" {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         targetNode.SNI,
-		})
-	} else {
-		conn, err = dialer.Dial("tcp", addr)
-	}
-
+func (s *ClashShimServer) probeNodePort(nodeIndex int) int {
+	port := ProbePortBase + nodeIndex
+	proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
 	if err != nil {
 		return 0
 	}
-	_ = conn.Close()
+
+	transport := &http.Transport{
+		Proxy:             http.ProxyURL(proxyURL),
+		DisableKeepAlives: true,
+		DialContext: (&net.Dialer{
+			Timeout: 1800 * time.Millisecond,
+		}).DialContext,
+		ResponseHeaderTimeout: 2000 * time.Millisecond,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2500 * time.Millisecond,
+	}
+
+	start := time.Now()
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodGet, "https://www.gstatic.com/generate_204", nil)
+	if err != nil {
+		return 0
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return 0
+	}
 
 	delayMs := int(time.Since(start).Milliseconds())
 	if delayMs <= 0 {
 		delayMs = 1
 	}
 	return delayMs
-}
-
-func (s *ClashShimServer) queryXrayStats() (map[string]int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "xray", "api", "statsquery", "-s", s.xrayAPIAddr, "-pattern", "outbound>>>")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-
-	var resp XrayStatsResponse
-	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
-		return nil, err
-	}
-
-	trafficMap := make(map[string]int64)
-	for _, item := range resp.Stat {
-		trafficMap[item.Name] = item.Value
-	}
-	return trafficMap, nil
 }
 
 func (s *ClashShimServer) handleVersion(w http.ResponseWriter, r *http.Request) {
@@ -272,9 +286,7 @@ func (s *ClashShimServer) handleProxies(w http.ResponseWriter, r *http.Request) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	xrayStats, _ := s.queryXrayStats()
 	proxies := make(map[string]interface{})
-
 	proxies["DIRECT"] = map[string]interface{}{"name": "DIRECT", "type": "Direct", "history": []interface{}{}}
 	proxies["REJECT"] = map[string]interface{}{"name": "REJECT", "type": "Reject", "history": []interface{}{}}
 
@@ -288,9 +300,9 @@ func (s *ClashShimServer) handleProxies(w http.ResponseWriter, r *http.Request) 
 		downKey := fmt.Sprintf("outbound>>>%s>>>traffic>>>downlink", n.Tag)
 
 		var upBytes, downBytes int64
-		if xrayStats != nil {
-			upBytes = xrayStats[upKey]
-			downBytes = xrayStats[downKey]
+		if s.cachedStats != nil {
+			upBytes = s.cachedStats[upKey]
+			downBytes = s.cachedStats[downKey]
 		}
 
 		delay, hasDelay := s.latencies[n.Tag]
@@ -442,10 +454,10 @@ func (s *ClashShimServer) handleProxyRoute(w http.ResponseWriter, r *http.Reques
 
 func (s *ClashShimServer) measureNodeDelay(w http.ResponseWriter, r *http.Request, nodeTag string) {
 	s.mu.RLock()
-	var targetNode *config.GenericNode
-	for _, n := range s.cfg.Nodes {
+	nodeIndex := -1
+	for idx, n := range s.cfg.Nodes {
 		if n.Tag == nodeTag {
-			targetNode = n
+			nodeIndex = idx
 			break
 		}
 	}
@@ -453,7 +465,7 @@ func (s *ClashShimServer) measureNodeDelay(w http.ResponseWriter, r *http.Reques
 	lastT := s.lastCheck[nodeTag]
 	s.mu.RUnlock()
 
-	if targetNode == nil {
+	if nodeIndex == -1 {
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
@@ -466,7 +478,7 @@ func (s *ClashShimServer) measureNodeDelay(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	delay := s.doPing(targetNode)
+	delay := s.probeNodePort(nodeIndex)
 
 	s.mu.Lock()
 	s.latencies[nodeTag] = delay
