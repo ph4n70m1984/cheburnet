@@ -37,7 +37,8 @@ const ALLOW_DOMAIN_CATEGORIES = [
 return view.extend({
     load: function() {
         return Promise.all([
-            network.getHostHints()
+            network.getHostHints(),
+            uci.load('cheburnet')
         ]);
     },
 
@@ -46,9 +47,6 @@ return view.extend({
         const m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box и Xray-core'));
 
-        // ==========================================
-        // 1. СЕКЦИЯ ЖИВОЙ ТЕЛЕМЕТРИИ И ДИАГНОСТИКИ
-        // ==========================================
         const statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
 
@@ -56,6 +54,10 @@ return view.extend({
             window.cheburProblems = {};
             window.cheburLastDiagSnapshot = null;
             window.cheburLastDiagTime = null;
+
+            let isSyncingDelays = false;
+            let syncIntervalId = null;
+            let bannerIntervalId = null;
 
             function formatRelativeTime(timestampMs) {
                 if (!timestampMs) return _('только что');
@@ -310,7 +312,6 @@ return view.extend({
                 }, _('Обновить сейчас'))
             ]);
 
-            // Блок быстрого переключения ядра
             const engineSwitchContainer = E('div', {
                 'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.1); display: flex; align-items: center; justify-content: space-between;'
             }, [
@@ -367,15 +368,20 @@ return view.extend({
                 })
                 .then(r => r.json())
                 .then(data => {
-                    ui.hideIndicator('switching-engine');
                     if (data && data.error) {
+                        ui.hideIndicator('switching-engine');
                         ui.addNotification(null, E('p', {}, _('Ошибка переключения: ') + data.error), 'error');
-                    } else {
+                        return;
+                    }
+
+                    uci.set('cheburnet', 'main', 'engine', targetEngine);
+                    return uci.save().then(() => {
                         updateEngineUI(targetEngine);
-                        ui.addNotification(null, E('p', {}, _('Движок успешно изменен на %s').format(targetEngine)), 'info');
                         const selectEl = document.getElementById('cbid.cheburnet.main.engine');
                         if (selectEl) selectEl.value = targetEngine;
-                    }
+                        ui.hideIndicator('switching-engine');
+                        ui.addNotification(null, E('p', {}, _('Движок успешно изменен на %s').format(targetEngine)), 'info');
+                    });
                 })
                 .catch(err => {
                     ui.hideIndicator('switching-engine');
@@ -487,63 +493,212 @@ return view.extend({
                     .catch(() => {});
             }
 
+            function highlightActiveNode(activeTag) {
+                if (!activeTag) return;
+                const rows = document.querySelectorAll('#chebur-nodes-table tr[id^="node-row-"]');
+                rows.forEach(r => {
+                    r.style.background = '';
+                    r.style.boxShadow = '';
+                    const badge = r.querySelector('.active-node-badge');
+                    if (badge) badge.remove();
+                });
+
+                const activeRow = document.getElementById('node-row-' + activeTag);
+                if (activeRow) {
+                    activeRow.style.background = 'rgba(56, 189, 248, 0.12)';
+                    activeRow.style.boxShadow = 'inset 3px 0 0 0 #38bdf8';
+
+                    const tagCell = activeRow.cells[0];
+                    if (tagCell && !tagCell.querySelector('.active-node-badge')) {
+                        const badge = E('span', {
+                            'class': 'active-node-badge',
+                            'style': 'margin-left: 8px; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; background: #0284c7; color: #ffffff;'
+                        }, _('АКТИВЕН'));
+                        tagCell.appendChild(badge);
+                    }
+                }
+            }
+
+            function selectProxyNode(nodeTag) {
+                const host = window.location.hostname;
+                ui.showIndicator('selecting-node', _('Переключение на сервер %s...').format(nodeTag));
+
+                fetch('http://' + host + ':9090/proxies/PROXY', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: nodeTag })
+                })
+                .then(r => {
+                    ui.hideIndicator('selecting-node');
+                    if (r.ok || r.status === 204) {
+                        highlightActiveNode(nodeTag);
+                        ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + nodeTag), 'info');
+                    } else {
+                        throw new Error('HTTP ' + r.status);
+                    }
+                })
+                .catch(() => {
+                    fetch('http://' + host + ':9090/proxies/auto', {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: nodeTag })
+                    })
+                    .then(r => {
+                        ui.hideIndicator('selecting-node');
+                        if (r.ok || r.status === 204) {
+                            highlightActiveNode(nodeTag);
+                            ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + nodeTag), 'info');
+                        }
+                    })
+                    .catch(err => {
+                        ui.hideIndicator('selecting-node');
+                        ui.addNotification(null, E('p', {}, _('Ошибка переключения узла: ') + err), 'error');
+                    });
+                });
+            }
+
+            function updateNodeUI(tag, latency) {
+                const latEl = document.getElementById('node-lat-' + tag);
+                const statusEl = document.getElementById('node-status-' + tag);
+                if (!latEl || !statusEl) return;
+
+                if (latency > 0) {
+                    latEl.textContent = latency + ' ms';
+                    latEl.style.color = latency < 200 ? '#4ade80' : (latency < 450 ? '#fb923c' : '#f87171');
+                    statusEl.innerHTML = '<span style="color: #4ade80; font-weight: bold;">● Доступен</span>';
+                } else {
+                    latEl.textContent = 'Timeout';
+                    latEl.style.color = '#71717a';
+                    statusEl.innerHTML = '<span style="color: #f87171; font-weight: bold;">● Офлайн</span>';
+                }
+            }
+
+            function syncClashDelays() {
+                if (isSyncingDelays) return;
+                isSyncingDelays = true;
+
+                const host = window.location.hostname;
+
+                fetch('http://' + host + ':9090/proxies')
+                    .then(r => {
+                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                        return r.json();
+                    })
+                    .then(data => {
+                        if (!data || !data.proxies) return;
+
+                        const resolveGroupNow = (groupName) => {
+                            let curr = groupName;
+                            const visited = {};
+                            for (let i = 0; i < 4; i++) {
+                                if (!curr || visited[curr]) break;
+                                visited[curr] = true;
+                                const grp = data.proxies[curr];
+                                if (grp && grp.now && grp.now !== curr) {
+                                    curr = grp.now;
+                                } else {
+                                    break;
+                                }
+                            }
+                            return curr;
+                        };
+
+                        for (const name of ['PROXY', 'proxy', 'auto', 'AUTO', 'auto-out']) {
+                            const group = data.proxies[name];
+                            if (group && group.now) {
+                                const resolved = resolveGroupNow(group.now);
+                                if (resolved) {
+                                    highlightActiveNode(resolved);
+                                    break;
+                                }
+                            }
+                        }
+
+                        const entries = Object.entries(data.proxies).filter(([tag]) => 
+                            !['DIRECT', 'REJECT', 'PROXY', 'GLOBAL', 'auto', 'AUTO', 'auto-out'].includes(tag)
+                        );
+
+                        entries.forEach(([tag, info]) => {
+                            if (info.history && info.history.length > 0) {
+                                const last = info.history[info.history.length - 1];
+                                if (last.delay !== undefined && last.delay > 0) {
+                                    updateNodeUI(tag, last.delay);
+                                } else if (last.delay === 0) {
+                                    updateNodeUI(tag, 0);
+                                }
+                            } else {
+                                updateNodeUI(tag, 0);
+                            }
+                        });
+                    })
+                    .catch(() => {})
+                    .finally(() => {
+                        isSyncingDelays = false;
+                    });
+            }
+
+            function connectWebSocket(host) {
+                if (window.cheburWs && (window.cheburWs.readyState === WebSocket.OPEN || window.cheburWs.readyState === WebSocket.CONNECTING)) {
+                    return;
+                }
+
+                const ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
+                window.cheburWs = ws;
+
+                ws.onopen = function() {
+                    const statusEl = document.getElementById('daemon-status');
+                    if (statusEl) {
+                        statusEl.textContent = '● Онлайн';
+                        statusEl.style.color = '#4ade80';
+                    }
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        const msg = JSON.parse(event.data);
+
+                        if (msg.active_node) {
+                            highlightActiveNode(msg.active_node);
+                        }
+
+                        if (msg.type === 'update_report' && msg.data) {
+                            showUpdateNotification(msg.data);
+                            renderUpdateReport(msg.data);
+                        }
+
+                        handleWsEvent(msg);
+                    } catch (e) {}
+                };
+
+                ws.onerror = function() {
+                    const statusEl = document.getElementById('daemon-status');
+                    if (statusEl) {
+                        statusEl.textContent = '● Ошибка связи';
+                        statusEl.style.color = '#f87171';
+                    }
+                };
+
+                ws.onclose = function() {
+                    const statusEl = document.getElementById('daemon-status');
+                    if (statusEl) {
+                        statusEl.textContent = '● Офлайн';
+                        statusEl.style.color = '#f87171';
+                    }
+                    setTimeout(() => connectWebSocket(host), 5000);
+                };
+            }
+
             function initTelemetry() {
                 const host = window.location.hostname;
                 const tbl = document.getElementById('chebur-nodes-table');
 
-                function updateNodeUI(tag, latency) {
-                    const latEl = document.getElementById('node-lat-' + tag);
-                    const statusEl = document.getElementById('node-status-' + tag);
-                    if (!latEl || !statusEl) return;
-
-                    if (latency > 0) {
-                        latEl.textContent = latency + ' ms';
-                        latEl.style.color = latency < 200 ? '#4ade80' : (latency < 450 ? '#fb923c' : '#f87171');
-                        statusEl.innerHTML = '<span style="color: #4ade80; font-weight: bold;">● Доступен</span>';
-                    } else {
-                        latEl.textContent = 'Timeout';
-                        latEl.style.color = '#71717a';
-                        statusEl.innerHTML = '<span style="color: #f87171; font-weight: bold;">● Офлайн</span>';
-                    }
-                }
-
-                function syncClashDelays() {
-                    fetch('http://' + host + ':9090/proxies')
-                        .then(r => r.json())
-                        .then(data => {
-                            if (!data || !data.proxies) return;
-                            Object.entries(data.proxies).forEach(([tag, info]) => {
-                                // Игнорируем служебные группы
-                                if (['DIRECT', 'REJECT', 'PROXY', 'GLOBAL'].includes(tag)) return;
-
-                                // Запрашиваем индивидуальный пинг для каждого тега
-                                fetch('http://' + host + ':9090/proxies/' + encodeURIComponent(tag) + '/delay?url=https://www.gstatic.com/generate_204&timeout=5000')
-                                    .then(res => res.json())
-                                    .then(delayData => {
-                                        if (delayData && delayData.delay !== undefined) {
-                                            updateNodeUI(tag, delayData.delay);
-                                        }
-                                    })
-                                    .catch(() => {
-                                        // Фолбек на историю из общего ответа, если индивидуальный запрос недоступен
-                                        if (info.history && info.history.length > 0) {
-                                            const last = info.history[info.history.length - 1];
-                                            if (last && last.delay !== undefined) {
-                                                updateNodeUI(tag, last.delay);
-                                            }
-                                        }
-                                    });
-                            });
-                        })
-                        .catch(() => {});
-                }
+                if (syncIntervalId) clearInterval(syncIntervalId);
+                if (bannerIntervalId) clearInterval(bannerIntervalId);
 
                 fetch('http://' + host + ':8088/api/v1/nodes')
                     .then(r => r.json())
                     .then(nodes => {
                         if (!nodes || nodes.length === 0) {
-                            const loadingRow = document.getElementById('loading-row');
-                            if (loadingRow) loadingRow.cells[0].textContent = 'Нет активных серверов.';
                             return;
                         }
 
@@ -558,6 +713,11 @@ return view.extend({
                             const row = tbl.insertRow(-1);
                             row.className = 'tr';
                             row.id = 'node-row-' + node.tag;
+                            row.style.cursor = 'pointer';
+                            row.title = _('Нажмите, чтобы сделать этот сервер активным');
+                            row.onclick = function() {
+                                selectProxyNode(node.tag);
+                            };
 
                             const cellTag = row.insertCell(0);
                             cellTag.className = 'td';
@@ -574,7 +734,16 @@ return view.extend({
                             cellStatus.innerHTML = '<span style="color: #fbbf24; font-weight: bold;">● Ожидание</span>';
                         });
 
-                        syncClashDelays();
+                        setTimeout(syncClashDelays, 800);
+
+                        fetch('http://' + host + ':8088/api/v1/status')
+                            .then(r => r.json())
+                            .then(data => {
+                                if (data && data.active_node) {
+                                    highlightActiveNode(data.active_node);
+                                }
+                            })
+                            .catch(() => {});
                     })
                     .catch(e => console.error('Nodes fetch error:', e));
 
@@ -587,6 +756,13 @@ return view.extend({
                         }
                         if (data.engine) {
                             updateEngineUI(data.engine);
+                            const selectEl = document.getElementById('cbid.cheburnet.main.engine');
+                            if (selectEl && selectEl.value !== data.engine) {
+                                selectEl.value = data.engine;
+                            }
+                        }
+                        if (data.active_node) {
+                            highlightActiveNode(data.active_node);
                         }
                     })
                     .catch(() => {});
@@ -618,58 +794,11 @@ return view.extend({
                     clearTimeout(diagInitTid);
                 });
 
-                const ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
-                window.cheburWs = ws;
+                connectWebSocket(host);
 
-                ws.onopen = function() {
-                    const statusEl = document.getElementById('daemon-status');
-                    if (statusEl) {
-                        statusEl.textContent = '● Онлайн';
-                        statusEl.style.color = '#4ade80';
-                    }
-                };
-
-                ws.onmessage = function(event) {
-                    try {
-                        const msg = JSON.parse(event.data);
-
-                        if (msg.node_latencies) {
-                            for (const [tag, latency] of Object.entries(msg.node_latencies)) {
-                                if (latency && latency > 0) {
-                                    updateNodeUI(tag, latency);
-                                }
-                            }
-                        }
-
-                        if (msg.type === 'update_report' && msg.data) {
-                            showUpdateNotification(msg.data);
-                            renderUpdateReport(msg.data);
-                        }
-
-                        handleWsEvent(msg);
-                    } catch (e) {}
-                };
-
-                ws.onerror = function() {
-                    const statusEl = document.getElementById('daemon-status');
-                    if (statusEl) {
-                        statusEl.textContent = '● Ошибка связи';
-                        statusEl.style.color = '#f87171';
-                    }
-                };
-
-                ws.onclose = function() {
-                    const statusEl = document.getElementById('daemon-status');
-                    if (statusEl) {
-                        statusEl.textContent = '● Офлайн';
-                        statusEl.style.color = '#f87171';
-                    }
-                    setTimeout(initTelemetry, 4000);
-                };
-
-                setInterval(syncClashDelays, 3000);
-                setInterval(updateBannerContent, 1000);
-                setTimeout(checkUpdates, 1200);
+                syncIntervalId = setInterval(syncClashDelays, 10000);
+                bannerIntervalId = setInterval(updateBannerContent, 2000);
+                setTimeout(checkUpdates, 1500);
             }
 
             setTimeout(initTelemetry, 250);
@@ -1094,7 +1223,7 @@ return view.extend({
                     ui.showIndicator('reloading-cheburnet', _('Применение настроек в Chebur.NET...'));
 
                     const engineField = document.getElementById('cbid.cheburnet.main.engine');
-                    const selectedEngine = engineField ? engineField.value : 'sing-box';
+                    const selectedEngine = engineField ? engineField.value : (uci.get('cheburnet', 'main', 'engine') || 'sing-box');
 
                     const host = window.location.hostname;
                     return fetch('http://' + host + ':8088/api/v1/engine/switch', {

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"cheburnet/internal/config"
 	"cheburnet/internal/network"
@@ -707,4 +709,51 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 	}
 
 	return out, nil
+}
+
+func getRealActiveNode(defaultTag string) string {
+	client := &http.Client{Timeout: 600 * time.Millisecond}
+	// Опрашиваем сначала 127.0.0.1, затем fallback на LAN-интерфейс
+	urls := []string{
+		"http://127.0.0.1:9090/proxies",
+		"http://192.168.11.1:9090/proxies",
+	}
+
+	var resp *http.Response
+	var err error
+	for _, u := range urls {
+		resp, err = client.Get(u)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	if resp == nil || err != nil {
+		return defaultTag
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Proxies map[string]struct {
+			Type string `json:"type"`
+			Now  string `json:"now"`
+		} `json:"proxies"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return defaultTag
+	}
+
+	for _, name := range []string{"auto", "auto-out", "PROXY", "proxy"} {
+		if group, ok := result.Proxies[name]; ok && group.Now != "" {
+			if subGroup, exists := result.Proxies[group.Now]; exists && subGroup.Now != "" {
+				return subGroup.Now
+			}
+			return group.Now
+		}
+	}
+
+	return defaultTag
 }

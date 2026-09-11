@@ -17,7 +17,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-// handleStatus возвращает текущий статус ядра, количество нод и внешний IP
+// handleStatus возвращает текущий статус ядра, количество нод, внешний IP и активную ноду
 func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
 
@@ -34,9 +34,15 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 		resp.Body.Close()
 	}
 
+	activeNode := ""
+	if len(cfg.Nodes) > 0 {
+		activeNode = cfg.Nodes[0].Tag
+	}
+
 	return c.JSON(fiber.Map{
 		"engine":      cfg.Engine,
 		"nodes_count": len(cfg.Nodes),
+		"active_node": activeNode,
 		"auto_hwid":   cfg.AutoHWID,
 		"custom_hwid": cfg.CustomHWID,
 		"outbound_ip": outboundIP,

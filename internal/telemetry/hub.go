@@ -87,7 +87,7 @@ func (h *Hub) BroadcastJSON(v interface{}) {
 }
 
 // Run опрашивает задержки нод и транслирует события диагностики
-func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine) {
+func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine, getActiveNode func() string) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -130,8 +130,14 @@ func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine) {
 				}
 			}
 
+			var activeTag string
+			if getActiveNode != nil {
+				activeTag = getActiveNode()
+			}
+
 			payload := map[string]interface{}{
 				"node_latencies": latencies,
+				"active_node":    activeTag,
 				"timestamp":      time.Now().Unix(),
 			}
 			h.BroadcastJSON(payload)

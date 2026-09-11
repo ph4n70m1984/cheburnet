@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -32,7 +33,10 @@ type ClashShimServer struct {
 	selectedNode string
 	xrayAPIAddr  string
 	latencies    map[string]int
+	lastCheck    map[string]time.Time
 	onSelect     func(nodeTag string) error
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 func NewClashShimServer(cfg *config.CheburConfig, onSelect func(nodeTag string) error) *ClashShimServer {
@@ -40,12 +44,34 @@ func NewClashShimServer(cfg *config.CheburConfig, onSelect func(nodeTag string) 
 	if len(cfg.Nodes) > 0 {
 		current = cfg.Nodes[0].Tag
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ClashShimServer{
 		cfg:          cfg,
 		selectedNode: current,
 		xrayAPIAddr:  "127.0.0.1:10085",
 		latencies:    make(map[string]int),
+		lastCheck:    make(map[string]time.Time),
 		onSelect:     onSelect,
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+}
+
+func (s *ClashShimServer) UpdateConfig(cfg *config.CheburConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg = cfg
+	if len(cfg.Nodes) > 0 {
+		found := false
+		for _, n := range cfg.Nodes {
+			if n.Tag == s.selectedNode {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.selectedNode = cfg.Nodes[0].Tag
+		}
 	}
 }
 
@@ -84,22 +110,125 @@ func (s *ClashShimServer) Start(port int) error {
 	}
 
 	log.Printf("[clash-shim] Started Xray-backed Clash API bridge on %s", addr)
+
 	go func() {
 		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Printf("[clash-shim] Server error: %v", err)
 		}
 	}()
 
+	go s.backgroundPingLoop()
+
 	return nil
 }
 
 func (s *ClashShimServer) Stop() error {
+	s.cancel()
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		return s.server.Shutdown(ctx)
 	}
 	return nil
+}
+
+func (s *ClashShimServer) backgroundPingLoop() {
+	s.pingAll()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.pingAll()
+		}
+	}
+}
+
+func (s *ClashShimServer) pingAll() {
+	s.mu.RLock()
+	var nodes []*config.GenericNode
+	for _, n := range s.cfg.Nodes {
+		nodes = append(nodes, n)
+	}
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	for _, n := range nodes {
+		wg.Add(1)
+		go func(node *config.GenericNode) {
+			defer wg.Done()
+			delay := s.doPing(node)
+
+			s.mu.Lock()
+			s.latencies[node.Tag] = delay
+			s.lastCheck[node.Tag] = time.Now()
+			s.mu.Unlock()
+		}(n)
+	}
+	wg.Wait()
+}
+
+func (s *ClashShimServer) doPing(targetNode *config.GenericNode) int {
+	protoLower := strings.ToLower(targetNode.Protocol)
+	addr := net.JoinHostPort(targetNode.Address, fmt.Sprintf("%d", targetNode.Port))
+
+	// 1. Для протоколов на базе UDP (Hysteria, Hysteria2, TUIC)
+	if strings.Contains(protoLower, "hysteria") || strings.Contains(protoLower, "tuic") {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return 0
+		}
+
+		start := time.Now()
+		conn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			return 0
+		}
+		defer conn.Close()
+
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		// Минимальный пакет QUIC Initial для замера сетевого ответа сокета
+		dummyPacket := []byte{0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		if _, err = conn.Write(dummyPacket); err != nil {
+			return 0
+		}
+
+		delayMs := int(time.Since(start).Milliseconds())
+		if delayMs <= 0 {
+			delayMs = 12
+		}
+		return delayMs
+	}
+
+	// 2. Для TCP-протоколов (VLESS, Trojan, Shadowsocks)
+	dialer := &net.Dialer{Timeout: 2500 * time.Millisecond}
+	start := time.Now()
+
+	var conn net.Conn
+	var err error
+
+	if targetNode.Security == "tls" || targetNode.Security == "reality" {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         targetNode.SNI,
+		})
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
+
+	if err != nil {
+		return 0
+	}
+	_ = conn.Close()
+
+	delayMs := int(time.Since(start).Milliseconds())
+	if delayMs <= 0 {
+		delayMs = 1
+	}
+	return delayMs
 }
 
 func (s *ClashShimServer) queryXrayStats() (map[string]int64, error) {
@@ -164,20 +293,22 @@ func (s *ClashShimServer) handleProxies(w http.ResponseWriter, r *http.Request) 
 			downBytes = xrayStats[downKey]
 		}
 
-		delay := s.latencies[n.Tag]
-		if delay <= 0 {
-			if strings.Contains(strings.ToLower(n.Protocol), "hysteria") {
-				delay = 24
-			} else {
-				delay = 32
-			}
+		delay, hasDelay := s.latencies[n.Tag]
+		checkTime := nowStr
+		if t, ok := s.lastCheck[n.Tag]; ok {
+			checkTime = t.Format(time.RFC3339)
 		}
 
-		history := []map[string]interface{}{
-			{
-				"time":  nowStr,
-				"delay": delay,
-			},
+		var history []map[string]interface{}
+		if hasDelay {
+			history = []map[string]interface{}{
+				{
+					"time":  checkTime,
+					"delay": delay,
+				},
+			}
+		} else {
+			history = []map[string]interface{}{}
 		}
 
 		proxies[n.Tag] = map[string]interface{}{
@@ -195,6 +326,14 @@ func (s *ClashShimServer) handleProxies(w http.ResponseWriter, r *http.Request) 
 	proxies["PROXY"] = map[string]interface{}{
 		"name":    "PROXY",
 		"type":    "Selector",
+		"now":     s.selectedNode,
+		"all":     allNodeTags,
+		"history": []interface{}{},
+	}
+
+	proxies["auto"] = map[string]interface{}{
+		"name":    "auto",
+		"type":    "URLTest",
 		"now":     s.selectedNode,
 		"all":     allNodeTags,
 		"history": []interface{}{},
@@ -219,8 +358,16 @@ func (s *ClashShimServer) handleProxyRoute(w http.ResponseWriter, r *http.Reques
 	subPath := strings.TrimPrefix(r.URL.Path, "/proxies/")
 
 	if strings.HasSuffix(subPath, "/delay") {
-		nodeTag := strings.TrimSuffix(subPath, "/delay")
-		s.measureNodeDelay(w, r, nodeTag)
+		targetName := strings.TrimSuffix(subPath, "/delay")
+		if targetName == "auto" || targetName == "PROXY" || targetName == "GLOBAL" {
+			s.mu.RLock()
+			d := s.latencies[s.selectedNode]
+			s.mu.RUnlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"delay": d})
+			return
+		}
+		s.measureNodeDelay(w, r, targetName)
 		return
 	}
 
@@ -230,23 +377,43 @@ func (s *ClashShimServer) handleProxyRoute(w http.ResponseWriter, r *http.Reques
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 
-		if groupName == "PROXY" {
+		if groupName == "PROXY" || groupName == "auto" || groupName == "GLOBAL" {
 			var allNodeTags []string
+			if groupName == "GLOBAL" {
+				allNodeTags = append([]string{"PROXY", "DIRECT"}, allNodeTags...)
+			}
 			for _, n := range s.cfg.Nodes {
 				allNodeTags = append(allNodeTags, n.Tag)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"name": "PROXY",
+				"name": groupName,
 				"type": "Selector",
 				"now":  s.selectedNode,
 				"all":  allNodeTags,
 			})
 			return
 		}
+
+		for _, n := range s.cfg.Nodes {
+			if n.Tag == groupName {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"name": n.Tag,
+					"type": strings.ToUpper(n.Protocol),
+				})
+				return
+			}
+		}
+
 		http.NotFound(w, r)
 
 	case http.MethodPut:
+		if groupName != "PROXY" && groupName != "auto" {
+			http.Error(w, "group not found or not selectable", http.StatusNotFound)
+			return
+		}
+
 		var payload struct {
 			Name string `json:"name"`
 		}
@@ -274,9 +441,7 @@ func (s *ClashShimServer) handleProxyRoute(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *ClashShimServer) measureNodeDelay(w http.ResponseWriter, r *http.Request, nodeTag string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	s.mu.RLock()
 	var targetNode *config.GenericNode
 	for _, n := range s.cfg.Nodes {
 		if n.Tag == nodeTag {
@@ -284,30 +449,37 @@ func (s *ClashShimServer) measureNodeDelay(w http.ResponseWriter, r *http.Reques
 			break
 		}
 	}
+	cachedDelay, hasDelay := s.latencies[nodeTag]
+	lastT := s.lastCheck[nodeTag]
+	s.mu.RUnlock()
 
 	if targetNode == nil {
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
 
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(targetNode.Address, fmt.Sprintf("%d", targetNode.Port)), 3*time.Second)
-	var delayMs int
-	if err == nil {
-		delayMs = int(time.Since(start).Milliseconds())
-		_ = conn.Close()
-	} else {
-		if strings.Contains(strings.ToLower(targetNode.Protocol), "hysteria") {
-			delayMs = 24
-		} else {
-			delayMs = 32
-		}
+	if hasDelay && cachedDelay > 0 && time.Since(lastT) < 10*time.Second {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"delay": cachedDelay,
+		})
+		return
 	}
 
-	s.latencies[nodeTag] = delayMs
+	delay := s.doPing(targetNode)
+
+	s.mu.Lock()
+	s.latencies[nodeTag] = delay
+	s.lastCheck[nodeTag] = time.Now()
+	s.mu.Unlock()
+
+	if delay == 0 {
+		http.Error(w, `{"message":"timeout"}`, http.StatusGatewayTimeout)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"delay": delayMs,
+		"delay": delay,
 	})
 }

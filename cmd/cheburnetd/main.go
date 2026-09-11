@@ -240,6 +240,82 @@ func extractFullProxyIPs(policies []config.ClientPolicy) []string {
 	return ips
 }
 
+func getRealActiveNode(defaultTag string) string {
+	client := &http.Client{Timeout: 800 * time.Millisecond}
+	urls := []string{
+		"http://127.0.0.1:9090/proxies",
+		"http://192.168.11.1:9090/proxies",
+	}
+
+	var resp *http.Response
+	var err error
+
+	for _, u := range urls {
+		r, e := client.Get(u)
+		if e == nil && r != nil && r.StatusCode == http.StatusOK {
+			resp = r
+			break
+		}
+		if r != nil {
+			_ = r.Body.Close()
+		}
+	}
+
+	if resp == nil {
+		return defaultTag
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Proxies map[string]struct {
+			Type string `json:"type"`
+			Now  string `json:"now"`
+		} `json:"proxies"`
+	}
+
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return defaultTag
+	}
+
+	resolveTarget := func(nodeName string) string {
+		curr := nodeName
+		visited := make(map[string]bool)
+		for i := 0; i < 4; i++ {
+			if curr == "" || visited[curr] {
+				break
+			}
+			visited[curr] = true
+			if group, exists := result.Proxies[curr]; exists && group.Now != "" && group.Now != curr {
+				curr = group.Now
+			} else {
+				break
+			}
+		}
+		return curr
+	}
+
+	for _, name := range []string{"PROXY", "proxy", "auto", "AUTO", "auto-out"} {
+		if group, ok := result.Proxies[name]; ok && group.Now != "" {
+			resolved := resolveTarget(group.Now)
+			if resolved != "" {
+				return resolved
+			}
+		}
+	}
+
+	for _, p := range result.Proxies {
+		typ := strings.ToLower(p.Type)
+		if (typ == "urltest" || typ == "selector") && p.Now != "" {
+			resolved := resolveTarget(p.Now)
+			if resolved != "" {
+				return resolved
+			}
+		}
+	}
+
+	return defaultTag
+}
+
 func runDaemon() {
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
@@ -366,7 +442,6 @@ func runDaemon() {
 	daemonCtx, daemonCancel := context.WithCancel(context.Background())
 	defer daemonCancel()
 
-	// Гарантированный безопасный запуск с предпроверкой ассетов и валидацией
 	if err := app.startActiveEngine(daemonCtx); err != nil {
 		log.Printf("[WARN] Selected engine %s failed to start: %v", app.activeEng.Name(), err)
 		fallbackEngineName := "sing-box"
@@ -382,7 +457,6 @@ func runDaemon() {
 		}
 	}
 
-	// Запуск Clash API Shim для поддержки панелей управления (Yacd / Metacubexd на 9090) при работе Xray
 	app.syncClashShim(daemonCtx)
 
 	app.rulesCron = network.NewRulesetCron(
@@ -408,7 +482,14 @@ func runDaemon() {
 		},
 	)
 
-	go hub.Run(daemonCtx, app.getCurrentEngine)
+	go hub.Run(daemonCtx, app.getCurrentEngine, func() string {
+		cfg := app.state.Get()
+		fallback := ""
+		if len(cfg.Nodes) > 0 {
+			fallback = cfg.Nodes[0].Tag
+		}
+		return getRealActiveNode(fallback)
+	})
 
 	srv := api.NewServer(
 		state,
@@ -469,6 +550,7 @@ func runDaemon() {
 	}()
 
 	go app.supervisorLoop(daemonCtx)
+	go app.startXrayURLTestLoop(daemonCtx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -482,6 +564,128 @@ func runDaemon() {
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
 	log.Println("[INFO] Stopped.")
+}
+
+func (a *App) startXrayURLTestLoop(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	ignoredTags := map[string]bool{
+		"DIRECT":   true,
+		"REJECT":   true,
+		"PROXY":    true,
+		"GLOBAL":   true,
+		"auto":     true,
+		"AUTO":     true,
+		"auto-out": true,
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			eng := a.getCurrentEngine()
+			if eng == nil || eng.Name() != "xray" {
+				continue
+			}
+
+			cfg := a.state.Get()
+			if len(cfg.Nodes) <= 1 {
+				continue
+			}
+
+			client := &http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Get("http://127.0.0.1:9090/proxies")
+			if err != nil {
+				resp, err = client.Get("http://192.168.11.1:9090/proxies")
+				if err != nil {
+					continue
+				}
+			}
+
+			var proxiesResp struct {
+				Proxies map[string]struct {
+					History []struct {
+						Delay int `json:"delay"`
+					} `json:"history"`
+				} `json:"proxies"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&proxiesResp); err != nil {
+				resp.Body.Close()
+				continue
+			}
+			resp.Body.Close()
+
+			bestTag := ""
+			bestDelay := 999999
+			currentFirstDelay := 999999
+
+			currentFirstTag := cfg.Nodes[0].Tag
+			if p, ok := proxiesResp.Proxies[currentFirstTag]; ok && len(p.History) > 0 {
+				last := p.History[len(p.History)-1]
+				if last.Delay > 0 {
+					currentFirstDelay = last.Delay
+				}
+			}
+
+			for tag, info := range proxiesResp.Proxies {
+				if ignoredTags[tag] {
+					continue
+				}
+				if len(info.History) > 0 {
+					last := info.History[len(info.History)-1]
+					if last.Delay > 0 && last.Delay < bestDelay {
+						bestDelay = last.Delay
+						bestTag = tag
+					}
+				}
+			}
+
+			const tolerance = 30
+
+			if bestTag != "" && bestTag != currentFirstTag && (currentFirstDelay-bestDelay) > tolerance {
+				log.Printf("[xray-urltest] Better node detected: %s (%d ms) vs current %s (%d ms). Reordering...",
+					bestTag, bestDelay, currentFirstTag, currentFirstDelay)
+
+				var targetNode *config.GenericNode
+				for _, n := range cfg.Nodes {
+					if n.Tag == bestTag {
+						targetNode = n
+						break
+					}
+				}
+
+				if targetNode != nil {
+					var reordered []*config.GenericNode
+					reordered = append(reordered, targetNode)
+					for _, n := range cfg.Nodes {
+						if n.Tag != bestTag {
+							reordered = append(reordered, n)
+						}
+					}
+
+					fresh := a.state.Update(func(c *config.CheburConfig) {
+						c.Nodes = reordered
+					})
+
+					if a.clashShim != nil {
+						a.clashShim.UpdateConfig(&fresh)
+					}
+
+					reloadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					if err := a.reloadActiveEngine(reloadCtx); err != nil {
+						log.Printf("[xray-urltest] Failed to reload engine with new best node: %v", err)
+					} else {
+						log.Printf("[xray-urltest] Xray successfully switched active outbound to: %s", bestTag)
+					}
+					cancel()
+				}
+			}
+		}
+	}
 }
 
 func (a *App) syncClashShim(ctx context.Context) {
@@ -517,9 +721,13 @@ func (a *App) syncClashShim(ctx context.Context) {
 					}
 				}
 
-				a.state.Update(func(c *config.CheburConfig) {
+				fresh := a.state.Update(func(c *config.CheburConfig) {
 					c.Nodes = reordered
 				})
+
+				if a.clashShim != nil {
+					a.clashShim.UpdateConfig(&fresh)
+				}
 
 				return a.reloadActiveEngine(ctx)
 			})
@@ -674,7 +882,6 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 		targetPath = RuntimeConfigPathXray
 	}
 
-	// 1. Проверяем и гарантируем наличие ассетов при любом старте
 	if eng.Name() == "xray" {
 		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
 			return fmt.Errorf("ensure assets for xray failed: %w", err)
@@ -685,12 +892,10 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 		}
 	}
 
-	// 2. Генерируем конфигурацию
 	if err := eng.BuildConfig(&cfg, targetPath); err != nil {
 		return fmt.Errorf("build %s config failed: %w", eng.Name(), err)
 	}
 
-	// 3. Выполняем валидацию
 	if eng.Name() == "xray" {
 		if err := a.xrayEng.ValidateConfig(targetPath); err != nil {
 			return fmt.Errorf("xray validate config failed: %w", err)
@@ -739,7 +944,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 
 	log.Printf("[INFO] Initiating safe pre-flight switch to %s...", name)
 
-	// 1. Предварительная загрузка и проверка ассетов
 	switch name {
 	case "xray":
 		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
@@ -751,7 +955,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		}
 	}
 
-	// 2. Генерация конфигурации под целевое ядро
 	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
 		oldName := "none"
 		if oldEng != nil {
@@ -760,7 +963,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine %s kept running)", name, err, oldName)
 	}
 
-	// 3. Предстартовая валидация конфигурации нового ядра
 	switch name {
 	case "xray":
 		if err := a.xrayEng.ValidateConfig(newTargetPath); err != nil {
@@ -775,7 +977,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		log.Println("[INFO] Pre-flight: sing-box check passed successfully")
 	}
 
-	// 4. Остановка старого ядра ТОЛЬКО после успешных тестов нового
 	oldTargetPath := ""
 	if oldEng != nil {
 		if oldEng.Name() == "xray" {
@@ -787,7 +988,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 		_ = oldEng.Stop()
 	}
 
-	// 5. Запуск проверенного ядра с rollback при сбое
 	if err := newEng.Start(ctx, newTargetPath); err != nil {
 		log.Printf("[ERROR] Failed to start verified engine %s: %v. Initiating rollback...", name, err)
 
@@ -806,7 +1006,6 @@ func (a *App) switchEngine(ctx context.Context, name string) error {
 	a.activeEng = newEng
 	a.mu.Unlock()
 
-	// 6. Синхронизируем состояние встроенного Clash API Shim для веб-панелей
 	a.syncClashShim(ctx)
 
 	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
