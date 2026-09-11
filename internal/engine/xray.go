@@ -19,8 +19,8 @@ import (
 )
 
 const (
-	XrayAssetDir       = "/usr/share/xray"
-	GeositePath        = "/usr/share/xray/geosite.dat"
+	XrayAssetDir       = "/etc/cheburnet/geo"
+	GeositePath        = "/etc/cheburnet/geo/geosite.dat"
 	GeositeDownloadURL = "https://github.com/itdoginfo/allow-domains/releases/latest/download/geosite.dat"
 )
 
@@ -67,17 +67,19 @@ func moveFileCrossDevice(src, dst string) error {
 	return nil
 }
 
-// EnsureAssets проверяет наличие /usr/share/xray/geosite.dat и при отсутствии
-// скачивает его, резолвя адрес через dns_server и dns_protocol из UCI-конфига
+// EnsureAssets проверяет наличие /etc/cheburnet/geo/geosite.dat и при отсутствии
+// скачивает его, создавая директорию при необходимости
 func (x *XrayEngine) EnsureAssets(ctx context.Context) error {
+	// Гарантируем наличие изолированного каталога
+	if err := os.MkdirAll(XrayAssetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create asset directory %s: %w", XrayAssetDir, err)
+	}
+
 	if _, err := os.Stat(GeositePath); err == nil {
 		return nil
 	}
 
 	log.Printf("[INFO] %s not found. Downloading asset from %s...", GeositePath, GeositeDownloadURL)
-	if err := os.MkdirAll(XrayAssetDir, 0755); err != nil {
-		return fmt.Errorf("failed to create asset directory %s: %w", XrayAssetDir, err)
-	}
 
 	// Создаем временный файл в той же файловой системе для исключения межфайловых коллизий
 	tmpFile := filepath.Join(XrayAssetDir, "geosite.dat.tmp")
@@ -209,7 +211,7 @@ func (x *XrayEngine) Start(ctx context.Context, configPath string) error {
 	}
 
 	x.cmd = NewIsolatedCmd(ctx, "xray", "run", "-c", configPath)
-	x.cmd.Env = append(x.cmd.Env, "XRAY_LOCATION_ASSET="+XrayAssetDir)
+	x.cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+XrayAssetDir)
 
 	return x.cmd.Start()
 }

@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"crypto/sha256"
@@ -17,6 +18,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	// TargetXrayVersion жестко задает поддерживаемую демоном версию Xray
+	TargetXrayVersion = "26.9.9"
+	XrayBinPath       = "/usr/bin/xray"
+	XrayReleaseBase   = "https://github.com/XTLS/Xray-core/releases/download"
 )
 
 type ComponentStatus struct {
@@ -56,7 +64,7 @@ func NewManager(repo, currentVer string) *Manager {
 	return &Manager{
 		githubRepo: repo,
 		currentVer: currentVer,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: &http.Client{Timeout: 90 * time.Second},
 		pkgManager: pkgMgr,
 		targetArch: arch,
 	}
@@ -115,7 +123,7 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	defer m.mu.Unlock()
 
 	sbStatus := m.checkPkgStatus("sing-box")
-	xrStatus := m.checkPkgStatus("xray-core")
+	xrStatus := m.checkPinnedXrayStatus()
 
 	chStatus := ComponentStatus{
 		Current:   strings.TrimPrefix(m.currentVer, "v"),
@@ -140,19 +148,50 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	return report, nil
 }
 
+// checkPinnedXrayStatus проверяет соответствие установленного бинарника Xray константе TargetXrayVersion
+func (m *Manager) checkPinnedXrayStatus() ComponentStatus {
+	st := ComponentStatus{
+		Latest: TargetXrayVersion,
+	}
+
+	binPath := XrayBinPath
+	if _, err := os.Stat(binPath); os.IsNotExist(err) {
+		if lp, err := exec.LookPath("xray"); err == nil {
+			binPath = lp
+		} else {
+			st.Installed = false
+			st.HasUpdate = true
+			return st
+		}
+	}
+
+	st.Installed = true
+	out, err := exec.Command(binPath, "version").CombinedOutput()
+	if err != nil {
+		st.Current = "unknown"
+		st.HasUpdate = true
+		return st
+	}
+
+	fields := strings.Fields(string(out))
+	if len(fields) >= 2 {
+		curVer := strings.TrimPrefix(fields[1], "v")
+		st.Current = curVer
+		st.HasUpdate = (curVer != TargetXrayVersion)
+	} else {
+		st.Current = "unknown"
+		st.HasUpdate = true
+	}
+
+	return st
+}
+
 func (m *Manager) checkPkgStatus(pkgName string) ComponentStatus {
 	st := ComponentStatus{}
 
 	binExists := false
-	lookupList := []string{pkgName}
-	if pkgName == "xray-core" {
-		lookupList = append(lookupList, "xray")
-	}
-	for _, bin := range lookupList {
-		if _, err := exec.LookPath(bin); err == nil {
-			binExists = true
-			break
-		}
+	if _, err := exec.LookPath(pkgName); err == nil {
+		binExists = true
 	}
 
 	if m.pkgManager == "apk" {
@@ -320,21 +359,182 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 	return nil
 }
 
+// UpgradeXrayCore скачивает таргетированную версию Xray с GitHub, сверяет контрольную сумму из .dgst и заменяет бинарник
+func (m *Manager) UpgradeXrayCore(ctx context.Context) error {
+	tag := "v" + strings.TrimPrefix(TargetXrayVersion, "v")
+	assetName := "Xray-linux-arm64-v8a.zip"
+	if runtime.GOARCH == "arm" {
+		assetName = "Xray-linux-arm32-v7a.zip"
+	}
+
+	zipURL := fmt.Sprintf("%s/%s/%s", XrayReleaseBase, tag, assetName)
+	dgstURL := zipURL + ".dgst"
+
+	log.Printf("[INFO] Pinned Xray target: %s. Fetching signature from %s...", tag, dgstURL)
+
+	expectedHash, err := m.fetchXrayDGSTHash(ctx, dgstURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch xray .dgst: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp(os.TempDir(), "xray_install_*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	archivePath := filepath.Join(tmpDir, assetName)
+	log.Printf("[INFO] Downloading Xray release: %s...", zipURL)
+	if err := m.downloadFile(ctx, zipURL, archivePath); err != nil {
+		return fmt.Errorf("failed to download xray archive: %w", err)
+	}
+
+	if err := m.verifyFileSHA256(archivePath, expectedHash); err != nil {
+		return fmt.Errorf("xray archive checksum failed: %w", err)
+	}
+
+	newBinPath := filepath.Join(tmpDir, "xray.bin")
+	if err := extractFileFromZip(archivePath, "xray", newBinPath); err != nil {
+		return fmt.Errorf("failed to extract xray executable: %w", err)
+	}
+
+	_ = os.Chmod(newBinPath, 0755)
+
+	// Валидируем бинарник вызовом version
+	testCmd := exec.CommandContext(ctx, newBinPath, "version")
+	if out, err := testCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("xray self-test failed: %w (out: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	targetPath := XrayBinPath
+	if lp, err := exec.LookPath("xray"); err == nil {
+		targetPath = lp
+	}
+
+	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
+		return fmt.Errorf("failed to replace xray binary: %w", err)
+	}
+
+	log.Printf("[INFO] Xray successfully pinned and updated to version %s at %s", TargetXrayVersion, targetPath)
+	return nil
+}
+
+func (m *Manager) fetchXrayDGSTHash(ctx context.Context, dgstURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dgstURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	// Парсим строки формата: SHA256= <хеш> или SHA256 = <хеш>
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToUpper(trimmed), "SHA256") {
+			parts := strings.Split(trimmed, "=")
+			if len(parts) == 2 {
+				return strings.ToLower(strings.TrimSpace(parts[1])), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("SHA256 not found in .dgst response")
+}
+
+func extractFileFromZip(zipPath, targetFileName, outPath string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if f.Name == targetFileName {
+			rc, err := f.Open()
+			if err != nil {
+				return err
+			}
+			defer rc.Close()
+
+			outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+			if err != nil {
+				return err
+			}
+			defer outFile.Close()
+
+			_, err = io.Copy(outFile, rc)
+			return err
+		}
+	}
+	return fmt.Errorf("file %s not found inside archive", targetFileName)
+}
+
+func replaceFileCrossDevice(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	_ = os.Remove(src)
+	return nil
+}
+
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	if len(pkgs) == 0 {
 		pkgs = []string{"sing-box", "xray-core"}
 	}
 
-	var targetPkgs []string
+	var pkgMgrTargets []string
+
 	for _, p := range pkgs {
+		if p == "xray" || p == "xray-core" {
+			xrStatus := m.checkPinnedXrayStatus()
+			if xrStatus.HasUpdate || !xrStatus.Installed {
+				log.Printf("[INFO] Upgrading Xray-core to pinned version %s...", TargetXrayVersion)
+				if err := m.UpgradeXrayCore(ctx); err != nil {
+					return err
+				}
+			} else {
+				log.Printf("[INFO] Xray is already on pinned version %s", TargetXrayVersion)
+			}
+			continue
+		}
+
 		st := m.checkPkgStatus(p)
 		if st.Installed {
-			targetPkgs = append(targetPkgs, p)
+			pkgMgrTargets = append(pkgMgrTargets, p)
 		}
 	}
 
-	if len(targetPkgs) == 0 {
-		log.Println("[INFO] No active core packages installed to upgrade")
+	if len(pkgMgrTargets) == 0 {
 		return nil
 	}
 
@@ -343,7 +543,7 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 		if out, err := exec.CommandContext(ctx, "apk", "update").CombinedOutput(); err != nil {
 			return fmt.Errorf("apk update failed: %s", string(out))
 		}
-		args := append([]string{"add", "--upgrade"}, targetPkgs...)
+		args := append([]string{"add", "--upgrade"}, pkgMgrTargets...)
 		log.Printf("[INFO] Running apk %s...", strings.Join(args, " "))
 		if out, err := exec.CommandContext(ctx, "apk", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("apk upgrade failed: %s", string(out))
@@ -355,7 +555,7 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg update failed: %s", string(out))
 	}
-	args := append([]string{"upgrade"}, targetPkgs...)
+	args := append([]string{"upgrade"}, pkgMgrTargets...)
 	log.Printf("[INFO] Running opkg %s...", strings.Join(args, " "))
 	if out, err := exec.CommandContext(ctx, "opkg", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("opkg upgrade failed: %s", string(out))
@@ -449,7 +649,7 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		currPath, _ = filepath.EvalSymlinks(currPath)
 
 		_ = os.Chmod(tmpBin, 0755)
-		if err := os.Rename(tmpBin, currPath); err != nil {
+		if err := replaceFileCrossDevice(tmpBin, currPath); err != nil {
 			return fmt.Errorf("replace binary failed: %w", err)
 		}
 
@@ -501,7 +701,7 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	switch target {
 	case "sing-box":
 		return m.UpgradeCores(ctx, "sing-box")
-	case "xray":
+	case "xray", "xray-core":
 		return m.UpgradeCores(ctx, "xray-core")
 	case "cores":
 		return m.UpgradeCores(ctx, "sing-box", "xray-core")
@@ -517,8 +717,6 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 
 // StartAutoUpdateLoop запускает периодический фоновый опрос релизов и установку обновлений
 func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled func() bool, onUpdateSuccess func()) {
-	// Первая проверка через 5 минут после старта устройства (чтобы дать подняться сети и прокси)
-	// Далее проверяем каждые 6 часов
 	initialDelay := 5 * time.Minute
 	checkInterval := 6 * time.Hour
 
@@ -568,7 +766,6 @@ func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled f
 			}
 		}
 
-		// Выполняем первую проверку
 		checkAndUpgrade()
 
 		for {
