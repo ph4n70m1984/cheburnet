@@ -359,18 +359,57 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 	return nil
 }
 
+// resolveXrayAsset сопоставляет GOARCH и системную архитектуру OpenWrt с именованием архивов Xray-core
+func (m *Manager) resolveXrayAsset() (string, error) {
+	arch := strings.ToLower(m.targetArch)
+
+	switch runtime.GOARCH {
+	case "arm64":
+		return "Xray-linux-arm64-v8a.zip", nil
+
+	case "amd64":
+		return "Xray-linux-64.zip", nil
+
+	case "386":
+		return "Xray-linux-32.zip", nil
+
+	case "arm":
+		if strings.Contains(arch, "v5") || strings.Contains(arch, "arm9") {
+			return "Xray-linux-arm32-v5.zip", nil
+		}
+		return "Xray-linux-arm32-v7a.zip", nil
+
+	case "mipsle":
+		// Подавляющее большинство роутеров OpenWrt (MT7621, MT7628, MT7620) используют softfloat
+		return "Xray-linux-mips32le-softfloat.zip", nil
+
+	case "mips":
+		// Big-endian MIPS (Atheros AR7xxx/AR9xxx, QCA95xx)
+		return "Xray-linux-mips32-softfloat.zip", nil
+
+	case "mips64le":
+		return "Xray-linux-mips64le-softfloat.zip", nil
+
+	case "mips64":
+		return "Xray-linux-mips64-softfloat.zip", nil
+
+	default:
+		return "", fmt.Errorf("unsupported Xray architecture: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
+	}
+}
+
 // UpgradeXrayCore скачивает таргетированную версию Xray с GitHub, сверяет контрольную сумму из .dgst и заменяет бинарник
 func (m *Manager) UpgradeXrayCore(ctx context.Context) error {
-	tag := "v" + strings.TrimPrefix(TargetXrayVersion, "v")
-	assetName := "Xray-linux-arm64-v8a.zip"
-	if runtime.GOARCH == "arm" {
-		assetName = "Xray-linux-arm32-v7a.zip"
+	assetName, err := m.resolveXrayAsset()
+	if err != nil {
+		return fmt.Errorf("architecture resolution failed: %w", err)
 	}
 
+	tag := "v" + strings.TrimPrefix(TargetXrayVersion, "v")
 	zipURL := fmt.Sprintf("%s/%s/%s", XrayReleaseBase, tag, assetName)
 	dgstURL := zipURL + ".dgst"
 
-	log.Printf("[INFO] Pinned Xray target: %s. Fetching signature from %s...", tag, dgstURL)
+	log.Printf("[INFO] Pinned Xray target: %s (%s). Fetching signature from %s...", tag, assetName, dgstURL)
 
 	expectedHash, err := m.fetchXrayDGSTHash(ctx, dgstURL)
 	if err != nil {
