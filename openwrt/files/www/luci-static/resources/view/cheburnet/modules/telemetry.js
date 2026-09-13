@@ -3,7 +3,72 @@
 'require ui';
 
 return baseclass.extend({
+    formatComponentStatus: function(name, comp) {
+        if (!comp || !comp.installed) {
+            return '<li>' + name + ': <span style="color:#71717a;">Не установлен</span></li>';
+        }
+        var currentVer = comp.current ? ('v' + comp.current.replace(/^v/, '')) : 'неизвестно';
+        var latestVer = comp.latest ? ('v' + comp.latest.replace(/^v/, '')) : currentVer;
+
+        if (comp.has_update) {
+            return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:#4ade80; font-weight:bold;">' + latestVer + ' (Доступно обновление)</span></li>';
+        }
+        return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:#8c8c8c;">Актуально</span></li>';
+    },
+
+    renderUpdateReport: function(r) {
+        var statusDiv = document.getElementById('ws-update-status');
+        var btnUpgrade = document.getElementById('ws-btn-upgrade');
+
+        if (!statusDiv) return;
+
+        if (!r || (!r.cheburnet && !r.sing_box)) {
+            statusDiv.innerHTML = '<span style="color:#f87171;">Не удалось получить данные о версиях релизов.</span>';
+            return;
+        }
+
+        var html = '<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">';
+        html += this.formatComponentStatus('Chebur.NET', r.cheburnet);
+        html += this.formatComponentStatus('Sing-box', r.sing_box);
+        html += '</ul>';
+
+        var hasAppUpdate = r.cheburnet && r.cheburnet.has_update;
+        var hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
+
+        if (!hasAppUpdate && !hasSbUpdate) {
+            html += '<div style="margin-top:8px; color:#4ade80; font-size:12px;">✔ Все компоненты обновлены до актуальных версий.</div>';
+        }
+        statusDiv.innerHTML = html;
+
+        if (btnUpgrade) {
+            btnUpgrade.style.display = (hasAppUpdate || hasSbUpdate) ? 'inline-block' : 'none';
+        }
+    },
+
+    showUpdateNotification: function(data) {
+        if (!data) return;
+        var alerts = [];
+        if (data.cheburnet && data.cheburnet.has_update) {
+            alerts.push('Chebur.NET: ' + data.cheburnet.current + ' → ' + data.cheburnet.latest);
+        }
+        if (data.sing_box && data.sing_box.installed && data.sing_box.has_update) {
+            alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
+        }
+        if (alerts.length > 0) {
+            var banner = document.getElementById('update-notification-banner');
+            var txt = document.getElementById('update-banner-text');
+            if (banner && txt) {
+                txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
+                banner.style.display = 'flex';
+                banner.style.background = 'rgba(234, 179, 8, 0.15)';
+                banner.style.borderColor = 'rgba(234, 179, 8, 0.4)';
+                banner.style.color = '#fef08a';
+            }
+        }
+    },
+
     createTelemetrySection: function(nodesModule) {
+        var self = this;
         window.cheburProblems = {};
         window.cheburLastDiagSnapshot = null;
         window.cheburActiveNodeTag = '';
@@ -67,6 +132,19 @@ return baseclass.extend({
                 })
                 .then(function(snap) { if (snap) renderDiagnosticSnapshot(snap); })
                 .catch(function() { clearTimeout(timeoutId); });
+        }
+
+        function checkUpdatesOnce() {
+            var host = window.location.hostname;
+            fetch('http://' + host + ':8088/api/v1/updates/check')
+                .then(function(r) { return r.ok ? r.json() : null; })
+                .then(function(data) {
+                    if (data) {
+                        self.showUpdateNotification(data);
+                        self.renderUpdateReport(data);
+                    }
+                })
+                .catch(function() {});
         }
 
         function syncClashDelays() {
@@ -151,6 +229,10 @@ return baseclass.extend({
                     var msg = JSON.parse(event.data);
                     if (msg.active_node && window.cheburActiveNodeTag !== 'auto') {
                         nodesModule.highlightActiveNode(msg.active_node, '');
+                    }
+                    if (msg.type === 'update_report' && msg.data) {
+                        self.showUpdateNotification(msg.data);
+                        self.renderUpdateReport(msg.data);
                     }
                     if (msg.type === 'upgrade_error' && msg.error) {
                         ui.addNotification(null, E('p', {}, _('Ошибка обновления: ') + msg.error), 'error');
@@ -330,6 +412,7 @@ return baseclass.extend({
 
             syncRealtimeStatus();
             fetchDiagnosticsOnce();
+            checkUpdatesOnce();
             connectWebSocket();
 
             syncIntervalId = setInterval(syncClashDelays, 4000);

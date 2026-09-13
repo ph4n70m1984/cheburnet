@@ -23,6 +23,72 @@ return view.extend({
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
+        window.cheburCheckUpdates = function(e) {
+            e.preventDefault();
+            var statusDiv = document.getElementById('ws-update-status');
+            if (statusDiv) {
+                statusDiv.innerHTML = '<span style="color:#fbbf24;">Выполняется проверка GitHub и пакетов...</span>';
+            }
+
+            var host = window.location.hostname;
+            fetch('http://' + host + ':8088/api/v1/updates/check')
+                .then(function(r) {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(function(data) {
+                    if (telemetryModule && typeof telemetryModule.renderUpdateReport === 'function') {
+                        telemetryModule.renderUpdateReport(data);
+                    }
+                    if (telemetryModule && typeof telemetryModule.showUpdateNotification === 'function') {
+                        telemetryModule.showUpdateNotification(data);
+                    }
+                })
+                .catch(function(err) {
+                    if (statusDiv) {
+                        statusDiv.innerHTML = '<span style="color:#f87171;">Ошибка проверки обновлений: ' + err.message + '</span>';
+                    }
+                });
+        };
+
+        window.cheburPerformUpgrade = function(e) {
+            e.preventDefault();
+            var statusDiv = document.getElementById('ws-update-status');
+            var btnUpgrade = document.getElementById('ws-btn-upgrade');
+            if (statusDiv) {
+                statusDiv.innerHTML = '<span style="color:#38bdf8;">Процесс обновления запущен в фоне. Демон перезапустится автоматически...</span>';
+            }
+            if (btnUpgrade) {
+                btnUpgrade.style.display = 'none';
+            }
+
+            fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: 'all' })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data && data.error) {
+                    if (statusDiv) {
+                        statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сбой: ' + data.error + '</span>';
+                    }
+                    if (btnUpgrade) {
+                        btnUpgrade.style.display = 'inline-block';
+                    }
+                    ui.addNotification(null, E('p', {}, _('Ошибка обновления: ') + data.error), 'error');
+                }
+            })
+            .catch(function(err) {
+                if (statusDiv) {
+                    statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сетевая ошибка: ' + err + '</span>';
+                }
+                if (btnUpgrade) {
+                    btnUpgrade.style.display = 'inline-block';
+                }
+            });
+        };
+
         var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
         statusSec.render = function() {
@@ -265,7 +331,21 @@ return view.extend({
         o.default = 'br-lan';
 
         // --- ВКЛАДКА 4: ОБНОВЛЕНИЯ ---
+        var o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
+        o_upd.rawhtml = true;
+        o_upd.default = '' +
+            '<div style="margin-bottom:15px; padding:15px; border:1px solid rgba(255,255,255,0.15); border-radius:6px; background:rgba(0,0,0,0.25);">' +
+                '<div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:#8c8c8c; font-size:13px;">' +
+                    'Ожидание ручной проверки релизов...' +
+                '</div>' +
+                '<div style="display:flex; gap:10px; flex-wrap:wrap;">' +
+                    '<button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">Проверить наличие обновлений</button>' +
+                    '<button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">Установить все обновления</button>' +
+                '</div>' +
+            '</div>';
+
         o = s.taboption('updates', form.Flag, 'auto_update', _('Автоматическое обновление'));
+        o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
         o.default = '0';
 
         return m.render();
