@@ -65,7 +65,8 @@ type SubscriptionConfig struct {
 	UserAgent    string   `json:"user_agent"`
 	HWID         string   `json:"hwid,omitempty"`
 	Enabled      bool     `json:"enabled"`
-	ExcludeRegex []string `json:"exclude_regex,omitempty"` // Фильтрация нод по регулярным выражениям
+	FilterMode   string   `json:"filter_mode,omitempty"`   // "exclude" (Blacklist) или "include" (Whitelist)
+	ExcludeRegex []string `json:"exclude_regex,omitempty"` // Регулярные выражения фильтра
 }
 
 type CheburConfig struct {

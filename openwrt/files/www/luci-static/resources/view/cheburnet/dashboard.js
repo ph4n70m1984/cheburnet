@@ -526,7 +526,6 @@ return view.extend({
                 window.cheburActiveNodeTag = isAuto ? 'auto' : selectedTag;
                 var targetRowId = isAuto ? 'node-row-auto' : ('node-row-' + selectedTag);
 
-                // 1. Верхняя карточка "АКТИВНЫЙ СЕРВЕР"
                 var nameEl = document.getElementById('active-server-name');
                 if (nameEl) {
                     if (isAuto) {
@@ -536,7 +535,6 @@ return view.extend({
                     }
                 }
 
-                // 2. Снимаем выделение со всех строк
                 var rows = document.querySelectorAll('#chebur-nodes-table tr[id^="node-row-"]');
                 rows.forEach(function(r) {
                     r.style.background = '';
@@ -547,7 +545,6 @@ return view.extend({
                     }
                 });
 
-                // 3. Статично выделяем только активную строку таблицы
                 var activeRow = document.getElementById(targetRowId);
                 if (activeRow) {
                     activeRow.style.background = 'rgba(56, 189, 248, 0.12)';
@@ -1074,9 +1071,17 @@ return view.extend({
         o.rmempty = false;
         o.modalonly = true;
 
-        o = subSec.option(form.DynamicList, 'exclude_regex', _('Исключить по регулярному выражению'));
-        o.description = _('Скрыть серверы, чьи имена соответствуют выражению. Если пусто — выводятся все.');
-        o.placeholder = _('Например: LTE|Белые списки');
+        // Выбор режима фильтрации серверов
+        o = subSec.option(form.ListValue, 'filter_mode', _('Режим фильтрации серверов'));
+        o.value('exclude', _('Исключить по регулярному выражению (Blacklist)'));
+        o.value('include', _('Оставить только совпадающие (Whitelist / Показать)'));
+        o.default = 'exclude';
+        o.rmempty = false;
+        o.modalonly = true;
+
+        o = subSec.option(form.DynamicList, 'exclude_regex', _('Регулярные выражения (RegExp)'));
+        o.description = _('Шаблоны для фильтрации названий серверов. В режиме "Исключить" скрывает совпавшие, в режиме "Оставить" — отображает только их (например: обход|lte). Если список пуст — выводятся все.');
+        o.placeholder = _('Например: обход|lte');
         o.datatype = 'string';
         o.rmempty = true;
         o.modalonly = true;

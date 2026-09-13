@@ -66,9 +66,10 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 				val := strings.TrimSpace(raw)
 				if val != "" {
 					cfg.Subscriptions = append(cfg.Subscriptions, SubscriptionConfig{
-						URL:       val,
-						UserAgent: "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
-						Enabled:   true,
+						URL:        val,
+						UserAgent:  "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
+						Enabled:    true,
+						FilterMode: "exclude",
 					})
 				}
 			}
@@ -155,8 +156,9 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 
 		if _, ok := secMap[secID]; !ok {
 			secMap[secID] = &SubscriptionConfig{
-				UserAgent: "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
-				Enabled:   true,
+				UserAgent:  "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
+				Enabled:    true,
+				FilterMode: "exclude",
 			}
 		}
 
@@ -174,6 +176,12 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 			secMap[secID].UserAgent = val
 		case "hwid":
 			secMap[secID].HWID = val
+		case "filter_mode":
+			if val == "include" {
+				secMap[secID].FilterMode = "include"
+			} else {
+				secMap[secID].FilterMode = "exclude"
+			}
 		case "enabled":
 			secMap[secID].Enabled = (val == "1" || val == "true")
 		case "exclude_regex":
@@ -194,6 +202,9 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 
 	for _, sub := range secMap {
 		if sub.URL != "" && sub.Enabled {
+			if sub.FilterMode == "" {
+				sub.FilterMode = "exclude"
+			}
 			subs = append(subs, *sub)
 		}
 	}
@@ -380,11 +391,17 @@ func (u *UCIStorage) AddSubscription(sub SubscriptionConfig) error {
 		ua = "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)"
 	}
 
+	filterMode := sub.FilterMode
+	if filterMode == "" {
+		filterMode = "exclude"
+	}
+
 	if sub.Name != "" {
 		_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.name=%s", secID, sub.Name)).Run()
 	}
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.url=%s", secID, sub.URL)).Run()
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.user_agent=%s", secID, ua)).Run()
+	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.filter_mode=%s", secID, filterMode)).Run()
 	if sub.HWID != "" {
 		_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.hwid=%s", secID, sub.HWID)).Run()
 	}

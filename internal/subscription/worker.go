@@ -86,7 +86,7 @@ type xrayOutboundItem struct {
 	StreamSettings map[string]interface{} `json:"streamSettings"`
 }
 
-func filterNodesByRegex(nodes []*config.GenericNode, patterns []string) []*config.GenericNode {
+func filterNodesByRegex(nodes []*config.GenericNode, patterns []string, filterMode string) []*config.GenericNode {
 	if len(patterns) == 0 {
 		return nodes
 	}
@@ -106,17 +106,28 @@ func filterNodesByRegex(nodes []*config.GenericNode, patterns []string) []*confi
 		return nodes
 	}
 
+	isIncludeMode := strings.EqualFold(filterMode, "include")
 	filtered := make([]*config.GenericNode, 0, len(nodes))
+
 	for _, node := range nodes {
-		exclude := false
+		matched := false
 		for _, re := range compiled {
 			if re.MatchString(node.Tag) {
-				exclude = true
+				matched = true
 				break
 			}
 		}
-		if !exclude {
-			filtered = append(filtered, node)
+
+		if isIncludeMode {
+			// Whitelist: оставляем только совпавшие
+			if matched {
+				filtered = append(filtered, node)
+			}
+		} else {
+			// Blacklist: исключаем совпавшие
+			if !matched {
+				filtered = append(filtered, node)
+			}
 		}
 	}
 	return filtered
@@ -129,6 +140,11 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 	targetHWID := strings.TrimSpace(sub.HWID)
 	if targetHWID == "" && w.autoHWID {
 		targetHWID = w.getOrGenerateHWID()
+	}
+
+	filterMode := sub.FilterMode
+	if filterMode == "" {
+		filterMode = "exclude"
 	}
 
 	var body []byte
@@ -239,7 +255,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 	}
 
 	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)[cite: 5]
-	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, subName, seenTags); len(xrayNodes) > 0 {
+	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
 		// 2. Попытка распарсить как Clash YAML[cite: 5]
@@ -315,17 +331,17 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			}
 		}
 
-		nodes = filterNodesByRegex(nodes, sub.ExcludeRegex)
+		nodes = filterNodesByRegex(nodes, sub.ExcludeRegex, filterMode)
 	}
 
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("панель не вернула серверов либо все были отфильтрованы правилом exclude_regex")
+		return nil, fmt.Errorf("панель не вернула серверов либо все были отфильтрованы правилом regex (%s)", filterMode)
 	}
 
 	return nodes, nil
 }
 
-func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subName string, seenTags map[string]bool) []*config.GenericNode {
+func parseXrayJSON(data []byte, targetHWID string, patterns []string, filterMode string, subName string, seenTags map[string]bool) []*config.GenericNode {
 	var profiles []xrayProfileItem
 	if err := json.Unmarshal(data, &profiles); err != nil {
 		var single xrayProfileItem
@@ -337,7 +353,7 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 	}
 
 	var compiled []*regexp.Regexp
-	for _, p := range excludeRegexes {
+	for _, p := range patterns {
 		p = strings.TrimSpace(strings.Trim(p, "'\""))
 		if p == "" {
 			continue
@@ -347,6 +363,7 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 		}
 	}
 
+	isIncludeMode := strings.EqualFold(filterMode, "include")
 	var nodes []*config.GenericNode
 
 	makeUniqueTag := func(rawName string) string {
@@ -381,15 +398,24 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 				rawTag = fmt.Sprintf("%s (%s)", baseRemarks, ob.Tag)
 			}
 
-			excluded := false
-			for _, re := range compiled {
-				if re.MatchString(rawTag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
-					excluded = true
-					break
+			if len(compiled) > 0 {
+				matched := false
+				for _, re := range compiled {
+					if re.MatchString(rawTag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
+						matched = true
+						break
+					}
 				}
-			}
-			if excluded {
-				continue
+
+				if isIncludeMode {
+					if !matched {
+						continue
+					}
+				} else {
+					if matched {
+						continue
+					}
+				}
 			}
 
 			uniqueTag := makeUniqueTag(rawTag)
