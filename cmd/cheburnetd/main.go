@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	CheburVersion            = "1.1.0-singbox"
+	CheburVersion            = "0.0.1-singbox-dev"
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
 	DefaultAPIBind           = "0.0.0.0:8088"
 	PIDFile                  = "/var/run/cheburnetd.pid"

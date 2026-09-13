@@ -65,10 +65,62 @@ func NewManager(repo, currentVer string) *Manager {
 	return &Manager{
 		githubRepo: repo,
 		currentVer: currentVer,
-		httpClient: &http.Client{Timeout: 90 * time.Second},
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 		pkgManager: pkgMgr,
 		targetArch: arch,
 	}
+}
+
+// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df
+func checkFreeSpaceBytes(path string) (uint64, error) {
+	// Вызываем `df -k <path>`, вывод гарантированно кроссплатформенный для Linux/Busybox
+	out, err := exec.Command("df", "-k", path).Output()
+	if err != nil {
+		// Fallback для сред разработки (например, Windows при сборке): не блокируем выполнение
+		if runtime.GOOS != "linux" {
+			return 1024 * 1024 * 1024, nil // 1 GB заглушка
+		}
+		return 0, fmt.Errorf("ошибка вызова df для %s: %w", path, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return 0, fmt.Errorf("неожиданный формат вывода df: %s", string(out))
+	}
+
+	// Последняя строка содержит данные раздела
+	fields := strings.Fields(lines[len(lines)-1])
+	// Формат обычно: Filesystem 1K-blocks Used Available Use% Mounted on
+	if len(fields) < 4 {
+		return 0, fmt.Errorf("не удалось распарсить поля df: %s", lines[len(lines)-1])
+	}
+
+	// 4-я колонка (индекс 3) — Available в килобайтах
+	availKb, err := strconv.ParseUint(fields[3], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка парсинга доступного места: %w", err)
+	}
+
+	return availKb * 1024, nil
+}
+
+// ensureSpace проверяет наличие необходимого свободного места на диске
+func ensureSpace(path string, requiredBytes uint64, description string) error {
+	free, err := checkFreeSpaceBytes(path)
+	if err != nil {
+		// Если по какой-то причине не удалось проверить (путь еще не создан), пробуем /tmp
+		if path != "/tmp" {
+			return ensureSpace("/tmp", requiredBytes, description)
+		}
+		return fmt.Errorf("ошибка проверки хранилища %s (%s): %w", description, path, err)
+	}
+
+	if free < requiredBytes {
+		freeMB := float64(free) / (1024 * 1024)
+		reqMB := float64(requiredBytes) / (1024 * 1024)
+		return fmt.Errorf("недостаточно места для %s: доступно %.1f МБ, требуется минимум %.1f МБ", description, freeMB, reqMB)
+	}
+	return nil
 }
 
 func detectPackageManager() string {
@@ -119,7 +171,6 @@ func detectTargetArch(pkgMgr string) string {
 	}
 }
 
-// parseSemVer парсит версии вида 1.1.0, 0.0.8.15, v1.1.0-singbox
 func parseSemVer(v string) []int {
 	v = strings.TrimPrefix(v, "v")
 	if idx := strings.Index(v, "-"); idx != -1 {
@@ -134,7 +185,6 @@ func parseSemVer(v string) []int {
 	return res
 }
 
-// isNewerVersion возвращает true только если remote строго новее, чем current
 func isNewerVersion(remote, current string) bool {
 	r := parseSemVer(remote)
 	c := parseSemVer(current)
@@ -165,7 +215,6 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	if err == nil {
 		cleanLatest := strings.TrimPrefix(latestTag, "v")
 		chStatus.Latest = cleanLatest
-		// Проверяем, что релиз на GitHub действительно новее локальной версии
 		chStatus.HasUpdate = cleanLatest != "" && isNewerVersion(cleanLatest, chStatus.Current)
 	}
 
@@ -295,48 +344,23 @@ func (m *Manager) resolveSingBoxAsset() (string, error) {
 	case "mips64":
 		return fmt.Sprintf("sing-box-%s-linux-mips64-softfloat.tar.gz", TargetSingBoxVersion), nil
 	default:
-		return "", fmt.Errorf("unsupported sing-box architecture: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
+		return "", fmt.Errorf("неподдерживаемая архитектура ядра sing-box: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
 	}
 }
 
 func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
 	status := m.checkPinnedSingBoxStatus()
 	if !status.HasUpdate && status.Installed {
-		log.Printf("[INFO] sing-box is already at %s (or newer). No upgrade needed.", status.Current)
+		log.Printf("[INFO] sing-box уже имеет версию %s. Обновление не требуется.", status.Current)
 		return nil
 	}
 
-	assetName, err := m.resolveSingBoxAsset()
-	if err != nil {
-		return fmt.Errorf("architecture resolution failed: %w", err)
-	}
+	// 1. Контроль памяти перед скачиванием
+	const minTmpSpace = 40 * 1024 * 1024  // 40 МБ в /tmp под tar.gz и распаковку
+	const minDestSpace = 25 * 1024 * 1024 // 25 МБ под бинарник в целевом каталоге
 
-	tag := "v" + strings.TrimPrefix(TargetSingBoxVersion, "v")
-	tarURL := fmt.Sprintf("%s/%s/%s", SingBoxReleaseBase, tag, assetName)
-
-	log.Printf("[INFO] Pinned sing-box-extended target: %s. Fetching from %s...", tag, tarURL)
-
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "sb_install_*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	archivePath := filepath.Join(tmpDir, assetName)
-	if err := m.downloadFile(ctx, tarURL, archivePath); err != nil {
-		return fmt.Errorf("failed to download sing-box archive: %w", err)
-	}
-
-	newBinPath := filepath.Join(tmpDir, "sing-box")
-	if err := extractFileFromTarGz(archivePath, "sing-box", newBinPath); err != nil {
-		return fmt.Errorf("failed to extract sing-box executable: %w", err)
-	}
-
-	_ = os.Chmod(newBinPath, 0755)
-
-	testCmd := exec.CommandContext(ctx, newBinPath, "version")
-	if out, err := testCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("sing-box self-test failed: %w (out: %s)", err, strings.TrimSpace(string(out)))
+	if err := ensureSpace("/tmp", minTmpSpace, "временного каталога /tmp"); err != nil {
+		return err
 	}
 
 	targetPath := SingBoxBinPath
@@ -344,11 +368,49 @@ func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
 		targetPath = lp
 	}
 
-	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
-		return fmt.Errorf("failed to replace sing-box binary: %w", err)
+	if err := ensureSpace(filepath.Dir(targetPath), minDestSpace, "установки в системный раздел"); err != nil {
+		return err
 	}
 
-	log.Printf("[INFO] sing-box successfully pinned and updated to version %s at %s", TargetSingBoxVersion, targetPath)
+	assetName, err := m.resolveSingBoxAsset()
+	if err != nil {
+		return fmt.Errorf("определение целевого архива: %w", err)
+	}
+
+	tag := "v" + strings.TrimPrefix(TargetSingBoxVersion, "v")
+	tarURL := fmt.Sprintf("%s/%s/%s", SingBoxReleaseBase, tag, assetName)
+
+	log.Printf("[INFO] Загрузка sing-box-extended %s в /tmp...", tag)
+
+	// Гарантированно создаем временную директорию строго в /tmp
+	tmpDir, err := os.MkdirTemp("/tmp", "sb_install_*")
+	if err != nil {
+		return fmt.Errorf("не удалось создать временную директорию в /tmp: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	archivePath := filepath.Join(tmpDir, assetName)
+	if err := m.downloadFile(ctx, tarURL, archivePath); err != nil {
+		return fmt.Errorf("сбой загрузки sing-box архива: %w", err)
+	}
+
+	newBinPath := filepath.Join(tmpDir, "sing-box")
+	if err := extractFileFromTarGz(archivePath, "sing-box", newBinPath); err != nil {
+		return fmt.Errorf("ошибка распаковки sing-box: %w", err)
+	}
+
+	_ = os.Chmod(newBinPath, 0755)
+
+	testCmd := exec.CommandContext(ctx, newBinPath, "version")
+	if out, err := testCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("бинарник sing-box не прошел самопроверку: %w (вывод: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
+		return fmt.Errorf("не удалось заменить бинарник sing-box: %w", err)
+	}
+
+	log.Printf("[INFO] sing-box успешно обновлен до %s (%s)", TargetSingBoxVersion, targetPath)
 	return nil
 }
 
@@ -386,7 +448,7 @@ func extractFileFromTarGz(tarGzPath, targetFileName, outPath string) error {
 			return err
 		}
 	}
-	return fmt.Errorf("file %s not found in tar.gz", targetFileName)
+	return fmt.Errorf("файл %s отсутствует внутри архива tar.gz", targetFileName)
 }
 
 func replaceFileCrossDevice(src, dst string) error {
@@ -417,10 +479,8 @@ func replaceFileCrossDevice(src, dst string) error {
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	sbStatus := m.checkPinnedSingBoxStatus()
 	if sbStatus.HasUpdate || !sbStatus.Installed {
-		log.Printf("[INFO] Upgrading sing-box to pinned version %s...", TargetSingBoxVersion)
 		return m.UpgradeSingBoxCore(ctx)
 	}
-	log.Printf("[INFO] sing-box is already at pinned version %s (or newer)", TargetSingBoxVersion)
 	return nil
 }
 
@@ -434,7 +494,7 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api request failed")
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("запрос к GitHub API завершился ошибкой")
 	}
 	defer resp.Body.Close()
 
@@ -485,7 +545,7 @@ func (m *Manager) fetchExpectedSHA256(ctx context.Context, checksumsURL, filenam
 	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to download checksums: %v", err)
+		return "", fmt.Errorf("не удалось загрузить sha256 контрольные суммы: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -521,21 +581,38 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
 	if !strings.EqualFold(actualHash, expectedHash) {
-		return fmt.Errorf("sha256 mismatch: expected %s, got %s", expectedHash, actualHash)
+		return fmt.Errorf("несовпадение sha256: ожидался %s, получен %s", expectedHash, actualHash)
 	}
 
-	log.Printf("[INFO] SHA256 verified successfully (%s)", actualHash)
+	log.Printf("[INFO] Контрольная сумма SHA256 проверена успешно (%s)", actualHash)
 	return nil
 }
 
 func (m *Manager) UpgradePackage(ctx context.Context) error {
-	tag, pkgAsset, binAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
-	if err != nil {
+	// 1. Проверка места для пакета cheburnet
+	const minPkgTmpSpace = 15 * 1024 * 1024  // 15 МБ в /tmp
+	const minOverlaySpace = 10 * 1024 * 1024 // 10 МБ в /overlay
+
+	if err := ensureSpace("/tmp", minPkgTmpSpace, "загрузки обновления в /tmp"); err != nil {
 		return err
 	}
 
+	// Проверяем /overlay (при отсутствии проверяем корень /)
+	destCheck := "/overlay"
+	if _, err := os.Stat(destCheck); err != nil {
+		destCheck = "/"
+	}
+	if err := ensureSpace(destCheck, minOverlaySpace, "установки в системный раздел"); err != nil {
+		return err
+	}
+
+	tag, pkgAsset, binAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
+	if err != nil {
+		return fmt.Errorf("сбой поиска релиза: %w", err)
+	}
+
 	const uciCfgPath = "/etc/config/cheburnet"
-	backupCfgPath := filepath.Join(os.TempDir(), "cheburnet_uci_preserved.bak")
+	backupCfgPath := "/tmp/cheburnet_uci_preserved.bak"
 
 	savedConfig := false
 	if cfgData, readErr := os.ReadFile(uciCfgPath); readErr == nil && len(cfgData) > 0 {
@@ -556,46 +633,47 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		currData, currErr := os.ReadFile(uciCfgPath)
 		if currErr != nil || len(currData) != len(backupData) {
 			_ = os.WriteFile(uciCfgPath, backupData, 0644)
-			log.Println("[INFO] User configuration /etc/config/cheburnet restored")
+			log.Println("[INFO] Пользовательская конфигурация /etc/config/cheburnet восстановлена")
 		}
 	}
 
 	if pkgAsset.URL != "" {
-		log.Printf("[INFO] Downloading %s package: %s", m.pkgManager, pkgAsset.URL)
-		tmpFile := filepath.Join(os.TempDir(), pkgAsset.Name)
+		log.Printf("[INFO] Загрузка %s пакета: %s", m.pkgManager, pkgAsset.URL)
+		tmpFile := filepath.Join("/tmp", pkgAsset.Name)
 		defer os.Remove(tmpFile)
 
 		if err := m.downloadFile(ctx, pkgAsset.URL, tmpFile); err != nil {
-			return fmt.Errorf("download package failed: %w", err)
+			return fmt.Errorf("ошибка скачивания пакета: %w", err)
 		}
 
 		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
 		if err := m.verifyFileSHA256(tmpFile, expectedHash); err != nil {
-			return fmt.Errorf("security verification failed: %w", err)
+			return fmt.Errorf("ошибка проверки безопасности: %w", err)
 		}
 
 		var cmd *exec.Cmd
 		if m.pkgManager == "apk" {
 			cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", tmpFile)
 		} else {
-			cmd = exec.CommandContext(ctx, "opkg", "install", "--force-reinstall", tmpFile)
+			// Направляем распаковку opkg строго в /tmp
+			cmd = exec.CommandContext(ctx, "opkg", "--tmp-dir", "/tmp", "install", "--force-reinstall", tmpFile)
 		}
 
 		out, err := cmd.CombinedOutput()
 		restoreConfigIfNeeded()
 
 		if err != nil {
-			return fmt.Errorf("%s install failed: %s", m.pkgManager, string(out))
+			return fmt.Errorf("установка через %s завершилась сбоем: %s", m.pkgManager, string(out))
 		}
 
-		log.Printf("[INFO] %s package successfully updated", m.pkgManager)
+		log.Printf("[INFO] Пакет %s успешно обновлен", m.pkgManager)
 		m.currentVer = tag
 		return nil
 	}
 
 	if binAsset.URL != "" {
-		log.Printf("[INFO] Package not found. Fallback to raw binary: %s", binAsset.URL)
-		tmpBin := filepath.Join(os.TempDir(), binAsset.Name)
+		log.Printf("[INFO] Пакет не найден. Fallback к бинарному файлу: %s", binAsset.URL)
+		tmpBin := filepath.Join("/tmp", binAsset.Name)
 		defer os.Remove(tmpBin)
 
 		if err := m.downloadFile(ctx, binAsset.URL, tmpBin); err != nil {
@@ -604,12 +682,11 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 
 		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, binAsset.Name)
 		if err := m.verifyFileSHA256(tmpBin, expectedHash); err != nil {
-			return fmt.Errorf("security verification failed: %w", err)
+			return fmt.Errorf("ошибка проверки безопасности: %w", err)
 		}
 
 		_ = os.Chmod(tmpBin, 0755)
 
-		// Обновляем все пути размещения бинарника, используемые в procd и PATH
 		destinations := []string{"/usr/bin/cheburnetd", "/bin/cheburnetd"}
 		if currPath, err := os.Executable(); err == nil {
 			if resolved, err := filepath.EvalSymlinks(currPath); err == nil {
@@ -622,14 +699,14 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 			if _, statErr := os.Stat(dest); statErr == nil {
 				if err := replaceFileCrossDevice(tmpBin, dest); err == nil {
 					replacedAny = true
-					log.Printf("[INFO] Binary replaced at %s", dest)
+					log.Printf("[INFO] Бинарник заменен в %s", dest)
 				}
 			}
 		}
 
 		if !replacedAny {
 			if err := replaceFileCrossDevice(tmpBin, "/usr/bin/cheburnetd"); err != nil {
-				return fmt.Errorf("replace binary failed: %w", err)
+				return fmt.Errorf("не удалось перезаписать исполняемый файл: %w", err)
 			}
 		}
 
@@ -638,7 +715,7 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		return nil
 	}
 
-	return fmt.Errorf("no matching release asset found for arch %s", m.targetArch)
+	return fmt.Errorf("не найден подходящий релизный файл для архитектуры %s", m.targetArch)
 }
 
 func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) error {
@@ -649,7 +726,7 @@ func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) erro
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download error (status: %d)", resp.StatusCode)
+		return fmt.Errorf("ошибка HTTP-загрузки (код: %d)", resp.StatusCode)
 	}
 	defer resp.Body.Close()
 
@@ -667,7 +744,7 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	m.mu.Lock()
 	if m.isUpgrading {
 		m.mu.Unlock()
-		return fmt.Errorf("upgrade already in progress")
+		return fmt.Errorf("процесс обновления уже выполняется")
 	}
 	m.isUpgrading = true
 	m.mu.Unlock()
@@ -684,10 +761,15 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	case "cheburnet":
 		return m.UpgradePackage(ctx)
 	case "all":
-		_ = m.UpgradeSingBoxCore(ctx)
-		return m.UpgradePackage(ctx)
+		if err := m.UpgradeSingBoxCore(ctx); err != nil {
+			return fmt.Errorf("ошибка обновления ядра sing-box: %w", err)
+		}
+		if err := m.UpgradePackage(ctx); err != nil {
+			return fmt.Errorf("ошибка обновления cheburnet: %w", err)
+		}
+		return nil
 	default:
-		return fmt.Errorf("unknown target: %s", target)
+		return fmt.Errorf("неизвестная цель обновления: %s", target)
 	}
 }
 
@@ -715,7 +797,7 @@ func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled f
 			checkCancel()
 
 			if err != nil {
-				log.Printf("[updater] Auto-check failed: %v", err)
+				log.Printf("[updater] Сбой фоновой проверки обновлений: %v", err)
 				return
 			}
 
@@ -724,18 +806,18 @@ func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled f
 				return
 			}
 
-			log.Printf("[updater] Auto-update triggered! Components: CheburNet=%v, SingBox=%v",
+			log.Printf("[updater] Инициализация автообновления: CheburNet=%v, SingBox=%v",
 				report.CheburNet.HasUpdate, report.SingBox.HasUpdate)
 
 			upgCtx, upgCancel := context.WithTimeout(ctx, 5*time.Minute)
 			defer upgCancel()
 
 			if err := m.PerformUpgrade(upgCtx, "all"); err != nil {
-				log.Printf("[updater] Auto-upgrade failed: %v", err)
+				log.Printf("[updater] Ошибка автообновления: %v", err)
 				return
 			}
 
-			log.Println("[updater] Auto-upgrade completed successfully.")
+			log.Println("[updater] Автообновление успешно завершено.")
 			if onUpdateSuccess != nil {
 				onUpdateSuccess()
 			}

@@ -274,6 +274,17 @@ return view.extend({
                     delete window.cheburProblems[msg.problem_id];
                     renderProblemsCards();
                     updateBannerContent();
+                } else if (msg.type === 'upgrade_error' && msg.error) {
+                    ui.addNotification(null, E('p', {}, _('Ошибка обновления: ') + msg.error), 'error');
+                    var b = document.getElementById('update-notification-banner');
+                    var txt = document.getElementById('update-banner-text');
+                    if (b && txt) {
+                        b.style.display = 'flex';
+                        b.style.background = 'rgba(239, 68, 68, 0.15)';
+                        b.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                        b.style.color = '#f87171';
+                        txt.innerHTML = '✖ <strong>Сбой:</strong> ' + msg.error;
+                    }
                 }
             }
 
@@ -332,27 +343,41 @@ return view.extend({
                 E('span', { 'id': 'update-banner-text', 'style': 'font-size: 13px; font-weight: 500;' }, ''),
                 E('button', {
                     'class': 'btn cbi-button-action',
+                    'id': 'btn-run-update-banner',
                     'style': 'font-size: 12px; margin: 0; padding: 4px 12px;',
                     'click': function(e) {
                         e.preventDefault();
-                        ui.showIndicator('updating-system', _('Выполняется обновление компонентов...'));
+                        var btn = this;
+                        btn.disabled = true;
+                        ui.showIndicator('updating-system', _('Проверка свободного места и установка обновлений...'));
+
                         fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ target: 'all' })
                         })
                         .then(function(r) { return r.json(); })
-                        .then(function() {
+                        .then(function(data) {
                             ui.hideIndicator('updating-system');
-                            ui.addNotification(null, E('p', {}, _('Процесс обновления запущен в фоне.')), 'info');
-                            var b = document.getElementById('update-notification-banner');
-                            if (b) {
-                                b.style.display = 'none';
+                            btn.disabled = false;
+                            if (data && data.error) {
+                                ui.addNotification(null, E('p', {}, _('Ошибка установки: ') + data.error), 'error');
+                                var txt = document.getElementById('update-banner-text');
+                                var b = document.getElementById('update-notification-banner');
+                                if (b && txt) {
+                                    b.style.background = 'rgba(239, 68, 68, 0.15)';
+                                    b.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                                    b.style.color = '#f87171';
+                                    txt.innerHTML = '✖ <strong>Сбой:</strong> ' + data.error;
+                                }
+                            } else {
+                                ui.addNotification(null, E('p', {}, _('Процесс обновления успешно запущен в фоне.')), 'info');
                             }
                         })
                         .catch(function(err) {
                             ui.hideIndicator('updating-system');
-                            ui.addNotification(null, E('p', {}, _('Ошибка запуска: ') + err), 'error');
+                            btn.disabled = false;
+                            ui.addNotification(null, E('p', {}, _('Сетевая ошибка: ') + err), 'error');
                         });
                     }
                 }, _('Обновить сейчас'))
@@ -450,6 +475,9 @@ return view.extend({
                     if (banner && txt) {
                         txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
                         banner.style.display = 'flex';
+                        banner.style.background = 'rgba(234, 179, 8, 0.15)';
+                        banner.style.borderColor = 'rgba(234, 179, 8, 0.4)';
+                        banner.style.color = '#fef08a';
                     }
                 }
             }
@@ -489,7 +517,6 @@ return view.extend({
                     .catch(function() {});
             }
 
-            // Статичная подсветка: selectedTag определяет строку в таблице, subResolvedTag - реальный выход
             function highlightActiveNode(selectedTag, subResolvedTag) {
                 if (!selectedTag) {
                     return;
@@ -609,7 +636,6 @@ return view.extend({
                     statusEl.innerHTML = '<span style="color: #f87171; font-weight: bold;">● Офлайн</span>';
                 }
 
-                // Синхронизируем показатели в верхней плашке
                 if (tag === window.cheburActiveNodeTag || (window.cheburActiveNodeTag === 'auto' && tag === 'auto')) {
                     var cardLat = document.getElementById('active-server-lat');
                     var cardBadge = document.getElementById('active-server-badge');
@@ -654,7 +680,6 @@ return view.extend({
                         var autoGroup = data.proxies['auto'] || data.proxies['AUTO'];
                         var autoCurrentBest = (autoGroup && autoGroup.now) ? autoGroup.now : '';
 
-                        // Проверяем текущий выбор: auto или ручная нода
                         if (proxyGroup && proxyGroup.now) {
                             if (proxyGroup.now === 'auto' || proxyGroup.now === 'AUTO') {
                                 highlightActiveNode('auto', autoCurrentBest);
@@ -663,7 +688,6 @@ return view.extend({
                             }
                         }
 
-                        // Обновляем задержку строки "auto" по выбранному ею узлу
                         var autoDelay = 0;
                         if (autoCurrentBest && data.proxies[autoCurrentBest]) {
                             var bestInfo = data.proxies[autoCurrentBest];
@@ -720,7 +744,6 @@ return view.extend({
                             ipEl.textContent = data.outbound_ip;
                         }
 
-                        // Если уже выбран режим auto - не позволяем backend-статусу сбрасывать подсветку строки
                         if (data.active_node && !window.cheburActiveNodeTag) {
                             highlightActiveNode(data.active_node, '');
                         }
@@ -753,7 +776,6 @@ return view.extend({
                 ws.onmessage = function(event) {
                     try {
                         var msg = JSON.parse(event.data);
-                        // Не перебиваем режим auto при получении физического имени ноды через WS
                         if (msg.active_node && window.cheburActiveNodeTag !== 'auto') {
                             highlightActiveNode(msg.active_node, '');
                         }
@@ -886,9 +908,31 @@ return view.extend({
                 btnUpgrade.style.display = 'none';
             }
 
-            if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
-                window.cheburWs.send(JSON.stringify({ action: 'perform_upgrade', target: 'all' }));
-            }
+            fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target: 'all' })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data && data.error) {
+                    if (statusDiv) {
+                        statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сбой: ' + data.error + '</span>';
+                    }
+                    if (btnUpgrade) {
+                        btnUpgrade.style.display = 'inline-block';
+                    }
+                    ui.addNotification(null, E('p', {}, _('Ошибка обновления: ') + data.error), 'error');
+                }
+            })
+            .catch(function(err) {
+                if (statusDiv) {
+                    statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сетевая ошибка: ' + err + '</span>';
+                }
+                if (btnUpgrade) {
+                    btnUpgrade.style.display = 'inline-block';
+                }
+            });
         };
 
         // ==========================================
@@ -1003,7 +1047,7 @@ return view.extend({
         subSec.anonymous = true;
         subSec.addremove = true;
         subSec.sortable = true;
-        wrapGridSectionInDetails(subSec, _('▶ Таблица ссылок подписок'), null, true);
+        wrapGridSectionInDetails(subSec, _('▶ Таблица ссылок подписок'), null, false);
 
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
