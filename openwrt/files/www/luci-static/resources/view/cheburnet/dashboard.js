@@ -7,31 +7,31 @@
 'require tools.widgets as widgets';
 
 const ALLOW_DOMAIN_CATEGORIES = [
-    { tag: 'anime',          title: 'Anime (44)' },
-    { tag: 'block',          title: 'Block (337)' },
-    { tag: 'cloudflare',     title: 'Cloudflare (4)' },
-    { tag: 'cloudfront',     title: 'CloudFront (1)' },
-    { tag: 'digitalocean',   title: 'DigitalOcean (1)' },
-    { tag: 'discord',        title: 'Discord (20)' },
-    { tag: 'geoblock',       title: 'Geoblock (466)' },
-    { tag: 'google_ai',      title: 'Google AI (28)' },
-    { tag: 'google_meet',    title: 'Google Meet (5)' },
-    { tag: 'google_play',    title: 'Google Play (12)' },
-    { tag: 'hdrezka',        title: 'HDRezka (17)' },
-    { tag: 'hetzner',        title: 'Hetzner (1)' },
-    { tag: 'hodca',          title: 'Hodca (251)' },
-    { tag: 'meta',           title: 'Meta (18)' },
-    { tag: 'news',           title: 'News (186)' },
-    { tag: 'ovh',            title: 'OVH (1)' },
-    { tag: 'porn',           title: 'Porn (51)' },
-    { tag: 'roblox',         title: 'Roblox (4)' },
-    { tag: 'russia_inside',  title: 'Russia Inside / РКН (1183)' },
-    { tag: 'russia_outside', title: 'Russia Outside (39)' },
-    { tag: 'telegram',       title: 'Telegram (20)' },
-    { tag: 'tiktok',         title: 'TikTok (16)' },
-    { tag: 'twitter',        title: 'Twitter / X (23)' },
-    { tag: 'ukraine_inside', title: 'Ukraine Inside (1551)' },
-    { tag: 'youtube',        title: 'YouTube (18)' }
+    { tag: 'anime',          title: 'Anime' },
+    { tag: 'block',          title: 'Block' },
+    { tag: 'cloudflare',     title: 'Cloudflare' },
+    { tag: 'cloudfront',     title: 'CloudFront' },
+    { tag: 'digitalocean',   title: 'DigitalOcean' },
+    { tag: 'discord',        title: 'Discord' },
+    { tag: 'geoblock',       title: 'Geoblock' },
+    { tag: 'google_ai',      title: 'Google AI' },
+    { tag: 'google_meet',    title: 'Google Meet' },
+    { tag: 'google_play',    title: 'Google Play' },
+    { tag: 'hdrezka',        title: 'HDRezka' },
+    { tag: 'hetzner',        title: 'Hetzner' },
+    { tag: 'hodca',          title: 'Hodca' },
+    { tag: 'meta',           title: 'Meta' },
+    { tag: 'news',           title: 'News' },
+    { tag: 'ovh',            title: 'OVH' },
+    { tag: 'porn',           title: 'Porn' },
+    { tag: 'roblox',         title: 'Roblox' },
+    { tag: 'russia_inside',  title: 'Russia Inside / РКН' },
+    { tag: 'russia_outside', title: 'Russia Outside' },
+    { tag: 'telegram',       title: 'Telegram' },
+    { tag: 'tiktok',         title: 'TikTok' },
+    { tag: 'twitter',        title: 'Twitter / X' },
+    { tag: 'ukraine_inside', title: 'Ukraine Inside' },
+    { tag: 'youtube',        title: 'YouTube' }
 ];
 
 return view.extend({
@@ -53,20 +53,11 @@ return view.extend({
         statusSec.render = function() {
             window.cheburProblems = {};
             window.cheburLastDiagSnapshot = null;
-            window.cheburLastDiagTime = null;
 
             let isSyncingDelays = false;
             let syncIntervalId = null;
-            let bannerIntervalId = null;
-
-            function formatRelativeTime(timestampMs) {
-                if (!timestampMs) return _('только что');
-                const diffSec = Math.max(0, Math.floor((Date.now() - timestampMs) / 1000));
-                if (diffSec < 2) return _('только что');
-                if (diffSec < 60) return `${diffSec} сек назад`;
-                const diffMin = Math.floor(diffSec / 60);
-                return `${diffMin} мин назад`;
-            }
+            let diagPollIntervalId = null;
+            let statusPollIntervalId = null;
 
             function updateBannerContent() {
                 const banner = document.getElementById('diag-banner');
@@ -74,7 +65,7 @@ return view.extend({
                 if (!banner || !content) return;
 
                 const snap = window.cheburLastDiagSnapshot;
-                if (!snap || !snap.ready) {
+                if (!snap) {
                     banner.style.background = 'rgba(255, 255, 255, 0.05)';
                     banner.style.borderColor = 'rgba(255, 255, 255, 0.15)';
                     banner.style.color = '#a1a1aa';
@@ -82,14 +73,13 @@ return view.extend({
                     return;
                 }
 
-                const relTime = formatRelativeTime(window.cheburLastDiagTime);
                 const pList = Object.values(window.cheburProblems || {});
 
                 if (pList.length === 0) {
                     banner.style.background = 'rgba(74, 222, 128, 0.1)';
                     banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
                     banner.style.color = '#4ade80';
-                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 15}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
+                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 15}</strong>`;
                     const container = document.getElementById('diag-problems-container');
                     if (container) container.innerHTML = '';
                     return;
@@ -100,7 +90,7 @@ return view.extend({
                 banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
                 banner.style.color = hasCrit ? '#f87171' : '#fef08a';
 
-                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong> &middot; последняя проверка <strong>${relTime}</strong>`;
+                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong>`;
             }
 
             function executeProblemAction(action, btnEl) {
@@ -122,19 +112,7 @@ return view.extend({
                 })
                 .then(() => {
                     btnEl.textContent = _('Запрос отправлен');
-                    setTimeout(() => {
-                        const subCtrl = new AbortController();
-                        const subTid = setTimeout(() => subCtrl.abort(), 4000);
-                        fetch('http://' + window.location.hostname + ':8088/api/v1/diagnostics', {
-                            signal: subCtrl.signal
-                        })
-                        .then(r => {
-                            clearTimeout(subTid);
-                            return r.json();
-                        })
-                        .then(renderDiagnosticSnapshot)
-                        .catch(() => {});
-                    }, 1200);
+                    setTimeout(fetchDiagnosticsOnce, 1200);
                 })
                 .catch(err => {
                     clearTimeout(timeoutId);
@@ -204,8 +182,6 @@ return view.extend({
                 if (!snap) return;
 
                 window.cheburLastDiagSnapshot = snap;
-                window.cheburLastDiagTime = snap.timestamp ? Date.parse(snap.timestamp) : Date.now();
-
                 window.cheburProblems = {};
                 if (snap.problems && Array.isArray(snap.problems)) {
                     snap.problems.forEach(p => {
@@ -217,6 +193,27 @@ return view.extend({
                 renderProblemsCards();
             }
 
+            function fetchDiagnosticsOnce() {
+                const host = window.location.hostname;
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 3500);
+
+                fetch('http://' + host + ':8088/api/v1/diagnostics', {
+                    signal: controller.signal
+                })
+                .then(r => {
+                    clearTimeout(timeoutId);
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(snap => {
+                    renderDiagnosticSnapshot(snap);
+                })
+                .catch(() => {
+                    clearTimeout(timeoutId);
+                });
+            }
+
             function handleWsEvent(msg) {
                 if (!msg || !msg.type) return;
 
@@ -224,12 +221,10 @@ return view.extend({
                     renderDiagnosticSnapshot(msg.snapshot);
                 } else if ((msg.type === 'diagnostic.problem_created' || msg.type === 'diagnostic.problem_updated') && msg.problem) {
                     window.cheburProblems[msg.problem.id] = msg.problem;
-                    window.cheburLastDiagTime = Date.now();
                     renderProblemsCards();
                     updateBannerContent();
                 } else if (msg.type === 'diagnostic.problem_resolved' && msg.problem_id) {
                     delete window.cheburProblems[msg.problem_id];
-                    window.cheburLastDiagTime = Date.now();
                     renderProblemsCards();
                     updateBannerContent();
                 }
@@ -554,6 +549,37 @@ return view.extend({
                     });
             }
 
+            function syncRealtimeStatus() {
+                const host = window.location.hostname;
+                fetch('http://' + host + ':8088/api/v1/status')
+                    .then(r => r.json())
+                    .then(data => {
+                        const statusEl = document.getElementById('daemon-status');
+                        if (statusEl) {
+                            statusEl.textContent = '● Онлайн';
+                            statusEl.style.color = '#4ade80';
+                        }
+                        const countEl = document.getElementById('total-nodes');
+                        if (countEl && data.nodes_count !== undefined) {
+                            countEl.textContent = data.nodes_count;
+                        }
+                        const ipEl = document.getElementById('outbound-ip');
+                        if (ipEl && data.outbound_ip) {
+                            ipEl.textContent = data.outbound_ip;
+                        }
+                        if (data.active_node) {
+                            highlightActiveNode(data.active_node);
+                        }
+                    })
+                    .catch(() => {
+                        const statusEl = document.getElementById('daemon-status');
+                        if (statusEl) {
+                            statusEl.textContent = '● Офлайн';
+                            statusEl.style.color = '#f87171';
+                        }
+                    });
+            }
+
             function connectWebSocket(host) {
                 if (window.cheburWs && (window.cheburWs.readyState === WebSocket.OPEN || window.cheburWs.readyState === WebSocket.CONNECTING)) {
                     return;
@@ -610,7 +636,8 @@ return view.extend({
                 const tbl = document.getElementById('chebur-nodes-table');
 
                 if (syncIntervalId) clearInterval(syncIntervalId);
-                if (bannerIntervalId) clearInterval(bannerIntervalId);
+                if (diagPollIntervalId) clearInterval(diagPollIntervalId);
+                if (statusPollIntervalId) clearInterval(statusPollIntervalId);
 
                 fetch('http://' + host + ':8088/api/v1/nodes')
                     .then(r => r.json())
@@ -652,62 +679,16 @@ return view.extend({
                         });
 
                         setTimeout(syncClashDelays, 800);
-
-                        fetch('http://' + host + ':8088/api/v1/status')
-                            .then(r => r.json())
-                            .then(data => {
-                                if (data && data.active_node) {
-                                    highlightActiveNode(data.active_node);
-                                }
-                            })
-                            .catch(() => {});
                     })
                     .catch(e => console.error('Nodes fetch error:', e));
 
-                fetch('http://' + host + ':8088/api/v1/status')
-                    .then(r => r.json())
-                    .then(data => {
-                        const countEl = document.getElementById('total-nodes');
-                        if (countEl && data.nodes_count !== undefined) {
-                            countEl.textContent = data.nodes_count;
-                        }
-                        if (data.active_node) {
-                            highlightActiveNode(data.active_node);
-                        }
-                    })
-                    .catch(() => {});
-
-                fetch('https://api.ipify.org?format=json')
-                    .then(r => r.json())
-                    .then(data => {
-                        const ipEl = document.getElementById('outbound-ip');
-                        if (ipEl && data.ip) {
-                            ipEl.textContent = data.ip;
-                        }
-                    })
-                    .catch(() => {
-                        const ipEl = document.getElementById('outbound-ip');
-                        if (ipEl) ipEl.textContent = 'Не определен';
-                    });
-
-                const diagInitCtrl = new AbortController();
-                const diagInitTid = setTimeout(() => diagInitCtrl.abort(), 4000);
-                fetch('http://' + host + ':8088/api/v1/diagnostics', {
-                    signal: diagInitCtrl.signal
-                })
-                .then(r => {
-                    clearTimeout(diagInitTid);
-                    return r.json();
-                })
-                .then(renderDiagnosticSnapshot)
-                .catch(() => {
-                    clearTimeout(diagInitTid);
-                });
-
+                syncRealtimeStatus();
+                fetchDiagnosticsOnce();
                 connectWebSocket(host);
 
                 syncIntervalId = setInterval(syncClashDelays, 5000);
-                bannerIntervalId = setInterval(updateBannerContent, 2000);
+                statusPollIntervalId = setInterval(syncRealtimeStatus, 5000);
+                diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 4000);
                 setTimeout(checkUpdates, 1500);
             }
 
