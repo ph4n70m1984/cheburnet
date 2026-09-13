@@ -686,9 +686,9 @@ return view.extend({
                 fetchDiagnosticsOnce();
                 connectWebSocket(host);
 
-                syncIntervalId = setInterval(syncClashDelays, 5000);
-                statusPollIntervalId = setInterval(syncRealtimeStatus, 5000);
-                diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 4000);
+                syncIntervalId = setInterval(syncClashDelays, 15000);
+                statusPollIntervalId = setInterval(syncRealtimeStatus, 15000);
+                diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 14000);
                 setTimeout(checkUpdates, 1500);
             }
 

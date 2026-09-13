@@ -119,6 +119,37 @@ func detectTargetArch(pkgMgr string) string {
 	}
 }
 
+// parseSemVer парсит версии вида 1.1.0, 0.0.8.15, v1.1.0-singbox
+func parseSemVer(v string) []int {
+	v = strings.TrimPrefix(v, "v")
+	if idx := strings.Index(v, "-"); idx != -1 {
+		v = v[:idx]
+	}
+	parts := strings.Split(v, ".")
+	res := make([]int, 4)
+	for i := 0; i < len(parts) && i < 4; i++ {
+		val, _ := strconv.Atoi(parts[i])
+		res[i] = val
+	}
+	return res
+}
+
+// isNewerVersion возвращает true только если remote строго новее, чем current
+func isNewerVersion(remote, current string) bool {
+	r := parseSemVer(remote)
+	c := parseSemVer(current)
+
+	for i := 0; i < len(r); i++ {
+		if r[i] > c[i] {
+			return true
+		}
+		if r[i] < c[i] {
+			return false
+		}
+	}
+	return false
+}
+
 func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateReport, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -134,7 +165,8 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	if err == nil {
 		cleanLatest := strings.TrimPrefix(latestTag, "v")
 		chStatus.Latest = cleanLatest
-		chStatus.HasUpdate = cleanLatest != "" && cleanLatest != chStatus.Current
+		// Проверяем, что релиз на GitHub действительно новее локальной версии
+		chStatus.HasUpdate = cleanLatest != "" && isNewerVersion(cleanLatest, chStatus.Current)
 	}
 
 	report := &UpdateReport{
@@ -575,15 +607,30 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 			return fmt.Errorf("security verification failed: %w", err)
 		}
 
-		currPath, err := os.Executable()
-		if err != nil {
-			currPath = "/usr/bin/cheburnetd"
-		}
-		currPath, _ = filepath.EvalSymlinks(currPath)
-
 		_ = os.Chmod(tmpBin, 0755)
-		if err := replaceFileCrossDevice(tmpBin, currPath); err != nil {
-			return fmt.Errorf("replace binary failed: %w", err)
+
+		// Обновляем все пути размещения бинарника, используемые в procd и PATH
+		destinations := []string{"/usr/bin/cheburnetd", "/bin/cheburnetd"}
+		if currPath, err := os.Executable(); err == nil {
+			if resolved, err := filepath.EvalSymlinks(currPath); err == nil {
+				destinations = append(destinations, resolved)
+			}
+		}
+
+		replacedAny := false
+		for _, dest := range destinations {
+			if _, statErr := os.Stat(dest); statErr == nil {
+				if err := replaceFileCrossDevice(tmpBin, dest); err == nil {
+					replacedAny = true
+					log.Printf("[INFO] Binary replaced at %s", dest)
+				}
+			}
+		}
+
+		if !replacedAny {
+			if err := replaceFileCrossDevice(tmpBin, "/usr/bin/cheburnetd"); err != nil {
+				return fmt.Errorf("replace binary failed: %w", err)
+			}
 		}
 
 		restoreConfigIfNeeded()
