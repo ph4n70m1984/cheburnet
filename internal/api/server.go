@@ -128,6 +128,13 @@ func (s *Server) setupRoutes() {
 		s.hub.Register(c)
 		defer s.hub.Unregister(c)
 
+		c.SetReadLimit(4096)
+		_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.SetPongHandler(func(string) error {
+			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+			return nil
+		})
+
 		for {
 			var msg struct {
 				Action string `json:"action"`
@@ -137,6 +144,7 @@ func (s *Server) setupRoutes() {
 			if err := c.ReadJSON(&msg); err != nil {
 				break
 			}
+			_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 			switch msg.Action {
 			case "check_updates":
@@ -147,7 +155,7 @@ func (s *Server) setupRoutes() {
 
 					report, err := s.updater.CheckUpdates(ctx, cfg.AutoUpdate)
 					if err == nil {
-						_ = conn.WriteJSON(map[string]interface{}{
+						_ = s.hub.SendJSON(conn, map[string]interface{}{
 							"type": "update_report",
 							"data": report,
 						})

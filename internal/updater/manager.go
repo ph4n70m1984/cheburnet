@@ -29,6 +29,8 @@ const (
 	SingBoxReleaseBase   = "https://github.com/shtorm-7/sing-box-extended/releases/download"
 )
 
+var sha256Regex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+
 type ComponentStatus struct {
 	Current   string `json:"current"`
 	Latest    string `json:"latest"`
@@ -73,12 +75,10 @@ func NewManager(repo, currentVer string) *Manager {
 
 // checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df
 func checkFreeSpaceBytes(path string) (uint64, error) {
-	// Вызываем `df -k <path>`, вывод гарантированно кроссплатформенный для Linux/Busybox
 	out, err := exec.Command("df", "-k", path).Output()
 	if err != nil {
-		// Fallback для сред разработки (например, Windows при сборке): не блокируем выполнение
 		if runtime.GOOS != "linux" {
-			return 1024 * 1024 * 1024, nil // 1 GB заглушка
+			return 1024 * 1024 * 1024, nil
 		}
 		return 0, fmt.Errorf("ошибка вызова df для %s: %w", path, err)
 	}
@@ -88,14 +88,11 @@ func checkFreeSpaceBytes(path string) (uint64, error) {
 		return 0, fmt.Errorf("неожиданный формат вывода df: %s", string(out))
 	}
 
-	// Последняя строка содержит данные раздела
 	fields := strings.Fields(lines[len(lines)-1])
-	// Формат обычно: Filesystem 1K-blocks Used Available Use% Mounted on
 	if len(fields) < 4 {
 		return 0, fmt.Errorf("не удалось распарсить поля df: %s", lines[len(lines)-1])
 	}
 
-	// 4-я колонка (индекс 3) — Available в килобайтах
 	availKb, err := strconv.ParseUint(fields[3], 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("ошибка парсинга доступного места: %w", err)
@@ -108,7 +105,6 @@ func checkFreeSpaceBytes(path string) (uint64, error) {
 func ensureSpace(path string, requiredBytes uint64, description string) error {
 	free, err := checkFreeSpaceBytes(path)
 	if err != nil {
-		// Если по какой-то причине не удалось проверить (путь еще не создан), пробуем /tmp
 		if path != "/tmp" {
 			return ensureSpace("/tmp", requiredBytes, description)
 		}
@@ -355,9 +351,8 @@ func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
 		return nil
 	}
 
-	// 1. Контроль памяти перед скачиванием
-	const minTmpSpace = 40 * 1024 * 1024  // 40 МБ в /tmp под tar.gz и распаковку
-	const minDestSpace = 25 * 1024 * 1024 // 25 МБ под бинарник в целевом каталоге
+	const minTmpSpace = 40 * 1024 * 1024
+	const minDestSpace = 25 * 1024 * 1024
 
 	if err := ensureSpace("/tmp", minTmpSpace, "временного каталога /tmp"); err != nil {
 		return err
@@ -382,7 +377,6 @@ func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
 
 	log.Printf("[INFO] Загрузка sing-box-extended %s в /tmp...", tag)
 
-	// Гарантированно создаем временную директорию строго в /tmp
 	tmpDir, err := os.MkdirTemp("/tmp", "sb_install_*")
 	if err != nil {
 		return fmt.Errorf("не удалось создать временную директорию в /tmp: %w", err)
@@ -452,18 +446,13 @@ func extractFileFromTarGz(tarGzPath, targetFileName, outPath string) error {
 }
 
 func replaceFileCrossDevice(src, dst string) error {
-	// 1. Пытаемся сделать атомарный rename (работает, если src и dst на одной FS)
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
 
-	// 2. Если файловые системы разные (cross-device: tmpfs -> overlayfs):
-	// Создаем временный файл СТРОГО в той же папке, что и dst
 	dstDir := filepath.Dir(dst)
 	tmpDst, err := os.CreateTemp(dstDir, ".bin_replace_*")
 	if err != nil {
-		// Если не удалось создать файл рядом (например, read-only или нет прав),
-		// пробуем удалить старый файл напрямую (разблокирует ETXTBSY)
 		_ = os.Remove(dst)
 		out, errCreate := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 		if errCreate != nil {
@@ -499,14 +488,11 @@ func replaceFileCrossDevice(src, dst string) error {
 	}
 	tmpDst.Close()
 
-	// Выставляем права на запуск
 	if err := os.Chmod(tmpDstPath, 0755); err != nil {
 		return err
 	}
 
-	// Атомарно подменяем запущенный файл (rename внутри одной FS overlayfs легален даже для запущенного процесса)
 	if err := os.Rename(tmpDstPath, dst); err != nil {
-		// Fallback: принудительный unlink перед заменой
 		_ = os.Remove(dst)
 		if errRetry := os.Rename(tmpDstPath, dst); errRetry != nil {
 			return fmt.Errorf("rename to target: %w", errRetry)
@@ -529,15 +515,20 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", releaseAsset{}, releaseAsset{}, "", err
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("create release request: %w", err)
 	}
 	req.Header.Set("User-Agent", "CheburNet-Updater")
 
 	resp, err := m.httpClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("запрос к GitHub API завершился ошибкой")
+	if err != nil {
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+	}
 
 	var rel struct {
 		TagName string `json:"tag_name"`
@@ -547,7 +538,7 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", releaseAsset{}, releaseAsset{}, "", err
+		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("decode github release response: %w", err)
 	}
 
 	tag = strings.TrimPrefix(rel.TagName, "v")
@@ -576,48 +567,63 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 }
 
 func (m *Manager) fetchExpectedSHA256(ctx context.Context, checksumsURL, filename string) (string, error) {
-	if checksumsURL == "" {
-		return "", nil
+	if strings.TrimSpace(checksumsURL) == "" {
+		return "", fmt.Errorf("манифест контрольных сумм sha256 отсутствует в релизе")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumsURL, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create checksums request: %w", err)
 	}
+	req.Header.Set("User-Agent", "CheburNet-Updater")
+
 	resp, err := m.httpClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("не удалось загрузить sha256 контрольные суммы: %v", err)
+	if err != nil {
+		return "", fmt.Errorf("failed to download checksums: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to download checksums: status code %d", resp.StatusCode)
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
-			baseName := filepath.Base(parts[1])
-			if baseName == filename || strings.TrimPrefix(parts[1], "*") == filename {
-				return strings.ToLower(parts[0]), nil
+			hashCandidate := strings.ToLower(parts[0])
+			baseName := filepath.Base(strings.TrimPrefix(parts[1], "*"))
+			if baseName == filename {
+				if !sha256Regex.MatchString(hashCandidate) {
+					return "", fmt.Errorf("некорректный формат sha256 хеша (%s) для %s", hashCandidate, filename)
+				}
+				return hashCandidate, nil
 			}
 		}
 	}
-	return "", nil
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan checksums file: %w", err)
+	}
+
+	return "", fmt.Errorf("контрольная сумма для файла %s не найдена в манифесте", filename)
 }
 
 func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
-	if expectedHash == "" {
-		return nil
+	expectedHash = strings.TrimSpace(strings.ToLower(expectedHash))
+	if !sha256Regex.MatchString(expectedHash) {
+		return fmt.Errorf("проверка отменена: не передан валидный 64-символьный SHA256")
 	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("не удалось открыть скачанный файл для проверки: %w", err)
 	}
 	defer file.Close()
 
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
-		return err
+		return fmt.Errorf("ошибка вычисления хеша: %w", err)
 	}
 
 	actualHash := hex.EncodeToString(hasher.Sum(nil))
@@ -630,15 +636,13 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 }
 
 func (m *Manager) UpgradePackage(ctx context.Context) error {
-	// 1. Проверка места для пакета cheburnet
-	const minPkgTmpSpace = 15 * 1024 * 1024  // 15 МБ в /tmp
-	const minOverlaySpace = 10 * 1024 * 1024 // 10 МБ в /overlay
+	const minPkgTmpSpace = 15 * 1024 * 1024
+	const minOverlaySpace = 10 * 1024 * 1024
 
 	if err := ensureSpace("/tmp", minPkgTmpSpace, "загрузки обновления в /tmp"); err != nil {
 		return err
 	}
 
-	// Проверяем /overlay (при отсутствии проверяем корень /)
 	destCheck := "/overlay"
 	if _, err := os.Stat(destCheck); err != nil {
 		destCheck = "/"
@@ -687,16 +691,18 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 			return fmt.Errorf("ошибка скачивания пакета: %w", err)
 		}
 
-		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
+		expectedHash, err := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
+		if err != nil {
+			return fmt.Errorf("проверка целостности заблокирована: %w", err)
+		}
 		if err := m.verifyFileSHA256(tmpFile, expectedHash); err != nil {
 			return fmt.Errorf("ошибка проверки безопасности: %w", err)
 		}
 
 		var cmd *exec.Cmd
 		if m.pkgManager == "apk" {
-			cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", tmpFile)
+			cmd = exec.CommandContext(ctx, "apk", "add", tmpFile)
 		} else {
-			// Направляем распаковку opkg строго в /tmp
 			cmd = exec.CommandContext(ctx, "opkg", "--tmp-dir", "/tmp", "install", "--force-reinstall", tmpFile)
 		}
 
@@ -721,7 +727,10 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 			return err
 		}
 
-		expectedHash, _ := m.fetchExpectedSHA256(ctx, checksumsURL, binAsset.Name)
+		expectedHash, err := m.fetchExpectedSHA256(ctx, checksumsURL, binAsset.Name)
+		if err != nil {
+			return fmt.Errorf("проверка целостности бинарника заблокирована: %w", err)
+		}
 		if err := m.verifyFileSHA256(tmpBin, expectedHash); err != nil {
 			return fmt.Errorf("ошибка проверки безопасности: %w", err)
 		}
@@ -762,23 +771,34 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("create download request: %w", err)
 	}
 
 	resp, err := m.httpClient.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ошибка HTTP-загрузки (код: %d)", resp.StatusCode)
+	if err != nil {
+		return fmt.Errorf("network request failed for %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		trimmed := strings.TrimSpace(string(errBody))
+		if trimmed != "" {
+			return fmt.Errorf("download error (status: %d): %s", resp.StatusCode, trimmed)
+		}
+		return fmt.Errorf("download error (status: %d)", resp.StatusCode)
+	}
+
 	out, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 	if err != nil {
-		return err
+		return fmt.Errorf("open target file %s: %w", targetPath, err)
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	if _, err = io.Copy(out, resp.Body); err != nil {
+		return fmt.Errorf("write payload to %s: %w", targetPath, err)
+	}
+	return nil
 }
 
 func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {

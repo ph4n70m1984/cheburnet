@@ -25,38 +25,57 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 	bypassOutputRule := ""
 
 	if isGlobalMode {
-		// В режиме Global VPN перехватываем весь не-локальный трафик
 		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr != @localv4 meta mark set %s counter", TableMark)
 		bypassOutputRule = fmt.Sprintf("ip daddr != @localv4 meta mark set %s counter", TableMark)
 	} else if len(subnets) > 0 {
-		// В режиме Rules перехватываем только указанные подсети
-		subnetElements = fmt.Sprintf(`
+		var validSubnets []string
+		for _, s := range subnets {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				validSubnets = append(validSubnets, s)
+			}
+		}
+
+		if len(validSubnets) > 0 {
+			subnetElements = fmt.Sprintf(`
 	set bypass_subnets {
 		type ipv4_addr
 		flags interval
 		auto-merge
 		elements = { %s }
-	}`, strings.Join(subnets, ", "))
+	}`, strings.Join(validSubnets, ", "))
 
-		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr @bypass_subnets meta mark set %s counter", TableMark)
-		bypassOutputRule = fmt.Sprintf("ip daddr @bypass_subnets meta mark set %s counter", TableMark)
+			bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr @bypass_subnets meta mark set %s counter", TableMark)
+			bypassOutputRule = fmt.Sprintf("ip daddr @bypass_subnets meta mark set %s counter", TableMark)
+		}
 	}
 
-	// Сет клиентов, чей весь трафик принудительно перенаправляется в прокси
 	clientSetElements := ""
 	clientMangleRule := ""
 	if len(fullProxyIPs) > 0 {
-		clientSetElements = fmt.Sprintf(`
+		var validClients []string
+		for _, ip := range fullProxyIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				validClients = append(validClients, ip)
+			}
+		}
+
+		if len(validClients) > 0 {
+			clientSetElements = fmt.Sprintf(`
 	set full_proxy_clients {
 		type ipv4_addr
 		flags interval
 		elements = { %s }
-	}`, strings.Join(fullProxyIPs, ", "))
+	}`, strings.Join(validClients, ", "))
 
-		clientMangleRule = fmt.Sprintf("iifname @interfaces ip saddr @full_proxy_clients ip daddr != @localv4 meta mark set %s counter", TableMark)
+			clientMangleRule = fmt.Sprintf("iifname @interfaces ip saddr @full_proxy_clients ip daddr != @localv4 meta mark set %s counter", TableMark)
+		}
 	}
 
 	tpl := `
+table inet %s
+delete table inet %s
 table inet %s {
 	set localv4 {
 		type ipv4_addr
@@ -101,6 +120,8 @@ table inet %s {
 `
 	rules := fmt.Sprintf(tpl,
 		TableName,
+		TableName,
+		TableName,
 		ifaceElements,
 		subnetElements,
 		clientSetElements,
@@ -116,15 +137,31 @@ table inet %s {
 		TableMark,
 	)
 
-	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = bytes.NewBufferString(rules)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("nft error: %w (output: %s)", err, string(out))
+	// 1. Проверка синтаксиса без применения (Dry-run)
+	checkCmd := exec.Command("nft", "-c", "-f", "-")
+	checkCmd.Stdin = bytes.NewBufferString(rules)
+	if out, err := checkCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft syntax check failed: %w (output: %s)", err, string(out))
 	}
+
+	// 2. Атомарное применение правил
+	applyCmd := exec.Command("nft", "-f", "-")
+	applyCmd.Stdin = bytes.NewBufferString(rules)
+	if out, err := applyCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft apply error: %w (output: %s)", err, string(out))
+	}
+
 	return nil
 }
 
 func FlushNFTRules() error {
-	_ = exec.Command("nft", "delete", "table", "inet", TableName).Run()
+	cmd := exec.Command("nft", "delete", "table", "inet", TableName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No such file or directory") {
+			return nil
+		}
+		return fmt.Errorf("flush nft rules error: %w (output: %s)", err, string(out))
+	}
 	return nil
 }
