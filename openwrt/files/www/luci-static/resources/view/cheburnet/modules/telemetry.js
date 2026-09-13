@@ -103,11 +103,90 @@ return baseclass.extend({
                 return;
             }
 
+            // Красный цвет баннера только для critical, для error/warning — янтарно-желтый
             var hasCrit = pList.some(function(p) { return p.severity === 'critical'; });
             banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
             banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
-            banner.style.color = hasCrit ? '#f87171' : '#fef08a';
+            banner.style.color = hasCrit ? '#f87171' : '#b45309';
             content.innerHTML = '▲ Обнаружены проблемы: <strong>' + pList.length + '</strong>';
+        }
+
+        function executeProblemAction(action, btnEl) {
+            if (!action) return;
+            btnEl.disabled = true;
+            btnEl.textContent = _('Выполняется...');
+
+            var controller = new AbortController();
+            var timeoutId = setTimeout(function() { controller.abort(); }, 6000);
+
+            fetch('http://' + window.location.hostname + ':8088/api/v1/actions/' + action, {
+                method: 'POST',
+                signal: controller.signal
+            })
+            .then(function(r) {
+                clearTimeout(timeoutId);
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function() {
+                btnEl.textContent = _('Запрос отправлен');
+                setTimeout(fetchDiagnosticsOnce, 1200);
+            })
+            .catch(function(err) {
+                clearTimeout(timeoutId);
+                btnEl.disabled = false;
+                btnEl.textContent = _('Ошибка');
+                ui.addNotification(null, E('p', {}, _('Ошибка вызова действия: ') + err), 'error');
+            });
+        }
+
+        function renderProblemsCards() {
+            var container = document.getElementById('diag-problems-container');
+            if (!container) return;
+            container.innerHTML = '';
+
+            var pList = Object.values(window.cheburProblems || {});
+            if (pList.length === 0) return;
+
+            pList.forEach(function(prob) {
+                var isCrit = (prob.severity === 'critical');
+                var cardBg = isCrit ? 'rgba(239, 68, 68, 0.1)' : 'rgba(234, 179, 8, 0.12)';
+                var cardBorder = isCrit ? '#ef4444' : '#eab308';
+                var msgColor = isCrit ? '#dc2626' : '#b45309';
+
+                var actionBtn = null;
+                if (prob.recoverable && prob.action) {
+                    actionBtn = E('button', {
+                        'class': 'btn cbi-button-action',
+                        'style': 'margin: 0; font-size: 11px; padding: 4px 12px; white-space: nowrap; font-weight: bold;',
+                        'click': function(e) {
+                            e.preventDefault();
+                            executeProblemAction(prob.action, this);
+                        }
+                    }, _('Исправить'));
+                }
+
+                var leftChildren = [
+                    E('div', { 'style': 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
+                        E('span', { 'style': 'font-weight: bold; font-size: 13px; color: ' + msgColor + ';' }, prob.message || 'Ошибка системы'),
+                        E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,0.08); color: #475569; font-weight: 600;' }, prob.component || 'система')
+                    ])
+                ];
+
+                var cardChildren = [
+                    E('div', { 'style': 'display: flex; flex-direction: column; gap: 4px;' }, leftChildren)
+                ];
+                if (actionBtn) {
+                    cardChildren.push(E('div', {}, [actionBtn]));
+                }
+
+                var card = E('div', {
+                    'id': 'problem-card-' + prob.id,
+                    'style': 'padding: 10px 14px; border-radius: 6px; background: ' + cardBg + '; border: 1px solid ' + cardBorder + '; display: flex; justify-content: space-between; align-items: center; gap: 15px; margin-bottom: 8px;'
+                }, cardChildren);
+
+                container.appendChild(card);
+            });
         }
 
         function renderDiagnosticSnapshot(snap) {
@@ -115,9 +194,14 @@ return baseclass.extend({
             window.cheburLastDiagSnapshot = snap;
             window.cheburProblems = {};
             if (snap.problems && Array.isArray(snap.problems)) {
-                snap.problems.forEach(function(p) { window.cheburProblems[p.id] = p; });
+                snap.problems.forEach(function(p, idx) {
+                    var pid = p.id || ('prob_' + idx);
+                    p.id = pid;
+                    window.cheburProblems[pid] = p;
+                });
             }
             updateBannerContent();
+            renderProblemsCards();
         }
 
         function fetchDiagnosticsOnce() {
@@ -234,6 +318,17 @@ return baseclass.extend({
                         self.showUpdateNotification(msg.data);
                         self.renderUpdateReport(msg.data);
                     }
+                    if (msg.type === 'diagnostic.snapshot' && msg.snapshot) {
+                        renderDiagnosticSnapshot(msg.snapshot);
+                    } else if ((msg.type === 'diagnostic.problem_created' || msg.type === 'diagnostic.problem_updated') && msg.problem) {
+                        window.cheburProblems[msg.problem.id] = msg.problem;
+                        renderProblemsCards();
+                        updateBannerContent();
+                    } else if (msg.type === 'diagnostic.problem_resolved' && msg.problem_id) {
+                        delete window.cheburProblems[msg.problem_id];
+                        renderProblemsCards();
+                        updateBannerContent();
+                    }
                     if (msg.type === 'upgrade_error' && msg.error) {
                         ui.addNotification(null, E('p', {}, _('Ошибка обновления: ') + msg.error), 'error');
                         var b = document.getElementById('update-notification-banner');
@@ -266,6 +361,11 @@ return baseclass.extend({
                 }
             }, _('Опросить'))
         ]);
+
+        var problemsContainer = E('div', {
+            'id': 'diag-problems-container',
+            'style': 'margin-bottom: 15px; display: flex; flex-direction: column; gap: 8px;'
+        });
 
         var updateBanner = E('div', {
             'id': 'update-notification-banner',
@@ -343,6 +443,7 @@ return baseclass.extend({
 
         var viewContainer = E('div', { 'class': 'cbi-section' }, [
             diagBanner,
+            problemsContainer,
             updateBanner,
             E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap;' }, [
                 E('div', { 'style': badgeStyle }, [
