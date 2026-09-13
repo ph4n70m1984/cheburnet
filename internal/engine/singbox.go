@@ -14,16 +14,22 @@ import (
 	"cheburnet/internal/engine/singbox"
 )
 
+type ConfigBuilder interface {
+	Build(cfg *config.CheburConfig, targetPath string) error
+}
+
 type SingBoxEngine struct {
-	builder *singbox.Builder
-	cmd     *exec.Cmd
-	cfg     *config.CheburConfig
-	mu      sync.Mutex
+	builder12 ConfigBuilder
+	builder14 ConfigBuilder
+	cmd       *exec.Cmd
+	cfg       *config.CheburConfig
+	mu        sync.Mutex
 }
 
 func NewSingBoxEngine() *SingBoxEngine {
 	return &SingBoxEngine{
-		builder: singbox.NewBuilder(),
+		builder12: singbox.NewBuilder(),
+		builder14: singbox.NewBuilderV14(),
 	}
 }
 
@@ -31,7 +37,6 @@ func (s *SingBoxEngine) Name() string {
 	return "sing-box"
 }
 
-// EnsureAssets проверяет наличие необходимых баз/ассетов для sing-box (no-op при встроенных базах)
 func (s *SingBoxEngine) EnsureAssets(ctx context.Context) error {
 	return nil
 }
@@ -40,7 +45,12 @@ func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string)
 	s.mu.Lock()
 	s.cfg = cfg
 	s.mu.Unlock()
-	return s.builder.Build(cfg, targetPath)
+
+	ver := singbox.DetectVersion("/usr/bin/sing-box")
+	if ver.Minor >= 13 {
+		return s.builder14.Build(cfg, targetPath)
+	}
+	return s.builder12.Build(cfg, targetPath)
 }
 
 func (s *SingBoxEngine) ValidateConfig(configPath string) error {

@@ -30,22 +30,18 @@ import (
 )
 
 var (
-	CheburVersion            = "1.0.0-dual"
+	CheburVersion            = "1.1.0-singbox"
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
-	RuntimeConfigPathXray    = "/tmp/run/cheburnet/xray.json"
 	DefaultAPIBind           = "0.0.0.0:8088"
-	DefaultClashShimPort     = 9090
 	PIDFile                  = "/var/run/cheburnetd.pid"
 )
 
 type App struct {
 	state         *config.StateManager
 	singboxEng    *engine.SingBoxEngine
-	xrayEng       *engine.XrayEngine
 	activeEng     engine.Engine
 	hub           *telemetry.Hub
 	server        *api.Server
-	clashShim     *api.ClashShimServer
 	rulesLoader   *network.CompressedRulesetLoader
 	rulesCron     *network.RulesetCron
 	healthTracker *engine.HealthTracker
@@ -63,22 +59,21 @@ func showHelp() {
 		"    reload                  Reload configuration without dropping routing\n" +
 		"    list_update             Update subscriptions and rulesets\n" +
 		"    check_updates           Check component and daemon updates\n" +
-		"    upgrade [target]        Run upgrade (target: all | cheburnet | cores | sing-box | xray)\n\n" +
+		"    upgrade [target]        Run upgrade (target: all | cheburnet | sing-box)\n\n" +
 		"Diagnostics & Network:\n" +
 		"    check_proxy             Check proxy connectivity through mixed port\n" +
 		"    check_nft               Check NFT rules presence\n" +
 		"    check_nft_rules         Check NFT mangle/proxy rule counters\n" +
-		"    check_engine            Check proxy engine (sing-box/xray) process status\n" +
+		"    check_engine            Check proxy engine (sing-box) process status\n" +
 		"    check_dns_available     Check local and upstream DNS availability\n" +
 		"    check_logs              Show journal logs filtered by cheburnet\n" +
 		"    global_check            Run end-to-end system diagnostic\n\n" +
 		"Inspection & Management:\n" +
 		"    show_config             Display parsed UCI configuration\n" +
-		"    show_engine_config      Show generated JSON config of the active engine\n" +
+		"    show_engine_config      Show generated JSON config of sing-box\n" +
 		"    show_version            Show Chebur.NET daemon version\n" +
 		"    get_status              Get daemon status (JSON)\n" +
-		"    get_system_info         Get device and OS specs (JSON)\n" +
-		"    switch_engine [name]    Switch active engine (sing-box | xray)\n")
+		"    get_system_info         Get device and OS specs (JSON)\n")
 }
 
 func main() {
@@ -117,15 +112,6 @@ func main() {
 		}
 		body := fmt.Sprintf(`{"target":"%s"}`, target)
 		callAPI(http.MethodPost, "/api/v1/updates/upgrade", strings.NewReader(body))
-
-	case "switch_engine":
-		if len(os.Args) < 3 {
-			fmt.Println("Error: engine name required (sing-box or xray)")
-			os.Exit(1)
-		}
-		targetEngine := strings.ToLower(strings.TrimSpace(os.Args[2]))
-		body := fmt.Sprintf(`{"engine":"%s","name":"%s"}`, targetEngine, targetEngine)
-		callAPI(http.MethodPost, "/api/v1/engine/switch", strings.NewReader(body))
 
 	case "check_proxy":
 		cliCheckProxy()
@@ -339,6 +325,7 @@ func runDaemon() {
 		log.Fatalf("[FATAL] Load config failed: %v", err)
 	}
 
+	initialConfig.Engine = "sing-box"
 	if initialConfig.RulesetUpdateInterval == "" {
 		initialConfig.RulesetUpdateInterval = "72h"
 	}
@@ -398,7 +385,6 @@ func runDaemon() {
 
 	state := config.NewStateManager(initialConfig)
 	sbEngine := engine.NewSingBoxEngine()
-	xrEngine := engine.NewXrayEngine()
 	hub := telemetry.NewHub()
 	healthTracker := engine.NewHealthTracker()
 	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
@@ -409,17 +395,11 @@ func runDaemon() {
 	app := &App{
 		state:         state,
 		singboxEng:    sbEngine,
-		xrayEng:       xrEngine,
+		activeEng:     sbEngine,
 		hub:           hub,
 		rulesLoader:   rulesLoader,
 		healthTracker: healthTracker,
 		diagEngine:    diagEngine,
-	}
-
-	if initialConfig.Engine == "xray" {
-		app.activeEng = xrEngine
-	} else {
-		app.activeEng = sbEngine
 	}
 
 	sourceIface := initialConfig.SourceIface
@@ -443,21 +423,8 @@ func runDaemon() {
 	defer daemonCancel()
 
 	if err := app.startActiveEngine(daemonCtx); err != nil {
-		log.Printf("[WARN] Selected engine %s failed to start: %v", app.activeEng.Name(), err)
-		fallbackEngineName := "sing-box"
-		if app.activeEng.Name() == "sing-box" {
-			fallbackEngineName = "xray"
-		}
-		log.Printf("[INFO] Initiating automatic fallback to alternative engine: %s...", fallbackEngineName)
-		if fbErr := app.switchEngine(daemonCtx, fallbackEngineName); fbErr != nil {
-			log.Printf("[CRITICAL] Fallback to %s failed: %v", fallbackEngineName, fbErr)
-		} else {
-			log.Printf("[INFO] Fallback recovery successful: %s is now running", fallbackEngineName)
-			_ = uciStorage.SaveEngine(fallbackEngineName)
-		}
+		log.Fatalf("[FATAL] Engine sing-box failed to start: %v", err)
 	}
-
-	app.syncClashShim(daemonCtx)
 
 	app.rulesCron = network.NewRulesetCron(
 		rulesLoader,
@@ -498,12 +465,7 @@ func runDaemon() {
 		updManager,
 		app.getCurrentEngine,
 		func(name string) error {
-			target := strings.ToLower(strings.TrimSpace(name))
-			if err := app.switchEngine(daemonCtx, target); err != nil {
-				return err
-			}
-			_ = uciStorage.SaveEngine(target)
-			return nil
+			return fmt.Errorf("engine switching is disabled: sing-box is the dedicated core")
 		},
 		app.rulesCron,
 		diagEngine,
@@ -550,7 +512,6 @@ func runDaemon() {
 	}()
 
 	go app.supervisorLoop(daemonCtx)
-	go app.startXrayURLTestLoop(daemonCtx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -558,202 +519,11 @@ func runDaemon() {
 
 	log.Println("[INFO] Shutting down Chebur.NET...")
 	_ = srv.Shutdown()
-	app.stopClashShim()
 	app.stopActiveEngine()
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
 	log.Println("[INFO] Stopped.")
-}
-
-func (a *App) startXrayURLTestLoop(ctx context.Context) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	ignoredTags := map[string]bool{
-		"DIRECT":   true,
-		"REJECT":   true,
-		"PROXY":    true,
-		"GLOBAL":   true,
-		"auto":     true,
-		"AUTO":     true,
-		"auto-out": true,
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-ticker.C:
-			eng := a.getCurrentEngine()
-			if eng == nil || eng.Name() != "xray" {
-				continue
-			}
-
-			cfg := a.state.Get()
-			if len(cfg.Nodes) <= 1 {
-				continue
-			}
-
-			client := &http.Client{Timeout: 3 * time.Second}
-			resp, err := client.Get("http://127.0.0.1:9090/proxies")
-			if err != nil {
-				resp, err = client.Get("http://192.168.11.1:9090/proxies")
-				if err != nil {
-					continue
-				}
-			}
-
-			var proxiesResp struct {
-				Proxies map[string]struct {
-					History []struct {
-						Delay int `json:"delay"`
-					} `json:"history"`
-				} `json:"proxies"`
-			}
-
-			if err := json.NewDecoder(resp.Body).Decode(&proxiesResp); err != nil {
-				resp.Body.Close()
-				continue
-			}
-			resp.Body.Close()
-
-			bestTag := ""
-			bestDelay := 999999
-			currentFirstDelay := 999999
-
-			currentFirstTag := cfg.Nodes[0].Tag
-			if p, ok := proxiesResp.Proxies[currentFirstTag]; ok && len(p.History) > 0 {
-				last := p.History[len(p.History)-1]
-				if last.Delay > 0 {
-					currentFirstDelay = last.Delay
-				}
-			}
-
-			for tag, info := range proxiesResp.Proxies {
-				if ignoredTags[tag] {
-					continue
-				}
-				if len(info.History) > 0 {
-					last := info.History[len(info.History)-1]
-					if last.Delay > 0 && last.Delay < bestDelay {
-						bestDelay = last.Delay
-						bestTag = tag
-					}
-				}
-			}
-
-			const tolerance = 30
-
-			if bestTag != "" && bestTag != currentFirstTag && (currentFirstDelay-bestDelay) > tolerance {
-				log.Printf("[xray-urltest] Better node detected: %s (%d ms) vs current %s (%d ms). Reordering...",
-					bestTag, bestDelay, currentFirstTag, currentFirstDelay)
-
-				var targetNode *config.GenericNode
-				for _, n := range cfg.Nodes {
-					if n.Tag == bestTag {
-						targetNode = n
-						break
-					}
-				}
-
-				if targetNode != nil {
-					var reordered []*config.GenericNode
-					reordered = append(reordered, targetNode)
-					for _, n := range cfg.Nodes {
-						if n.Tag != bestTag {
-							reordered = append(reordered, n)
-						}
-					}
-
-					fresh := a.state.Update(func(c *config.CheburConfig) {
-						c.Nodes = reordered
-					})
-
-					if a.clashShim != nil {
-						a.clashShim.UpdateConfig(&fresh)
-					}
-
-					reloadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-					if err := a.reloadActiveEngine(reloadCtx); err != nil {
-						log.Printf("[xray-urltest] Failed to reload engine with new best node: %v", err)
-					} else {
-						log.Printf("[xray-urltest] Xray successfully switched active outbound to: %s", bestTag)
-					}
-					cancel()
-				}
-			}
-		}
-	}
-}
-
-func (a *App) syncClashShim(ctx context.Context) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	eng := a.activeEng
-	if eng == nil {
-		return
-	}
-
-	if eng.Name() == "xray" {
-		if a.clashShim == nil {
-			cfg := a.state.Get()
-			shim := api.NewClashShimServer(&cfg, func(nodeTag string) error {
-				log.Printf("[clash-shim] User selected node: %s", nodeTag)
-				var targetNode *config.GenericNode
-				for _, n := range cfg.Nodes {
-					if n.Tag == nodeTag {
-						targetNode = n
-						break
-					}
-				}
-				if targetNode == nil {
-					return fmt.Errorf("node with tag '%s' not found", nodeTag)
-				}
-
-				var reordered []*config.GenericNode
-				reordered = append(reordered, targetNode)
-				for _, n := range cfg.Nodes {
-					if n.Tag != nodeTag {
-						reordered = append(reordered, n)
-					}
-				}
-
-				fresh := a.state.Update(func(c *config.CheburConfig) {
-					c.Nodes = reordered
-				})
-
-				if a.clashShim != nil {
-					a.clashShim.UpdateConfig(&fresh)
-				}
-
-				return a.reloadActiveEngine(ctx)
-			})
-
-			if err := shim.Start(DefaultClashShimPort); err != nil {
-				log.Printf("[WARN] Failed to start Clash API shim on port %d: %v", DefaultClashShimPort, err)
-			} else {
-				a.clashShim = shim
-			}
-		}
-	} else {
-		if a.clashShim != nil {
-			log.Println("[INFO] Stopping Clash API shim (sing-box provides native clash API on port 9090)")
-			_ = a.clashShim.Stop()
-			a.clashShim = nil
-		}
-	}
-}
-
-func (a *App) stopClashShim() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.clashShim != nil {
-		_ = a.clashShim.Stop()
-		a.clashShim = nil
-	}
 }
 
 func stopDaemon() {
@@ -773,18 +543,6 @@ func (a *App) getCurrentEngine() engine.Engine {
 	return a.activeEng
 }
 
-func (a *App) getEngineByName(name string) (engine.Engine, string, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	switch name {
-	case "xray":
-		return a.xrayEng, RuntimeConfigPathXray, nil
-	case "sing-box":
-		return a.singboxEng, RuntimeConfigPathSingBox, nil
-	default:
-		return nil, "", fmt.Errorf("unknown engine '%s'", name)
-	}
-}
-
 func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
@@ -798,20 +556,7 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	targetEngine := strings.ToLower(strings.TrimSpace(cfg.Engine))
-	if eng.Name() != targetEngine {
-		log.Printf("[INFO] Engine change detected in config (current: %s, target: %s), switching...", eng.Name(), targetEngine)
-		a.engineOpMu.Unlock()
-		err := a.switchEngine(ctx, targetEngine)
-		a.engineOpMu.Lock()
-		return err
-	}
-
 	targetPath := RuntimeConfigPathSingBox
-	if eng.Name() == "xray" {
-		targetPath = RuntimeConfigPathXray
-	}
-
 	allRuleSets := collectAllRuleSets(&cfg)
 
 	if a.rulesCron != nil {
@@ -856,10 +601,6 @@ func (a *App) restartActiveEngine(ctx context.Context) error {
 	}
 
 	targetPath := RuntimeConfigPathSingBox
-	if eng.Name() == "xray" {
-		targetPath = RuntimeConfigPathXray
-	}
-
 	_ = eng.Stop()
 	return eng.Start(ctx, targetPath)
 }
@@ -878,32 +619,17 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 	}
 
 	targetPath := RuntimeConfigPathSingBox
-	if eng.Name() == "xray" {
-		targetPath = RuntimeConfigPathXray
-	}
 
-	if eng.Name() == "xray" {
-		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
-			return fmt.Errorf("ensure assets for xray failed: %w", err)
-		}
-	} else if eng.Name() == "sing-box" {
-		if err := a.singboxEng.EnsureAssets(ctx); err != nil {
-			return fmt.Errorf("ensure assets for sing-box failed: %w", err)
-		}
+	if err := a.singboxEng.EnsureAssets(ctx); err != nil {
+		return fmt.Errorf("ensure assets for sing-box failed: %w", err)
 	}
 
 	if err := eng.BuildConfig(&cfg, targetPath); err != nil {
 		return fmt.Errorf("build %s config failed: %w", eng.Name(), err)
 	}
 
-	if eng.Name() == "xray" {
-		if err := a.xrayEng.ValidateConfig(targetPath); err != nil {
-			return fmt.Errorf("xray validate config failed: %w", err)
-		}
-	} else if eng.Name() == "sing-box" {
-		if err := a.singboxEng.ValidateConfig(targetPath); err != nil {
-			return fmt.Errorf("sing-box validate config failed: %w", err)
-		}
+	if err := a.singboxEng.ValidateConfig(targetPath); err != nil {
+		return fmt.Errorf("sing-box validate config failed: %w", err)
 	}
 
 	return eng.Start(ctx, targetPath)
@@ -920,96 +646,6 @@ func (a *App) stopActiveEngine() {
 	if eng != nil {
 		_ = eng.Stop()
 	}
-}
-
-func (a *App) switchEngine(ctx context.Context, name string) error {
-	name = strings.ToLower(strings.TrimSpace(name))
-	newEng, newTargetPath, err := a.getEngineByName(name)
-	if err != nil {
-		return err
-	}
-
-	a.engineOpMu.Lock()
-	defer a.engineOpMu.Unlock()
-
-	a.mu.RLock()
-	oldEng := a.activeEng
-	cfg := a.state.Get()
-	a.mu.RUnlock()
-
-	if oldEng != nil && oldEng.Name() == newEng.Name() {
-		log.Printf("[INFO] Engine '%s' is already active", name)
-		return nil
-	}
-
-	log.Printf("[INFO] Initiating safe pre-flight switch to %s...", name)
-
-	switch name {
-	case "xray":
-		if err := a.xrayEng.EnsureAssets(ctx); err != nil {
-			return fmt.Errorf("xray asset preparation failed (geosite.dat): %w", err)
-		}
-	case "sing-box":
-		if err := a.singboxEng.EnsureAssets(ctx); err != nil {
-			return fmt.Errorf("sing-box asset preparation failed: %w", err)
-		}
-	}
-
-	if err := newEng.BuildConfig(&cfg, newTargetPath); err != nil {
-		oldName := "none"
-		if oldEng != nil {
-			oldName = oldEng.Name()
-		}
-		return fmt.Errorf("pre-flight build config failed for %s: %w (active engine %s kept running)", name, err, oldName)
-	}
-
-	switch name {
-	case "xray":
-		if err := a.xrayEng.ValidateConfig(newTargetPath); err != nil {
-			return fmt.Errorf("xray validation failed: %w (switch aborted, active engine preserved)", err)
-		}
-		log.Println("[INFO] Pre-flight: xray -test passed successfully")
-
-	case "sing-box":
-		if err := a.singboxEng.ValidateConfig(newTargetPath); err != nil {
-			return fmt.Errorf("sing-box validation failed: %w (switch aborted, active engine preserved)", err)
-		}
-		log.Println("[INFO] Pre-flight: sing-box check passed successfully")
-	}
-
-	oldTargetPath := ""
-	if oldEng != nil {
-		if oldEng.Name() == "xray" {
-			oldTargetPath = RuntimeConfigPathXray
-		} else {
-			oldTargetPath = RuntimeConfigPathSingBox
-		}
-		log.Printf("[INFO] Stopping previous engine %s...", oldEng.Name())
-		_ = oldEng.Stop()
-	}
-
-	if err := newEng.Start(ctx, newTargetPath); err != nil {
-		log.Printf("[ERROR] Failed to start verified engine %s: %v. Initiating rollback...", name, err)
-
-		if oldEng != nil && oldTargetPath != "" {
-			if rbErr := oldEng.Start(ctx, oldTargetPath); rbErr != nil {
-				log.Printf("[CRITICAL] Rollback failed! Both engines down: %v", rbErr)
-				return fmt.Errorf("switch to %s failed: %w; rollback to %s failed: %v", name, err, oldEng.Name(), rbErr)
-			}
-			log.Printf("[INFO] Rollback successful: recovered active engine %s", oldEng.Name())
-		}
-
-		return fmt.Errorf("failed to start %s, safely rolled back: %w", name, err)
-	}
-
-	a.mu.Lock()
-	a.activeEng = newEng
-	a.mu.Unlock()
-
-	a.syncClashShim(ctx)
-
-	log.Printf("[INFO] Successfully switched proxy engine to %s", name)
-	return nil
 }
 
 func (a *App) supervisorLoop(ctx context.Context) {
@@ -1067,9 +703,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 
 		if currentEng != nil {
 			targetPath := RuntimeConfigPathSingBox
-			if currentEng.Name() == "xray" {
-				targetPath = RuntimeConfigPathXray
-			}
 
 			_ = currentEng.Stop()
 			if startErr := currentEng.Start(ctx, targetPath); startErr != nil {
@@ -1250,11 +883,8 @@ func cliCheckNFT() {
 
 func cliCheckEngine() {
 	sbRunning := exec.Command("pgrep", "-f", "sing-box").Run() == nil
-	xrRunning := exec.Command("pgrep", "-f", "xray").Run() == nil
-
 	res := map[string]interface{}{
 		"sing_box_running": sbRunning,
-		"xray_running":     xrRunning,
 	}
 	data, _ := json.MarshalIndent(res, "", "  ")
 	fmt.Println(string(data))
@@ -1376,11 +1006,6 @@ func cliShowEngineConfig() {
 	if _, err := os.Stat(RuntimeConfigPathSingBox); err == nil {
 		data, _ := os.ReadFile(RuntimeConfigPathSingBox)
 		fmt.Printf("--- Active sing-box config (%s) ---\n%s\n", RuntimeConfigPathSingBox, string(data))
-		return
-	}
-	if _, err := os.Stat(RuntimeConfigPathXray); err == nil {
-		data, _ := os.ReadFile(RuntimeConfigPathXray)
-		fmt.Printf("--- Active Xray config (%s) ---\n%s\n", RuntimeConfigPathXray, string(data))
 		return
 	}
 	fmt.Println("No generated runtime config found in /tmp/run/cheburnet/")

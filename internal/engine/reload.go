@@ -11,11 +11,10 @@ import (
 	"cheburnet/internal/config"
 )
 
-// SafeReload атомарно генерирует новый конфиг, валидирует его силами ядра,
-// гарантированно бэкапит рабочий конфиг, перезапускает процесс,
+// SafeReload атомарно генерирует новый конфиг, валидирует его силами sing-box check,
+// бэкапит рабочий конфиг, перезапускает процесс,
 // проводит проверку здоровья и выполняет автоматический откат при сбое.
 func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targetPath string) error {
-	// Сохраняем расширение .json, чтобы Xray и Sing-box корректно определяли формат
 	stagingPath := strings.TrimSuffix(targetPath, ".json") + ".new.json"
 	backupPath := strings.TrimSuffix(targetPath, ".json") + ".bak.json"
 
@@ -26,13 +25,12 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 		return fmt.Errorf("build config failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 
-	// 2. Валидация бинарником (sing-box check или xray -test)
+	// 2. Валидация бинарником (sing-box check)
 	if err := eng.ValidateConfig(stagingPath); err != nil {
 		return fmt.Errorf("binary validation failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 
-	// 3. Строгий бэкап текущего рабочего конфига.
-	// Если рабочий файл есть, но бэкап не удался — НЕМЕДЛЕННЫЙ ABORT.
+	// 3. Бэкап текущего рабочего конфига
 	hasBackup := false
 	if _, err := os.Stat(targetPath); err == nil {
 		if err := copyFile(targetPath, backupPath); err != nil {
@@ -59,7 +57,7 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 		return triggerRollback(ctx, eng, targetPath, backupPath, hasBackup, fmt.Errorf("engine start failed: %w", err))
 	}
 
-	// 7. Пост-старт верификация локальных портов и DNS (1 сек на bind сокетов)
+	// 7. Пост-старт верификация локальных портов и DNS
 	time.Sleep(1 * time.Second)
 
 	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -70,7 +68,6 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 		return triggerRollback(ctx, eng, targetPath, backupPath, hasBackup, fmt.Errorf("health check failed: %w", err))
 	}
 
-	// Успешный запуск и прохождение верификации — удаляем бэкап
 	if hasBackup {
 		_ = os.Remove(backupPath)
 	}
@@ -88,12 +85,10 @@ func triggerRollback(ctx context.Context, eng Engine, targetPath, backupPath str
 		return fmt.Errorf("%w; rollback failed: backup file missing: %v", originalErr, statErr)
 	}
 
-	// Восстанавливаем предыдущий проверенный конфиг поверх сбойного
 	if err := os.Rename(backupPath, targetPath); err != nil {
 		return fmt.Errorf("%w; rollback failed to restore file: %v", originalErr, err)
 	}
 
-	// Поднимаем стабильную версию
 	if rbErr := eng.Start(ctx, targetPath); rbErr != nil {
 		log.Printf("[engine-reload] FATAL: rollback start failed: %v", rbErr)
 		return fmt.Errorf("%w; rollback start also failed: %v", originalErr, rbErr)

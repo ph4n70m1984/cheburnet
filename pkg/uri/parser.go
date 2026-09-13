@@ -14,7 +14,6 @@ import (
 // decodeBase64Safe декодирует строку Base64 со стандартным или URL-safe алфавитом и любым паддингом
 func decodeBase64Safe(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
-	// Дополняем недостающий padding '='
 	if pad := len(s) % 4; pad != 0 {
 		s += strings.Repeat("=", 4-pad)
 	}
@@ -23,6 +22,16 @@ func decodeBase64Safe(s string) ([]byte, error) {
 		return res, nil
 	}
 	return base64.URLEncoding.DecodeString(s)
+}
+
+// extractSNI безопасно извлекает SNI с учётом алиасов (sni, peer, serverName)
+func extractSNI(q url.Values) string {
+	for _, key := range []string{"sni", "peer", "serverName"} {
+		if val := strings.TrimSpace(q.Get(key)); val != "" {
+			return val
+		}
+	}
+	return ""
 }
 
 // ParseNodeURI парсит vless://, ss://, trojan://, socks4/5://, hy2/hysteria2://
@@ -86,12 +95,21 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		if node.Network == "" {
 			node.Network = "tcp"
 		}
-		node.Security = q.Get("security")
-		node.SNI = q.Get("sni")
-		if node.SNI == "" {
-			node.SNI = node.Address
+		node.Security = strings.ToLower(strings.TrimSpace(q.Get("security")))
+
+		// 1. Извлекаем SNI через алиасы: sni, peer, serverName
+		sni := extractSNI(q)
+
+		// 2. Для Reality НЕЛЬЗЯ делать fallback на node.Address (это ломает TLS ClientHello)
+		if sni == "" && node.Security != "reality" {
+			sni = node.Address
 		}
+		node.SNI = sni
+
 		node.Fingerprint = q.Get("fp")
+		if node.Fingerprint == "" {
+			node.Fingerprint = "chrome"
+		}
 		node.PublicKey = q.Get("pbk")
 		node.ShortID = q.Get("sid")
 		node.Path = q.Get("path")
@@ -132,7 +150,7 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		if node.Security == "" {
 			node.Security = "tls"
 		}
-		node.SNI = q.Get("sni")
+		node.SNI = extractSNI(q)
 		if node.SNI == "" {
 			node.SNI = node.Address
 		}
@@ -158,7 +176,7 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		if u.User != nil {
 			node.Password = u.User.Username()
 		}
-		node.SNI = q.Get("sni")
+		node.SNI = extractSNI(q)
 		if node.SNI == "" {
 			node.SNI = node.Address
 		}
@@ -194,7 +212,6 @@ func parseLegacyShadowsocksURI(rawURI string) (string, error) {
 		return "", err
 	}
 
-	// Ожидается строка вида: method:password@host:port
 	decodedStr := string(decoded)
 	atIdx := strings.LastIndex(decodedStr, "@")
 	if atIdx == -1 {

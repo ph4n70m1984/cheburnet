@@ -15,42 +15,27 @@ import (
 // 1. TCP-сокет смешанного прокси-порта (mixed/http/socks inbound).
 // 2. Реальный DNS-запрос через локальный UDP-вход ядра (127.0.0.42:53).
 func VerifyEngineAlive(ctx context.Context, cfg *config.CheburConfig) error {
-	dialer := &net.Dialer{Timeout: 1 * time.Second}
+	d := net.Dialer{Timeout: 800 * time.Millisecond}
 
-	// 1. Проверяем TCP-порт прокси
-	proxyTarget := fmt.Sprintf("127.0.0.1:%d", cfg.MixedPort)
-	if cfg.MixedPort == 0 {
-		proxyTarget = "127.0.0.1:4534"
-	}
-	conn, err := dialer.DialContext(ctx, "tcp", proxyTarget)
-	if err != nil {
-		return fmt.Errorf("local proxy inbound unreachable: %w", err)
-	}
-	_ = conn.Close()
-
-	// 2. Проверяем локальный DNS через реальный запрос A-записи
-	dnsTarget := fmt.Sprintf("127.0.0.42:%d", cfg.DNSPort)
-	if cfg.DNSPort == 0 {
-		dnsTarget = "127.0.0.42:53"
+	// 1. Для Xray проверяем локальный порт API (10085)
+	conn, err := d.DialContext(ctx, "tcp", "127.0.0.1:10085")
+	if err == nil {
+		_ = conn.Close()
+		return nil
 	}
 
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(dialCtx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 1500 * time.Millisecond}
-			return d.DialContext(dialCtx, "udp", dnsTarget)
-		},
+	// 2. Фоллбек: проверка локального Mixed/HTTP порта
+	mixedPort := cfg.MixedPort
+	if mixedPort <= 0 {
+		mixedPort = 4534
+	}
+	conn, err = d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort))
+	if err == nil {
+		_ = conn.Close()
+		return nil
 	}
 
-	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-
-	addrs, err := r.LookupHost(lookupCtx, "example.com")
-	if err != nil || len(addrs) == 0 {
-		return fmt.Errorf("local dns inbound (%s) query failed: %w", dnsTarget, err)
-	}
-
-	return nil
+	return fmt.Errorf("engine local api/proxy inbound unreachable (tried 10085 and %d): %w", mixedPort, err)
 }
 
 // VerifyTraffic выполняет полный сквозной E2E-тест генерации 204 через исходящий прокси

@@ -15,7 +15,6 @@ import (
 
 const (
 	RulesStorageDir = "/etc/cheburnet/rules"
-	XrayAssetDir    = "/usr/share/xray"
 	TempDownloadDir = "/tmp"
 	DownloadTimeout = 30 * time.Second
 )
@@ -27,7 +26,6 @@ type CompressedRulesetLoader struct {
 
 func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	_ = os.MkdirAll(RulesStorageDir, 0755)
-	_ = os.MkdirAll(XrayAssetDir, 0755)
 	return &CompressedRulesetLoader{
 		storageDir: RulesStorageDir,
 		client: &http.Client{
@@ -36,7 +34,7 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	}
 }
 
-// GetSubnets читает локальный .gz кэш или пробует скачать его при первом запуске
+// GetSubnets читает локальный .gz кэш или скачивает его при первом запуске
 func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, error) {
 	normName := strings.ToLower(strings.TrimSpace(rulesetName))
 	if normName == "" {
@@ -47,7 +45,7 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 
 	if _, err := os.Stat(targetGz); os.IsNotExist(err) {
 		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
-			// 404 означает отсутствие IP-подсетей для данной категории (например, чистый geosite)
+			// 404 означает отсутствие IP-подсетей для данной категории
 			return nil, nil
 		}
 	}
@@ -67,7 +65,6 @@ func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
 
 // downloadAndCompressAtomic запрашивает файл подсетей (в репозитории имена в UPPERCASE: DISCORD.lst)
 func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
-	// В репозитории itdoginfo/allow-domains файлы в Subnets/IPv4/ названы в UPPERCASE
 	fileName := strings.ToUpper(rulesetName) + ".lst"
 	url := fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s", fileName)
 	tmpGz := filepath.Join(TempDownloadDir, fmt.Sprintf("%s.lst.gz.tmp", rulesetName))
@@ -117,60 +114,6 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	}
 
 	return l.safeCopyToFlash(tmpGz, targetGz)
-}
-
-// UpdateGeositeDat скачивает актуальный geosite.dat для Xray
-func (l *CompressedRulesetLoader) UpdateGeositeDat() (bool, error) {
-	url := "https://github.com/itdoginfo/allow-domains/releases/latest/download/geosite.dat"
-	targetPath := filepath.Join(XrayAssetDir, "geosite.dat")
-	tmpPath := filepath.Join(TempDownloadDir, "geosite.dat.tmp")
-	defer os.Remove(tmpPath)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("User-Agent", "CheburNET-Daemon")
-
-	// Если файл уже есть, используем заголовок проверки изменения по дате
-	if fi, err := os.Stat(targetPath); err == nil {
-		req.Header.Set("If-Modified-Since", fi.ModTime().UTC().Format(http.TimeFormat))
-	}
-
-	resp, err := l.client.Do(req)
-	if err != nil {
-		return false, fmt.Errorf("http get geosite: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotModified {
-		return false, nil // Файл не изменился
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("bad status downloading geosite.dat: %s", resp.Status)
-	}
-
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return false, fmt.Errorf("create tmp geosite: %w", err)
-	}
-
-	written, err := io.Copy(out, resp.Body)
-	_ = out.Close()
-	if err != nil {
-		return false, fmt.Errorf("stream copy geosite failed: %w", err)
-	}
-
-	if written < 1024 {
-		return false, fmt.Errorf("geosite.dat is too small (%d bytes)", written)
-	}
-
-	if err := l.safeCopyToFlash(tmpPath, targetPath); err != nil {
-		return false, err
-	}
-
-	return true, nil
 }
 
 func (l *CompressedRulesetLoader) createEmptyGz(targetPath string) error {

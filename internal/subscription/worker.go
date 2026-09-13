@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/pkg/happ"
 	"cheburnet/pkg/uri"
 
 	"gopkg.in/yaml.v3"
@@ -60,6 +61,7 @@ type ClashConfig struct {
 		Server      string `yaml:"server"`
 		Port        int    `yaml:"port"`
 		UUID        string `yaml:"uuid"`
+		Password    string `yaml:"password"`
 		Network     string `yaml:"network"`
 		Flow        string `yaml:"flow"`
 		TLS         bool   `yaml:"tls"`
@@ -129,72 +131,95 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		targetHWID = w.getOrGenerateHWID()
 	}
 
-	reqCtx, reqCancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer reqCancel()
+	var body []byte
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, err
-	}
+	// 1. Обработка статической ссылки happ://crypt4/
+	if happ.IsCrypt4(reqURL) {
+		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt inline crypt4: %w", err)
+		}
+		body = decrypted
+	} else {
+		// 2. Обычный HTTP запрос
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer reqCancel()
 
-	ua := strings.TrimSpace(sub.UserAgent)
-	if ua == "" {
-		ua = "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)"
-	}
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req.Header.Set("User-Agent", ua)
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Connection", "keep-alive")
+		ua := strings.TrimSpace(sub.UserAgent)
+		if ua == "" {
+			ua = "Happ/4.3.5"
+		}
 
-	if targetHWID != "" {
-		req.Header.Set("x-hwid", targetHWID)
-		req.Header.Set("hwid", targetHWID)
-		req.Header.Set("X-HWID", targetHWID)
-	}
+		req.Header.Set("User-Agent", ua)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Connection", "keep-alive")
 
-	dialer := &net.Dialer{
-		Timeout:   6 * time.Second,
-		KeepAlive: 0,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 3 * time.Second}
-				conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
-				if err != nil {
-					return d.DialContext(ctx, "udp", "8.8.8.8:53")
-				}
-				return conn, nil
+		if targetHWID != "" {
+			req.Header.Set("x-hwid", targetHWID)
+			req.Header.Set("hwid", targetHWID)
+			req.Header.Set("X-HWID", targetHWID)
+		}
+
+		dialer := &net.Dialer{
+			Timeout:   6 * time.Second,
+			KeepAlive: 0,
+			Resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 3 * time.Second}
+					conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
+					if err != nil {
+						return d.DialContext(ctx, "udp", "8.8.8.8:53")
+					}
+					return conn, nil
+				},
 			},
-		},
-	}
+		}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:           dialer.DialContext,
-			ResponseHeaderTimeout: 8 * time.Second,
-			DisableKeepAlives:     true,
-		},
-	}
+		client := &http.Client{
+			Transport: &http.Transport{
+				DialContext:           dialer.DialContext,
+				ResponseHeaderTimeout: 8 * time.Second,
+				DisableKeepAlives:     true,
+			},
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http fetch error: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("http fetch error: %w", err)
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
-	}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+		rawBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		// 3. Обработка случая, когда сервер вернул happ://crypt4/ в теле
+		strBody := strings.TrimSpace(string(rawBody))
+		if happ.IsCrypt4(strBody) {
+			decrypted, err := happ.DecryptCrypt4(strBody, targetHWID, sub.HWID, "HappDefaultSalt")
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt downloaded crypt4 body: %w", err)
+			}
+			body = decrypted
+		} else {
+			body = rawBody
+		}
 	}
 
 	var nodes []*config.GenericNode
 	seenTags := make(map[string]bool)
 
-	// Вспомогательная функция для генерации уникального тега с учетом имени провайдера
 	makeUniqueTag := func(rawName string) string {
 		tag := strings.TrimSpace(rawName)
 		if tag == "" {
@@ -213,11 +238,11 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)
+	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)[cite: 5]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML
+		// 2. Попытка распарсить как Clash YAML[cite: 5]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -241,6 +266,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 					Port:        p.Port,
 					Protocol:    p.Type,
 					UUID:        p.UUID,
+					Password:    p.Password,
 					Flow:        p.Flow,
 					Network:     p.Network,
 					Security:    sec,
@@ -253,7 +279,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Base64
+			// 3. Base64[cite: 5]
 			content := string(body)
 			trimmed := strings.TrimSpace(content)
 
@@ -267,12 +293,18 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				}
 			}
 
-			// 4. Plaintext построчно
+			// 4. Plaintext построчно[cite: 5]
 			scanner := bufio.NewScanner(strings.NewReader(content))
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
 				if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "не поддерживается") {
 					continue
+				}
+
+				if happ.IsCrypt4(line) {
+					if dec, err := happ.DecryptCrypt4(line, targetHWID, sub.HWID, "HappDefaultSalt"); err == nil {
+						line = string(dec)
+					}
 				}
 
 				node, err := uri.ParseNodeURI(line, w.autoHWID, targetHWID)
@@ -283,7 +315,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			}
 		}
 
-		// Дополнительная фильтрация нод по регулярным выражениям для форматов Clash/Plaintext
 		nodes = filterNodesByRegex(nodes, sub.ExcludeRegex)
 	}
 
@@ -340,7 +371,8 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 		baseRemarks := strings.TrimSpace(prof.Remarks)
 
 		for _, ob := range prof.Outbounds {
-			if ob.Protocol != "vless" && ob.Protocol != "hysteria2" && ob.Protocol != "shadowsocks" && ob.Protocol != "trojan" {
+			proto := strings.ToLower(ob.Protocol)
+			if proto != "vless" && proto != "hysteria" && proto != "hysteria2" && proto != "shadowsocks" && proto != "trojan" {
 				continue
 			}
 
@@ -349,7 +381,6 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 				rawTag = fmt.Sprintf("%s (%s)", baseRemarks, ob.Tag)
 			}
 
-			// Проверка совпадений с регулярными выражениями
 			excluded := false
 			for _, re := range compiled {
 				if re.MatchString(rawTag) || (baseRemarks != "" && re.MatchString(baseRemarks)) || re.MatchString(ob.Tag) {
@@ -365,11 +396,11 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 
 			node := &config.GenericNode{
 				Tag:      uniqueTag,
-				Protocol: ob.Protocol,
+				Protocol: proto,
 				HWID:     targetHWID,
 			}
 
-			if ob.Protocol == "vless" {
+			if proto == "vless" {
 				if vnext, ok := ob.Settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
 					if firstTarget, ok := vnext[0].(map[string]interface{}); ok {
 						if addr, ok := firstTarget["address"].(string); ok {
@@ -398,6 +429,7 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 					if sec, ok := ss["security"].(string); ok {
 						node.Security = sec
 					}
+
 					if reality, ok := ss["realitySettings"].(map[string]interface{}); ok {
 						if sni, ok := reality["serverName"].(string); ok {
 							node.SNI = sni
@@ -409,6 +441,45 @@ func parseXrayJSON(data []byte, targetHWID string, excludeRegexes []string, subN
 							node.ShortID = sid
 						}
 						if fp, ok := reality["fingerprint"].(string); ok {
+							node.Fingerprint = fp
+						}
+						if spx, ok := reality["spiderX"].(string); ok {
+							node.Path = spx
+						}
+					}
+
+					if tls, ok := ss["tlsSettings"].(map[string]interface{}); ok {
+						if sni, ok := tls["serverName"].(string); ok {
+							node.SNI = sni
+						}
+						if fp, ok := tls["fingerprint"].(string); ok {
+							node.Fingerprint = fp
+						}
+					}
+				}
+			}
+
+			if proto == "hysteria" || proto == "hysteria2" {
+				node.Protocol = "hysteria2"
+				if addr, ok := ob.Settings["address"].(string); ok {
+					node.Address = addr
+				}
+				if port, ok := ob.Settings["port"].(float64); ok {
+					node.Port = int(port)
+				}
+
+				if ss := ob.StreamSettings; ss != nil {
+					if hys, ok := ss["hysteriaSettings"].(map[string]interface{}); ok {
+						if auth, ok := hys["auth"].(string); ok {
+							node.Password = auth
+							node.UUID = auth
+						}
+					}
+					if tls, ok := ss["tlsSettings"].(map[string]interface{}); ok {
+						if sni, ok := tls["serverName"].(string); ok {
+							node.SNI = sni
+						}
+						if fp, ok := tls["fingerprint"].(string); ok {
 							node.Fingerprint = fp
 						}
 					}

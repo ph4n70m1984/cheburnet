@@ -1,8 +1,9 @@
 package updater
 
 import (
-	"archive/zip"
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,17 +15,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	// TargetXrayVersion жестко задает поддерживаемую демоном версию Xray
-	TargetXrayVersion = "26.9.9"
-	XrayBinPath       = "/usr/bin/xray"
-	XrayReleaseBase   = "https://github.com/XTLS/Xray-core/releases/download"
+	TargetSingBoxVersion = "1.14.0-extended-2.7.1"
+	SingBoxBinPath       = "/usr/bin/sing-box"
+	SingBoxReleaseBase   = "https://github.com/shtorm-7/sing-box-extended/releases/download"
 )
 
 type ComponentStatus struct {
@@ -37,7 +39,6 @@ type ComponentStatus struct {
 type UpdateReport struct {
 	CheburNet  ComponentStatus `json:"cheburnet"`
 	SingBox    ComponentStatus `json:"sing_box"`
-	Xray       ComponentStatus `json:"xray"`
 	AutoUpdate bool            `json:"auto_update"`
 	PkgManager string          `json:"pkg_manager"`
 }
@@ -122,8 +123,7 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	sbStatus := m.checkPkgStatus("sing-box")
-	xrStatus := m.checkPinnedXrayStatus()
+	sbStatus := m.checkPinnedSingBoxStatus()
 
 	chStatus := ComponentStatus{
 		Current:   strings.TrimPrefix(m.currentVer, "v"),
@@ -140,7 +140,6 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	report := &UpdateReport{
 		CheburNet:  chStatus,
 		SingBox:    sbStatus,
-		Xray:       xrStatus,
 		AutoUpdate: autoUpdate,
 		PkgManager: m.pkgManager,
 	}
@@ -148,15 +147,63 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	return report, nil
 }
 
-// checkPinnedXrayStatus проверяет соответствие установленного бинарника Xray константе TargetXrayVersion
-func (m *Manager) checkPinnedXrayStatus() ComponentStatus {
-	st := ComponentStatus{
-		Latest: TargetXrayVersion,
+func parseExtendedSemVer(v string) (base []int, ext []int) {
+	parts := strings.Split(v, "-extended-")
+	baseParts := strings.Split(parts[0], ".")
+	for _, p := range baseParts {
+		val, _ := strconv.Atoi(p)
+		base = append(base, val)
+	}
+	for len(base) < 3 {
+		base = append(base, 0)
 	}
 
-	binPath := XrayBinPath
+	if len(parts) > 1 {
+		extParts := strings.Split(parts[1], ".")
+		for _, p := range extParts {
+			val, _ := strconv.Atoi(p)
+			ext = append(ext, val)
+		}
+	}
+	for len(ext) < 3 {
+		ext = append(ext, 0)
+	}
+	return
+}
+
+func isVersionGreaterOrEqual(a, b string) bool {
+	aBase, aExt := parseExtendedSemVer(a)
+	bBase, bExt := parseExtendedSemVer(b)
+
+	for i := 0; i < 3; i++ {
+		if aBase[i] > bBase[i] {
+			return true
+		}
+		if aBase[i] < bBase[i] {
+			return false
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		if aExt[i] > bExt[i] {
+			return true
+		}
+		if aExt[i] < bExt[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (m *Manager) checkPinnedSingBoxStatus() ComponentStatus {
+	st := ComponentStatus{
+		Latest: TargetSingBoxVersion,
+	}
+
+	binPath := SingBoxBinPath
 	if _, err := os.Stat(binPath); os.IsNotExist(err) {
-		if lp, err := exec.LookPath("xray"); err == nil {
+		if lp, err := exec.LookPath("sing-box"); err == nil {
 			binPath = lp
 		} else {
 			st.Installed = false
@@ -167,17 +214,23 @@ func (m *Manager) checkPinnedXrayStatus() ComponentStatus {
 
 	st.Installed = true
 	out, err := exec.Command(binPath, "version").CombinedOutput()
-	if err != nil {
+	if err != nil && len(out) == 0 {
 		st.Current = "unknown"
 		st.HasUpdate = true
 		return st
 	}
 
-	fields := strings.Fields(string(out))
-	if len(fields) >= 2 {
-		curVer := strings.TrimPrefix(fields[1], "v")
+	re := regexp.MustCompile(`version\s+([^\s\n]+)`)
+	matches := re.FindStringSubmatch(string(out))
+	if len(matches) >= 2 {
+		curVer := strings.TrimPrefix(matches[1], "v")
 		st.Current = curVer
-		st.HasUpdate = (curVer != TargetXrayVersion)
+
+		if isVersionGreaterOrEqual(curVer, TargetSingBoxVersion) {
+			st.HasUpdate = false
+		} else {
+			st.HasUpdate = true
+		}
 	} else {
 		st.Current = "unknown"
 		st.HasUpdate = true
@@ -186,73 +239,157 @@ func (m *Manager) checkPinnedXrayStatus() ComponentStatus {
 	return st
 }
 
-func (m *Manager) checkPkgStatus(pkgName string) ComponentStatus {
-	st := ComponentStatus{}
+func (m *Manager) resolveSingBoxAsset() (string, error) {
+	arch := strings.ToLower(m.targetArch)
 
-	binExists := false
-	if _, err := exec.LookPath(pkgName); err == nil {
-		binExists = true
+	switch runtime.GOARCH {
+	case "arm64":
+		return fmt.Sprintf("sing-box-%s-linux-arm64.tar.gz", TargetSingBoxVersion), nil
+	case "amd64":
+		return fmt.Sprintf("sing-box-%s-linux-amd64.tar.gz", TargetSingBoxVersion), nil
+	case "386":
+		return fmt.Sprintf("sing-box-%s-linux-386.tar.gz", TargetSingBoxVersion), nil
+	case "arm":
+		if strings.Contains(arch, "v5") {
+			return fmt.Sprintf("sing-box-%s-linux-armv5.tar.gz", TargetSingBoxVersion), nil
+		}
+		return fmt.Sprintf("sing-box-%s-linux-armv7.tar.gz", TargetSingBoxVersion), nil
+	case "mipsle":
+		return fmt.Sprintf("sing-box-%s-linux-mipsle-softfloat.tar.gz", TargetSingBoxVersion), nil
+	case "mips":
+		return fmt.Sprintf("sing-box-%s-linux-mips-softfloat.tar.gz", TargetSingBoxVersion), nil
+	case "mips64le":
+		return fmt.Sprintf("sing-box-%s-linux-mips64le-softfloat.tar.gz", TargetSingBoxVersion), nil
+	case "mips64":
+		return fmt.Sprintf("sing-box-%s-linux-mips64-softfloat.tar.gz", TargetSingBoxVersion), nil
+	default:
+		return "", fmt.Errorf("unsupported sing-box architecture: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
+	}
+}
+
+func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
+	status := m.checkPinnedSingBoxStatus()
+	if !status.HasUpdate && status.Installed {
+		log.Printf("[INFO] sing-box is already at %s (or newer). No upgrade needed.", status.Current)
+		return nil
 	}
 
-	if m.pkgManager == "apk" {
-		out, err := exec.Command("apk", "info", "-v", pkgName).Output()
-		if err == nil && len(strings.TrimSpace(string(out))) > 0 {
-			line := strings.TrimSpace(string(out))
-			st.Current = strings.TrimPrefix(line, pkgName+"-")
-			st.Latest = st.Current
-			st.Installed = true
-		} else {
-			st.Installed = binExists
-			if !binExists {
-				st.Current = ""
-				st.Latest = ""
-				st.HasUpdate = false
-				return st
+	assetName, err := m.resolveSingBoxAsset()
+	if err != nil {
+		return fmt.Errorf("architecture resolution failed: %w", err)
+	}
+
+	tag := "v" + strings.TrimPrefix(TargetSingBoxVersion, "v")
+	tarURL := fmt.Sprintf("%s/%s/%s", SingBoxReleaseBase, tag, assetName)
+
+	log.Printf("[INFO] Pinned sing-box-extended target: %s. Fetching from %s...", tag, tarURL)
+
+	tmpDir, err := os.MkdirTemp(os.TempDir(), "sb_install_*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	archivePath := filepath.Join(tmpDir, assetName)
+	if err := m.downloadFile(ctx, tarURL, archivePath); err != nil {
+		return fmt.Errorf("failed to download sing-box archive: %w", err)
+	}
+
+	newBinPath := filepath.Join(tmpDir, "sing-box")
+	if err := extractFileFromTarGz(archivePath, "sing-box", newBinPath); err != nil {
+		return fmt.Errorf("failed to extract sing-box executable: %w", err)
+	}
+
+	_ = os.Chmod(newBinPath, 0755)
+
+	testCmd := exec.CommandContext(ctx, newBinPath, "version")
+	if out, err := testCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("sing-box self-test failed: %w (out: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	targetPath := SingBoxBinPath
+	if lp, err := exec.LookPath("sing-box"); err == nil {
+		targetPath = lp
+	}
+
+	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
+		return fmt.Errorf("failed to replace sing-box binary: %w", err)
+	}
+
+	log.Printf("[INFO] sing-box successfully pinned and updated to version %s at %s", TargetSingBoxVersion, targetPath)
+	return nil
+}
+
+func extractFileFromTarGz(tarGzPath, targetFileName, outPath string) error {
+	f, err := os.Open(tarGzPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		if filepath.Base(header.Name) == targetFileName && (header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA) {
+			outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+			if err != nil {
+				return err
 			}
-		}
+			defer outFile.Close()
 
-		outUpgr, err := exec.Command("apk", "version", "-l", "<", pkgName).Output()
-		if err == nil && len(outUpgr) > 0 && st.Installed {
-			st.HasUpdate = true
-		}
-		return st
-	}
-
-	outStatus, err := exec.Command("opkg", "status", pkgName).Output()
-	if err == nil && len(strings.TrimSpace(string(outStatus))) > 0 {
-		for _, line := range strings.Split(string(outStatus), "\n") {
-			if strings.HasPrefix(line, "Version:") {
-				st.Current = strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
-				st.Latest = st.Current
-				st.Installed = true
-				break
-			}
+			_, err = io.Copy(outFile, tr)
+			return err
 		}
 	}
+	return fmt.Errorf("file %s not found in tar.gz", targetFileName)
+}
 
-	if !st.Installed {
-		st.Installed = binExists
-		if !binExists {
-			st.Current = ""
-			st.Latest = ""
-			st.HasUpdate = false
-			return st
-		}
+func replaceFileCrossDevice(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
 	}
 
-	outUpgr, err := exec.Command("opkg", "list-upgradable").Output()
-	if err == nil && st.Installed {
-		for _, line := range strings.Split(string(outUpgr), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 5 && fields[0] == pkgName {
-				st.Latest = fields[4]
-				st.HasUpdate = true
-				break
-			}
-		}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
 	}
 
-	return st
+	_ = os.Remove(src)
+	return nil
+}
+
+func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
+	sbStatus := m.checkPinnedSingBoxStatus()
+	if sbStatus.HasUpdate || !sbStatus.Installed {
+		log.Printf("[INFO] Upgrading sing-box to pinned version %s...", TargetSingBoxVersion)
+		return m.UpgradeSingBoxCore(ctx)
+	}
+	log.Printf("[INFO] sing-box is already at pinned version %s (or newer)", TargetSingBoxVersion)
+	return nil
 }
 
 func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, binAsset releaseAsset, checksumsURL string, err error) {
@@ -356,249 +493,6 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 	}
 
 	log.Printf("[INFO] SHA256 verified successfully (%s)", actualHash)
-	return nil
-}
-
-// resolveXrayAsset сопоставляет GOARCH и системную архитектуру OpenWrt с именованием архивов Xray-core
-func (m *Manager) resolveXrayAsset() (string, error) {
-	arch := strings.ToLower(m.targetArch)
-
-	switch runtime.GOARCH {
-	case "arm64":
-		return "Xray-linux-arm64-v8a.zip", nil
-
-	case "amd64":
-		return "Xray-linux-64.zip", nil
-
-	case "386":
-		return "Xray-linux-32.zip", nil
-
-	case "arm":
-		if strings.Contains(arch, "v5") || strings.Contains(arch, "arm9") {
-			return "Xray-linux-arm32-v5.zip", nil
-		}
-		return "Xray-linux-arm32-v7a.zip", nil
-
-	case "mipsle":
-		// Подавляющее большинство роутеров OpenWrt (MT7621, MT7628, MT7620) используют softfloat
-		return "Xray-linux-mips32le-softfloat.zip", nil
-
-	case "mips":
-		// Big-endian MIPS (Atheros AR7xxx/AR9xxx, QCA95xx)
-		return "Xray-linux-mips32-softfloat.zip", nil
-
-	case "mips64le":
-		return "Xray-linux-mips64le-softfloat.zip", nil
-
-	case "mips64":
-		return "Xray-linux-mips64-softfloat.zip", nil
-
-	default:
-		return "", fmt.Errorf("unsupported Xray architecture: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
-	}
-}
-
-// UpgradeXrayCore скачивает таргетированную версию Xray с GitHub, сверяет контрольную сумму из .dgst и заменяет бинарник
-func (m *Manager) UpgradeXrayCore(ctx context.Context) error {
-	assetName, err := m.resolveXrayAsset()
-	if err != nil {
-		return fmt.Errorf("architecture resolution failed: %w", err)
-	}
-
-	tag := "v" + strings.TrimPrefix(TargetXrayVersion, "v")
-	zipURL := fmt.Sprintf("%s/%s/%s", XrayReleaseBase, tag, assetName)
-	dgstURL := zipURL + ".dgst"
-
-	log.Printf("[INFO] Pinned Xray target: %s (%s). Fetching signature from %s...", tag, assetName, dgstURL)
-
-	expectedHash, err := m.fetchXrayDGSTHash(ctx, dgstURL)
-	if err != nil {
-		return fmt.Errorf("failed to fetch xray .dgst: %w", err)
-	}
-
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "xray_install_*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	archivePath := filepath.Join(tmpDir, assetName)
-	log.Printf("[INFO] Downloading Xray release: %s...", zipURL)
-	if err := m.downloadFile(ctx, zipURL, archivePath); err != nil {
-		return fmt.Errorf("failed to download xray archive: %w", err)
-	}
-
-	if err := m.verifyFileSHA256(archivePath, expectedHash); err != nil {
-		return fmt.Errorf("xray archive checksum failed: %w", err)
-	}
-
-	newBinPath := filepath.Join(tmpDir, "xray.bin")
-	if err := extractFileFromZip(archivePath, "xray", newBinPath); err != nil {
-		return fmt.Errorf("failed to extract xray executable: %w", err)
-	}
-
-	_ = os.Chmod(newBinPath, 0755)
-
-	// Валидируем бинарник вызовом version
-	testCmd := exec.CommandContext(ctx, newBinPath, "version")
-	if out, err := testCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("xray self-test failed: %w (out: %s)", err, strings.TrimSpace(string(out)))
-	}
-
-	targetPath := XrayBinPath
-	if lp, err := exec.LookPath("xray"); err == nil {
-		targetPath = lp
-	}
-
-	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
-		return fmt.Errorf("failed to replace xray binary: %w", err)
-	}
-
-	log.Printf("[INFO] Xray successfully pinned and updated to version %s at %s", TargetXrayVersion, targetPath)
-	return nil
-}
-
-func (m *Manager) fetchXrayDGSTHash(ctx context.Context, dgstURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dgstURL, nil)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	// Парсим строки формата: SHA256= <хеш> или SHA256 = <хеш>
-	for _, line := range strings.Split(string(body), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToUpper(trimmed), "SHA256") {
-			parts := strings.Split(trimmed, "=")
-			if len(parts) == 2 {
-				return strings.ToLower(strings.TrimSpace(parts[1])), nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("SHA256 not found in .dgst response")
-}
-
-func extractFileFromZip(zipPath, targetFileName, outPath string) error {
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	for _, f := range r.File {
-		if f.Name == targetFileName {
-			rc, err := f.Open()
-			if err != nil {
-				return err
-			}
-			defer rc.Close()
-
-			outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				return err
-			}
-			defer outFile.Close()
-
-			_, err = io.Copy(outFile, rc)
-			return err
-		}
-	}
-	return fmt.Errorf("file %s not found inside archive", targetFileName)
-}
-
-func replaceFileCrossDevice(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-
-	_ = os.Remove(src)
-	return nil
-}
-
-func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
-	if len(pkgs) == 0 {
-		pkgs = []string{"sing-box", "xray-core"}
-	}
-
-	var pkgMgrTargets []string
-
-	for _, p := range pkgs {
-		if p == "xray" || p == "xray-core" {
-			xrStatus := m.checkPinnedXrayStatus()
-			if xrStatus.HasUpdate || !xrStatus.Installed {
-				log.Printf("[INFO] Upgrading Xray-core to pinned version %s...", TargetXrayVersion)
-				if err := m.UpgradeXrayCore(ctx); err != nil {
-					return err
-				}
-			} else {
-				log.Printf("[INFO] Xray is already on pinned version %s", TargetXrayVersion)
-			}
-			continue
-		}
-
-		st := m.checkPkgStatus(p)
-		if st.Installed {
-			pkgMgrTargets = append(pkgMgrTargets, p)
-		}
-	}
-
-	if len(pkgMgrTargets) == 0 {
-		return nil
-	}
-
-	if m.pkgManager == "apk" {
-		log.Println("[INFO] Updating apk package repositories...")
-		if out, err := exec.CommandContext(ctx, "apk", "update").CombinedOutput(); err != nil {
-			return fmt.Errorf("apk update failed: %s", string(out))
-		}
-		args := append([]string{"add", "--upgrade"}, pkgMgrTargets...)
-		log.Printf("[INFO] Running apk %s...", strings.Join(args, " "))
-		if out, err := exec.CommandContext(ctx, "apk", args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("apk upgrade failed: %s", string(out))
-		}
-		return nil
-	}
-
-	log.Println("[INFO] Updating opkg repository indexes...")
-	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
-		return fmt.Errorf("opkg update failed: %s", string(out))
-	}
-	args := append([]string{"upgrade"}, pkgMgrTargets...)
-	log.Printf("[INFO] Running opkg %s...", strings.Join(args, " "))
-	if out, err := exec.CommandContext(ctx, "opkg", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("opkg upgrade failed: %s", string(out))
-	}
 	return nil
 }
 
@@ -738,23 +632,18 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	}()
 
 	switch target {
-	case "sing-box":
-		return m.UpgradeCores(ctx, "sing-box")
-	case "xray", "xray-core":
-		return m.UpgradeCores(ctx, "xray-core")
-	case "cores":
-		return m.UpgradeCores(ctx, "sing-box", "xray-core")
+	case "sing-box", "cores":
+		return m.UpgradeSingBoxCore(ctx)
 	case "cheburnet":
 		return m.UpgradePackage(ctx)
 	case "all":
-		_ = m.UpgradeCores(ctx, "sing-box", "xray-core")
+		_ = m.UpgradeSingBoxCore(ctx)
 		return m.UpgradePackage(ctx)
 	default:
 		return fmt.Errorf("unknown target: %s", target)
 	}
 }
 
-// StartAutoUpdateLoop запускает периодический фоновый опрос релизов и установку обновлений
 func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled func() bool, onUpdateSuccess func()) {
 	initialDelay := 5 * time.Minute
 	checkInterval := 6 * time.Hour
@@ -783,13 +672,13 @@ func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled f
 				return
 			}
 
-			needUpgrade := report.CheburNet.HasUpdate || report.SingBox.HasUpdate || report.Xray.HasUpdate
+			needUpgrade := report.CheburNet.HasUpdate || report.SingBox.HasUpdate
 			if !needUpgrade {
 				return
 			}
 
-			log.Printf("[updater] Auto-update triggered! Components: CheburNet=%v, SingBox=%v, Xray=%v",
-				report.CheburNet.HasUpdate, report.SingBox.HasUpdate, report.Xray.HasUpdate)
+			log.Printf("[updater] Auto-update triggered! Components: CheburNet=%v, SingBox=%v",
+				report.CheburNet.HasUpdate, report.SingBox.HasUpdate)
 
 			upgCtx, upgCancel := context.WithTimeout(ctx, 5*time.Minute)
 			defer upgCancel()

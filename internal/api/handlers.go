@@ -17,6 +17,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+const TargetConfigPath = "/tmp/run/cheburnet/sing-box.json"
+
 // handleStatus возвращает текущий статус ядра, количество нод, внешний IP и активную ноду
 func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
@@ -40,34 +42,13 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"engine":      cfg.Engine,
+		"engine":      "sing-box",
 		"nodes_count": len(cfg.Nodes),
 		"active_node": activeNode,
 		"auto_hwid":   cfg.AutoHWID,
 		"custom_hwid": cfg.CustomHWID,
 		"outbound_ip": outboundIP,
 	})
-}
-
-// handleSwitchEngine переключает ядро между sing-box и xray
-func (s *Server) handleSwitchEngine(c *fiber.Ctx) error {
-	var req struct {
-		Engine string `json:"engine"`
-	}
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	if req.Engine != "sing-box" && req.Engine != "xray" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "engine must be sing-box or xray"})
-	}
-
-	if err := s.swapEngine(req.Engine); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	s.state.SetEngine(req.Engine)
-	return c.JSON(fiber.Map{"status": "ok", "active_engine": req.Engine})
 }
 
 // handleGetNodes возвращает список всех текущих нод
@@ -136,19 +117,14 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		}
 	}
 
-	// 1. Атомарно обновляем состояние и сразу получаем свежий изолированный снимок
+	// 1. Атомарно обновляем состояние и получаем изолированный снимок
 	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
 		cfg.Nodes = allNodes
 	})
 
-	// 2. Безопасный перезапуск sing-box / xray через SafeReload со свежим снапшотом
+	// 2. Безопасный перезапуск sing-box через SafeReload
 	eng := s.getEngine()
-	targetPath := "/tmp/run/cheburnet/sing-box.json"
-	if eng.Name() == "xray" {
-		targetPath = "/tmp/run/cheburnet/xray.json"
-	}
-
-	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, targetPath); err != nil {
+	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
 		log.Printf("[api] update subscriptions reload error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to safely apply updated subscriptions: " + err.Error(),
@@ -236,12 +212,7 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 	}
 
 	eng := s.getEngine()
-	targetPath := "/tmp/run/cheburnet/sing-box.json"
-	if eng.Name() == "xray" {
-		targetPath = "/tmp/run/cheburnet/xray.json"
-	}
-
-	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, targetPath); err != nil {
+	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to safely reload engine with new source: " + err.Error(),
 		})
@@ -287,7 +258,7 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 
 	newCfg.Nodes = allNodes
 
-	// 1. Атомарно обновляем конфигурацию в памяти и возвращаем чистый снапшот
+	// 1. Атомарно обновляем конфигурацию в памяти
 	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
 		*cfg = *newCfg
 	})
@@ -299,14 +270,10 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 	}
 
 	eng := s.getEngine()
-	targetPath := "/tmp/run/cheburnet/sing-box.json"
-	if eng.Name() == "xray" {
-		targetPath = "/tmp/run/cheburnet/xray.json"
-	}
 
 	// 3. Передаем свежий снапшот в SafeReload
 	if len(freshSnapshot.Nodes) > 0 {
-		if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, targetPath); err != nil {
+		if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to safely reload engine: " + err.Error(),
 			})

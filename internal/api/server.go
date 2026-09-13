@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"os/exec"
-	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -29,7 +28,6 @@ type Server struct {
 	subWorker  *subscription.Worker
 	updater    *updater.Manager
 	getEngine  func() engine.Engine
-	swapEngine func(name string) error
 	rulesCron  *network.RulesetCron
 	diagEngine *diagnostics.DiagnosticsEngine
 	onAction   ActionCallback
@@ -63,7 +61,6 @@ func NewServer(
 		subWorker:  subWorker,
 		updater:    upd,
 		getEngine:  getEngine,
-		swapEngine: swapEngine,
 		rulesCron:  rulesCron,
 		diagEngine: diagEngine,
 		onAction:   onAction,
@@ -78,39 +75,9 @@ func (s *Server) setupRoutes() {
 
 	api.Get("/status", s.handleStatus)
 
-	// Всеядный обработчик переключения: читает и engine, и name
 	api.Post("/engine/switch", func(c *fiber.Ctx) error {
-		var req struct {
-			Engine string `json:"engine"`
-			Name   string `json:"name"`
-		}
-
-		if err := c.BodyParser(&req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "invalid request payload",
-			})
-		}
-
-		target := strings.ToLower(strings.TrimSpace(req.Engine))
-		if target == "" {
-			target = strings.ToLower(strings.TrimSpace(req.Name))
-		}
-
-		if target != "sing-box" && target != "xray" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "engine must be sing-box or xray",
-			})
-		}
-
-		if err := s.swapEngine(target); err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": err.Error(),
-			})
-		}
-
-		return c.JSON(fiber.Map{
-			"status":        "ok",
-			"active_engine": target,
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "engine switching is disabled: sing-box is the dedicated core",
 		})
 	})
 

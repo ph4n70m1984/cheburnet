@@ -45,7 +45,7 @@ return view.extend({
     render: function(data) {
         const hosts = (data && data[0]) ? data[0] : {};
         const m = new form.Map('cheburnet', _('Chebur.NET'),
-            _('Управление прозрачным проксированием трафика на базе Sing-box и Xray-core'));
+            _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
         const statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
@@ -312,97 +312,6 @@ return view.extend({
                 }, _('Обновить сейчас'))
             ]);
 
-            const engineSwitchContainer = E('div', {
-                'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.1); display: flex; align-items: center; justify-content: space-between;'
-            }, [
-                E('div', { 'style': 'display: flex; align-items: center; gap: 10px;' }, [
-                    E('span', { 'style': 'font-size: 13px; color: #a1a1aa;' }, _('Активный движок ядра:')),
-                    E('span', { 'id': 'quick-engine-label', 'style': 'font-size: 13px; font-weight: bold; color: #38bdf8;' }, _('Загрузка...'))
-                ]),
-                E('div', { 'style': 'display: flex; gap: 8px;' }, [
-                    E('button', {
-                        'class': 'btn cbi-button-action',
-                        'id': 'btn-switch-singbox',
-                        'style': 'font-size: 11px; margin: 0; padding: 4px 12px;',
-                        'click': function(e) {
-                            e.preventDefault();
-                            switchEngineQuick('sing-box');
-                        }
-                    }, 'Sing-box'),
-                    E('button', {
-                        'class': 'btn cbi-button-action',
-                        'id': 'btn-switch-xray',
-                        'style': 'font-size: 11px; margin: 0; padding: 4px 12px;',
-                        'click': function(e) {
-                            e.preventDefault();
-                            switchEngineQuick('xray');
-                        }
-                    }, 'Xray-core')
-                ])
-            ]);
-
-            function updateEngineUI(activeEngine) {
-                const label = document.getElementById('quick-engine-label');
-                const btnSb = document.getElementById('btn-switch-singbox');
-                const btnXr = document.getElementById('btn-switch-xray');
-                
-                const isXray = (activeEngine === 'xray');
-
-                if (label) {
-                    label.textContent = isXray ? 'Xray-core' : 'Sing-box';
-                    label.style.color = isXray ? '#a855f7' : '#38bdf8';
-                }
-                if (btnSb && btnXr) {
-                    btnSb.style.opacity = isXray ? '1' : '0.5';
-                    btnXr.style.opacity = isXray ? '0.5' : '1';
-                    btnSb.disabled = !isXray;
-                    btnXr.disabled = isXray;
-                }
-
-                const selectEl = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
-                if (selectEl && selectEl.value !== activeEngine) {
-                    selectEl.value = activeEngine;
-                }
-            }
-
-            function switchEngineQuick(targetEngine) {
-                ui.showIndicator('switching-engine', _('Переключение движка на %s...').format(targetEngine));
-                const host = window.location.hostname;
-
-                fetch('http://' + host + ':8088/api/v1/engine/switch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ engine: targetEngine })
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data && data.error) {
-                        ui.hideIndicator('switching-engine');
-                        ui.addNotification(null, E('p', {}, _('Ошибка переключения: ') + data.error), 'error');
-                        return;
-                    }
-
-                    uci.set('cheburnet', 'main', 'engine', targetEngine);
-                    return uci.save().then(() => {
-                        // Вызываем нативный роутер демона вместо uci.apply(), чтобы избежать ubus тайм-аутов
-                        return fetch('http://' + host + ':8088/api/v1/reload', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' }
-                        });
-                    }).then(() => {
-                        updateEngineUI(targetEngine);
-                        const selectEl = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
-                        if (selectEl) selectEl.value = targetEngine;
-                        ui.hideIndicator('switching-engine');
-                        ui.addNotification(null, E('p', {}, _('Движок успешно изменен на %s').format(targetEngine)), 'info');
-                    });
-                })
-                .catch(err => {
-                    ui.hideIndicator('switching-engine');
-                    ui.addNotification(null, E('p', {}, _('Сетевая ошибка: ') + err), 'warning');
-                });
-            }
-
             const table = E('table', { 'class': 'table', 'id': 'chebur-nodes-table' }, [
                 E('tr', { 'class': 'tr table-titles' }, [
                     E('th', { 'class': 'th' }, _('Сервер / Тег')),
@@ -420,7 +329,6 @@ return view.extend({
                 diagBanner,
                 problemsContainer,
                 updateBanner,
-                engineSwitchContainer,
                 E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap;' }, [
                     E('div', { 'style': badgeStyle }, [
                         E('span', { 'style': 'color: #8c8c8c; font-size: 13px;' }, _('Сервис демона:')),
@@ -457,9 +365,6 @@ return view.extend({
                 if (data.sing_box && data.sing_box.installed && data.sing_box.has_update) {
                     alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
                 }
-                if (data.xray && data.xray.installed && data.xray.has_update) {
-                    alerts.push('Xray: ' + data.xray.current + ' → ' + data.xray.latest);
-                }
                 if (alerts.length > 0) {
                     const banner = document.getElementById('update-notification-banner');
                     const txt = document.getElementById('update-banner-text');
@@ -478,7 +383,6 @@ return view.extend({
                     let html = `<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">`;
                     html += formatComponentStatus('Chebur.NET', r.cheburnet);
                     html += formatComponentStatus('Sing-box', r.sing_box);
-                    html += formatComponentStatus('Xray-core', r.xray);
                     html += `</ul>`;
                     statusDiv.innerHTML = html;
                 }
@@ -486,9 +390,8 @@ return view.extend({
                 if (btnUpgrade) {
                     const hasAppUpdate = r.cheburnet && r.cheburnet.has_update;
                     const hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
-                    const hasXrUpdate = r.xray && r.xray.installed && r.xray.has_update;
 
-                    if (hasAppUpdate || hasSbUpdate || hasXrUpdate) {
+                    if (hasAppUpdate || hasSbUpdate) {
                         btnUpgrade.style.display = 'inline-block';
                     } else {
                         btnUpgrade.style.display = 'none';
@@ -671,10 +574,6 @@ return view.extend({
                     try {
                         const msg = JSON.parse(event.data);
 
-                        if (msg.engine) {
-                            updateEngineUI(msg.engine);
-                        }
-
                         if (msg.active_node) {
                             highlightActiveNode(msg.active_node);
                         }
@@ -772,9 +671,6 @@ return view.extend({
                         if (countEl && data.nodes_count !== undefined) {
                             countEl.textContent = data.nodes_count;
                         }
-                        if (data.engine) {
-                            updateEngineUI(data.engine);
-                        }
                         if (data.active_node) {
                             highlightActiveNode(data.active_node);
                         }
@@ -810,7 +706,7 @@ return view.extend({
 
                 connectWebSocket(host);
 
-                syncIntervalId = setInterval(syncClashDelays, 10000);
+                syncIntervalId = setInterval(syncClashDelays, 5000);
                 bannerIntervalId = setInterval(updateBannerContent, 2000);
                 setTimeout(checkUpdates, 1500);
             }
@@ -870,12 +766,7 @@ return view.extend({
         s.tab('updates', _('Менеджер обновлений'));
 
         // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
-        let o = s.taboption('general', form.ListValue, 'engine', _('Движок ядра'));
-        o.value('sing-box', 'Sing-box');
-        o.value('xray', 'Xray-core');
-        o.default = 'sing-box';
-
-        o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
+        let o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
         o.value('rules', _('По спискам (Избирательный обход)'));
         o.value('global', _('Весь трафик (Полный туннель / Global VPN)'));
         o.default = 'rules';
@@ -1236,39 +1127,24 @@ return view.extend({
                     ui.hideIndicator('saving-cheburnet');
                     ui.showIndicator('reloading-cheburnet', _('Применение настроек в Chebur.NET...'));
 
-                    const engineSelect = document.querySelector('select[name$=".engine"]') || document.getElementById('cbid.cheburnet.main.engine');
-                    const selectedEngine = engineSelect ? engineSelect.value : (uci.get('cheburnet', 'main', 'engine') || 'sing-box');
-
                     const host = window.location.hostname;
-                    return fetch('http://' + host + ':8088/api/v1/engine/switch', {
+                    return fetch('http://' + host + ':8088/api/v1/reload', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ engine: selectedEngine })
+                        headers: { 'Content-Type': 'application/json' }
                     })
                     .then(function(res) { return res.json(); })
-                    .then(function() {
-                        return new Promise(function(resolve) {
-                            setTimeout(resolve, 800);
-                        }).then(function() {
-                            return fetch('http://' + host + ':8088/api/v1/reload', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' }
-                            })
-                            .then(function(res) { return res.json(); })
-                            .then(function(data) {
-                                ui.hideIndicator('reloading-cheburnet');
-                                if (data && data.error) {
-                                    ui.addNotification(null, E('p', {}, _('Ошибка применения: ') + data.error), 'error');
-                                } else {
-                                    ui.addNotification(null, E('p', {}, _('Движок и настройки успешно применены!')), 'info');
-                                    window.location.reload();
-                                }
-                            });
-                        });
+                    .then(function(data) {
+                        ui.hideIndicator('reloading-cheburnet');
+                        if (data && data.error) {
+                            ui.addNotification(null, E('p', {}, _('Ошибка применения: ') + data.error), 'error');
+                        } else {
+                            ui.addNotification(null, E('p', {}, _('Настройки успешно применены!')), 'info');
+                            window.location.reload();
+                        }
                     })
                     .catch(function(err) {
                         ui.hideIndicator('reloading-cheburnet');
-                        ui.addNotification(null, E('p', {}, _('Сетевая ошибка при переключении: ') + err), 'warning');
+                        ui.addNotification(null, E('p', {}, _('Сетевая ошибка при перезагрузке: ') + err), 'warning');
                     });
                 });
             });

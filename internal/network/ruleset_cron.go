@@ -82,18 +82,10 @@ func (c *RulesetCron) Start(ctx context.Context) {
 				log.Println("[ruleset-cron] starting scheduled update...")
 				updatedAny := false
 
-				// 1. Проверка и обновление geosite.dat для Xray
-				if updatedGeo, err := c.loader.UpdateGeositeDat(); err != nil {
-					log.Printf("[ruleset-cron] failed to update geosite.dat: %v", err)
-				} else if updatedGeo {
-					log.Println("[ruleset-cron] geosite.dat successfully updated")
-					updatedAny = true
-				}
-
-				// 2. Обновление локальных подсетей .lst.gz
+				// Обновление локальных подсетей .lst.gz
 				for _, rs := range currentSets {
 					if err := c.loader.UpdateRuleset(rs); err != nil {
-						// 404 для подсетей — штатно для сервисов, содержащих только домены
+						// 404 для подсетей — штатно для категорий без IP-диапазонов
 						log.Printf("[ruleset-cron] ruleset %s: %v", rs, err)
 					} else {
 						log.Printf("[ruleset-cron] successfully updated and compressed subnets for %s", rs)
@@ -101,7 +93,7 @@ func (c *RulesetCron) Start(ctx context.Context) {
 					}
 				}
 
-				// 3. Перезагрузка ядра при наличии изменений
+				// Перезагрузка ядра при наличии изменений
 				if updatedAny && c.reloadCallback != nil {
 					log.Println("[ruleset-cron] applying updated rulesets into running engine...")
 					if err := c.reloadCallback(); err != nil {

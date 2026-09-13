@@ -20,10 +20,5 @@ type Engine interface {
 }
 
 func NewEngine(name string) Engine {
-	switch name {
-	case "xray":
-		return NewXrayEngine()
-	default:
-		return NewSingBoxEngine()
-	}
+	return NewSingBoxEngine()
 }

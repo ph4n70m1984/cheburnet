@@ -69,7 +69,7 @@ type SubscriptionConfig struct {
 }
 
 type CheburConfig struct {
-	Engine                string               `json:"engine"`
+	Engine                string               `json:"engine"`       // Всегда "sing-box"
 	RoutingMode           string               `json:"routing_mode"` // "rules" или "global"
 	SourceMode            string               `json:"source_mode"`
 	AutoHWID              bool                 `json:"auto_hwid"`
