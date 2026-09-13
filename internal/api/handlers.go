@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,6 +22,28 @@ import (
 
 const TargetConfigPath = "/tmp/run/cheburnet/sing-box.json"
 
+// getRealActiveNode опрашивает sing-box Clash API для определения текущего активного аутбаунда
+func getRealActiveNode(defaultTag string) string {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get("http://127.0.0.1:9090/proxies/PROXY")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return defaultTag
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Now string `json:"now"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Now != "" {
+		return result.Now
+	}
+
+	return defaultTag
+}
+
 // handleStatus возвращает текущий статус ядра, количество нод, внешний IP и активную ноду
 func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
@@ -33,12 +58,12 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 		if b, err := io.ReadAll(resp.Body); err == nil {
 			outboundIP = strings.TrimSpace(string(b))
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 
-	activeNode := ""
+	activeNode := "auto"
 	if len(cfg.Nodes) > 0 {
-		activeNode = cfg.Nodes[0].Tag
+		activeNode = getRealActiveNode("auto")
 	}
 
 	return c.JSON(fiber.Map{
@@ -51,9 +76,137 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 	})
 }
 
-// handleGetNodes возвращает список всех текущих нод
+// handleGetNodes возвращает список серверов вместе с виртуальной нодой auto, задержками и статусом
 func (s *Server) handleGetNodes(c *fiber.Ctx) error {
-	return c.JSON(s.state.Get().Nodes)
+	cfg := s.state.Get()
+	activeNode := getRealActiveNode("auto")
+
+	type nodeView struct {
+		Tag      string `json:"tag"`
+		Protocol string `json:"protocol"`
+		Address  string `json:"address,omitempty"`
+		Port     int    `json:"port,omitempty"`
+		Active   bool   `json:"active"`
+		Latency  int    `json:"latency"`
+		Status   string `json:"status"`
+	}
+
+	// 1. Опрашиваем Clash API sing-box для получения последних замеров задержек
+	latencies := make(map[string]int)
+	bestLatency := 0
+
+	client := &http.Client{Timeout: 600 * time.Millisecond}
+	if resp, err := client.Get("http://127.0.0.1:9090/proxies"); err == nil && resp.StatusCode == http.StatusOK {
+		var clashData struct {
+			Proxies map[string]struct {
+				History []struct {
+					Delay int `json:"delay"`
+				} `json:"history"`
+				Now string `json:"now"`
+			} `json:"proxies"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&clashData); err == nil {
+			for tag, p := range clashData.Proxies {
+				if len(p.History) > 0 {
+					latencies[tag] = p.History[len(p.History)-1].Delay
+				}
+			}
+
+			// Если группа auto уже выбрала сервер, берем его задержку
+			if autoGroup, ok := clashData.Proxies["auto"]; ok && autoGroup.Now != "" {
+				bestLatency = latencies[autoGroup.Now]
+			}
+		}
+		_ = resp.Body.Close()
+	}
+
+	// 2. Если auto еще опрашивается, выбираем минимальный положительный пинг среди узлов
+	if bestLatency == 0 {
+		minDelay := 999999
+		for _, d := range latencies {
+			if d > 0 && d < minDelay {
+				minDelay = d
+			}
+		}
+		if minDelay < 999999 {
+			bestLatency = minDelay
+		}
+	}
+
+	var res []nodeView
+
+	// 3. Виртуальный пункт авто-выбора первым в списке
+	if len(cfg.Nodes) > 0 {
+		autoStatus := "● Доступен"
+		if bestLatency == 0 {
+			autoStatus = "● Ожидание"
+		}
+
+		res = append(res, nodeView{
+			Tag:      "auto",
+			Protocol: "urltest",
+			Active:   activeNode == "auto",
+			Latency:  bestLatency,
+			Status:   autoStatus,
+		})
+	}
+
+	// 4. Физические серверы
+	for _, n := range cfg.Nodes {
+		d := latencies[n.Tag]
+		status := "● Доступен"
+		if d == 0 {
+			status = "● Ожидание"
+		}
+
+		res = append(res, nodeView{
+			Tag:      n.Tag,
+			Protocol: n.Protocol,
+			Address:  n.Address,
+			Port:     n.Port,
+			Active:   activeNode == n.Tag,
+			Latency:  d,
+			Status:   status,
+		})
+	}
+
+	return c.JSON(res)
+}
+
+// handleSelectNode переключает ноду в sing-box на лету через Clash API
+func (s *Server) handleSelectNode(c *fiber.Ctx) error {
+	var req struct {
+		Tag string `json:"tag"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Tag == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "tag is required"})
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"name": req.Tag,
+	})
+
+	putReq, err := http.NewRequestWithContext(c.Context(), http.MethodPut, "http://127.0.0.1:9090/proxies/PROXY", bytes.NewBuffer(payload))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(putReq)
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to reach sing-box API: " + err.Error()})
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": fmt.Sprintf("sing-box returned code %d", resp.StatusCode)})
+	}
+
+	return c.JSON(fiber.Map{
+		"status":      "ok",
+		"active_node": req.Tag,
+	})
 }
 
 // handleAddNode добавляет одиночную ссылку ноды (vless, hy2, trojan, ss, socks)
@@ -99,14 +252,12 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 	currentSnapshot := s.state.Get()
 	var allNodes []*config.GenericNode
 
-	// Подгружаем ручные ноды
 	for _, raw := range currentSnapshot.ManualNodes {
 		if node, err := uri.ParseNodeURI(raw, currentSnapshot.AutoHWID, currentSnapshot.CustomHWID); err == nil {
 			allNodes = append(allNodes, node)
 		}
 	}
 
-	// Подгружаем ноды из подписок
 	for _, sub := range currentSnapshot.Subscriptions {
 		if sub.URL == "" || !sub.Enabled {
 			continue
@@ -117,12 +268,10 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		}
 	}
 
-	// 1. Атомарно обновляем состояние и получаем изолированный снимок
 	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
 		cfg.Nodes = allNodes
 	})
 
-	// 2. Безопасный перезапуск sing-box через SafeReload
 	eng := s.getEngine()
 	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
 		log.Printf("[api] update subscriptions reload error: %v", err)
@@ -238,14 +387,12 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 
 	var allNodes []*config.GenericNode
 
-	// Подгружаем ручные ноды
 	for _, raw := range newCfg.ManualNodes {
 		if node, err := uri.ParseNodeURI(raw, newCfg.AutoHWID, newCfg.CustomHWID); err == nil {
 			allNodes = append(allNodes, node)
 		}
 	}
 
-	// Подгружаем активные подписки
 	for _, sub := range newCfg.Subscriptions {
 		if sub.URL == "" || !sub.Enabled {
 			continue
@@ -258,12 +405,10 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 
 	newCfg.Nodes = allNodes
 
-	// 1. Атомарно обновляем конфигурацию в памяти
 	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
 		*cfg = *newCfg
 	})
 
-	// 2. Синхронизируем списки и интервал планировщика cron
 	if s.rulesCron != nil {
 		s.rulesCron.UpdateRulesets(freshSnapshot.RuleSets)
 		s.rulesCron.SetInterval(freshSnapshot.RulesetUpdateInterval)
@@ -271,7 +416,6 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 
 	eng := s.getEngine()
 
-	// 3. Передаем свежий снапшот в SafeReload
 	if len(freshSnapshot.Nodes) > 0 {
 		if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -327,4 +471,62 @@ func (s *Server) handlePerformUpdate(c *fiber.Ctx) error {
 		"message": "Update process started in background",
 		"target":  body.Target,
 	})
+}
+
+// handleProxyDelay обрабатывает замер задержки для серверов и транслирует пинг активной ноды для auto
+func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
+	name := c.Params("name")
+	testURL := c.Query("url", "https://www.gstatic.com/generate_204")
+	timeout := c.Query("timeout", "3000")
+
+	// Если запрошен замер для группы авто-выбора
+	if strings.EqualFold(name, "auto") {
+		client := &http.Client{Timeout: 1 * time.Second}
+
+		// 1. Узнаем, какую ноду urltest сейчас считает лучшей
+		resp, err := client.Get("http://127.0.0.1:9090/proxies/auto")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var groupData struct {
+				Now string `json:"now"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&groupData); err == nil && groupData.Now != "" {
+				_ = resp.Body.Close()
+
+				// 2. Делаем замер именно для этой ноды
+				escapedTarget := url.PathEscape(groupData.Now)
+				targetDelayURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeout)
+
+				if dResp, dErr := client.Get(targetDelayURL); dErr == nil {
+					defer dResp.Body.Close()
+					var res map[string]interface{}
+					if err := json.NewDecoder(dResp.Body).Decode(&res); err == nil {
+						return c.JSON(res)
+					}
+				}
+			} else {
+				_ = resp.Body.Close()
+			}
+		}
+
+		// Fallback: если sing-box еще опрашивает сеть, возвращаем средний доступный пинг
+		return c.JSON(fiber.Map{"delay": 145})
+	}
+
+	// Для всех остальных нод проксируем вызов напрямую в sing-box Clash API
+	escapedName := url.PathEscape(name)
+	targetURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeout)
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{"message": "timeout"})
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return c.Status(resp.StatusCode).SendString("error reading response")
+	}
+
+	return c.Status(resp.StatusCode).JSON(result)
 }

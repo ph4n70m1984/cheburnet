@@ -54,7 +54,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	isGlobal := cfg.RoutingMode == "global"
 
-	// 1. Аутбаунды (ноды и селекторы)
+	// 1. Аутбаунды (ноды, urltest auto и селекторы)
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -75,7 +75,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
-			urltestTag := fmt.Sprintf("%s-urltest", grp.Tag)
+			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
 			interval := grp.Interval
 			if interval == "" {
 				interval = "3m"
@@ -90,15 +90,17 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "urltest",
-				"tag":       urltestTag,
-				"outbounds": grp.Nodes,
-				"url":       targetURL,
-				"interval":  interval,
-				"tolerance": tolerance,
+				"type":                        "urltest",
+				"tag":                         urltestTag,
+				"outbounds":                   grp.Nodes,
+				"url":                         targetURL,
+				"interval":                    interval,
+				"tolerance":                   tolerance,
+				"idle_timeout":                "30m",
+				"interrupt_exist_connections": false,
 			})
 
-			selectorList := append(grp.Nodes, urltestTag)
+			selectorList := append([]string{urltestTag}, grp.Nodes...)
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":      "selector",
 				"tag":       grp.Tag,
@@ -111,16 +113,18 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 		}
 	} else if len(allNodeTags) > 0 {
-		urltestTag := "AUTO"
+		urltestTag := "auto"
 		selectorTag := "PROXY"
 
 		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "urltest",
-			"tag":       urltestTag,
-			"outbounds": allNodeTags,
-			"url":       "https://www.gstatic.com/generate_204",
-			"interval":  "3m",
-			"tolerance": 50,
+			"type":                        "urltest",
+			"tag":                         urltestTag,
+			"outbounds":                   allNodeTags,
+			"url":                         "https://www.gstatic.com/generate_204",
+			"interval":                    "3m",
+			"tolerance":                   50,
+			"idle_timeout":                "30m",
+			"interrupt_exist_connections": false,
 		})
 
 		selectorList := append([]string{urltestTag}, allNodeTags...)
@@ -227,7 +231,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"strategy": "ipv4_only",
 	}
 
-	// 3. Inbounds (без legacy поля sniff)
+	// 3. Inbounds (чистый tproxy без устаревшего поля sniff)
 	tproxyPort := cfg.TProxyPort
 	if tproxyPort == 0 {
 		tproxyPort = 1602

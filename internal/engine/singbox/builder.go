@@ -327,7 +327,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
-			urltestTag := fmt.Sprintf("%s-urltest", grp.Tag)
+			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
 			interval := grp.Interval
 			if interval == "" {
 				interval = "3m"
@@ -342,15 +342,17 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "urltest",
-				"tag":       urltestTag,
-				"outbounds": grp.Nodes,
-				"url":       targetURL,
-				"interval":  interval,
-				"tolerance": tolerance,
+				"type":                        "urltest",
+				"tag":                         urltestTag,
+				"outbounds":                   grp.Nodes,
+				"url":                         targetURL,
+				"interval":                    interval,
+				"tolerance":                   tolerance,
+				"idle_timeout":                "30m",
+				"interrupt_exist_connections": false,
 			})
 
-			selectorList := append(grp.Nodes, urltestTag)
+			selectorList := append([]string{urltestTag}, grp.Nodes...)
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":      "selector",
 				"tag":       grp.Tag,
@@ -363,16 +365,18 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 		}
 	} else if len(allNodeTags) > 0 {
-		urltestTag := "AUTO"
+		urltestTag := "auto"
 		selectorTag := "PROXY"
 
 		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "urltest",
-			"tag":       urltestTag,
-			"outbounds": allNodeTags,
-			"url":       "https://www.gstatic.com/generate_204",
-			"interval":  "3m",
-			"tolerance": 50,
+			"type":                        "urltest",
+			"tag":                         urltestTag,
+			"outbounds":                   allNodeTags,
+			"url":                         "https://www.gstatic.com/generate_204",
+			"interval":                    "3m",
+			"tolerance":                   50,
+			"idle_timeout":                "30m",
+			"interrupt_exist_connections": false,
 		})
 
 		selectorList := append([]string{urltestTag}, allNodeTags...)
@@ -713,7 +717,6 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 
 func getRealActiveNode(defaultTag string) string {
 	client := &http.Client{Timeout: 600 * time.Millisecond}
-	// Опрашиваем сначала 127.0.0.1, затем fallback на LAN-интерфейс
 	urls := []string{
 		"http://127.0.0.1:9090/proxies",
 		"http://192.168.11.1:9090/proxies",

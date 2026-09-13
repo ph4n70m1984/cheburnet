@@ -115,6 +115,7 @@ func (s *Server) setupRoutes() {
 	api.Post("/source", s.handleAddSource)
 	api.Post("/sources/add", s.handleAddSource)
 	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
+	api.Get("/proxies/:name/delay", s.handleProxyDelay)
 
 	s.app.Use("/ws", func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {

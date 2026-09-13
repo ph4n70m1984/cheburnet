@@ -489,17 +489,27 @@ return view.extend({
                     .catch(function() {});
             }
 
-            function highlightActiveNode(activeTag) {
-                if (!activeTag) {
+            // Статичная подсветка: selectedTag определяет строку в таблице, subResolvedTag - реальный выход
+            function highlightActiveNode(selectedTag, subResolvedTag) {
+                if (!selectedTag) {
                     return;
                 }
-                window.cheburActiveNodeTag = activeTag;
 
+                var isAuto = (selectedTag === 'auto' || selectedTag === 'AUTO');
+                window.cheburActiveNodeTag = isAuto ? 'auto' : selectedTag;
+                var targetRowId = isAuto ? 'node-row-auto' : ('node-row-' + selectedTag);
+
+                // 1. Верхняя карточка "АКТИВНЫЙ СЕРВЕР"
                 var nameEl = document.getElementById('active-server-name');
                 if (nameEl) {
-                    nameEl.textContent = activeTag;
+                    if (isAuto) {
+                        nameEl.textContent = subResolvedTag ? ('⚡ Авто → ' + subResolvedTag) : '⚡ Автовыбор (auto)';
+                    } else {
+                        nameEl.textContent = selectedTag;
+                    }
                 }
 
+                // 2. Снимаем выделение со всех строк
                 var rows = document.querySelectorAll('#chebur-nodes-table tr[id^="node-row-"]');
                 rows.forEach(function(r) {
                     r.style.background = '';
@@ -510,7 +520,8 @@ return view.extend({
                     }
                 });
 
-                var activeRow = document.getElementById('node-row-' + activeTag);
+                // 3. Статично выделяем только активную строку таблицы
+                var activeRow = document.getElementById(targetRowId);
                 if (activeRow) {
                     activeRow.style.background = 'rgba(56, 189, 248, 0.12)';
                     activeRow.style.boxShadow = 'inset 3px 0 0 0 #38bdf8';
@@ -526,15 +537,18 @@ return view.extend({
 
                     var protoSpan = activeRow.querySelector('.node-proto-label');
                     var cardProto = document.getElementById('active-server-proto');
-                    if (protoSpan && cardProto) {
-                        cardProto.textContent = protoSpan.textContent;
+                    if (cardProto) {
+                        cardProto.textContent = isAuto
+                            ? (subResolvedTag ? ('Динамический выбор: ' + subResolvedTag) : 'urltest')
+                            : (protoSpan ? protoSpan.textContent : '');
                     }
                 }
             }
 
             function selectProxyNode(nodeTag) {
                 var host = window.location.hostname;
-                ui.showIndicator('selecting-node', _('Переключение на сервер %s...').format(nodeTag));
+                var displayName = (nodeTag === 'auto') ? _('Автовыбор') : nodeTag;
+                ui.showIndicator('selecting-node', _('Переключение на %s...').format(displayName));
 
                 fetch('http://' + host + ':9090/proxies/PROXY', {
                     method: 'PUT',
@@ -544,23 +558,25 @@ return view.extend({
                 .then(function(r) {
                     ui.hideIndicator('selecting-node');
                     if (r.ok || r.status === 204) {
-                        highlightActiveNode(nodeTag);
-                        ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + nodeTag), 'info');
+                        highlightActiveNode(nodeTag, '');
+                        ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + displayName), 'info');
+                        setTimeout(syncClashDelays, 300);
                     } else {
                         throw new Error('HTTP ' + r.status);
                     }
                 })
                 .catch(function() {
-                    fetch('http://' + host + ':9090/proxies/auto', {
-                        method: 'PUT',
+                    fetch('http://' + host + ':8088/api/v1/nodes/select', {
+                        method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ name: nodeTag })
+                        body: JSON.stringify({ tag: nodeTag })
                     })
                     .then(function(r) {
                         ui.hideIndicator('selecting-node');
-                        if (r.ok || r.status === 204) {
-                            highlightActiveNode(nodeTag);
-                            ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + nodeTag), 'info');
+                        if (r.ok) {
+                            highlightActiveNode(nodeTag, '');
+                            ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + displayName), 'info');
+                            setTimeout(syncClashDelays, 300);
                         }
                     })
                     .catch(function(err) {
@@ -593,11 +609,12 @@ return view.extend({
                     statusEl.innerHTML = '<span style="color: #f87171; font-weight: bold;">● Офлайн</span>';
                 }
 
-                if (tag === window.cheburActiveNodeTag) {
+                // Синхронизируем показатели в верхней плашке
+                if (tag === window.cheburActiveNodeTag || (window.cheburActiveNodeTag === 'auto' && tag === 'auto')) {
                     var cardLat = document.getElementById('active-server-lat');
                     var cardBadge = document.getElementById('active-server-badge');
                     if (cardLat) {
-                        cardLat.textContent = latency > 0 ? latency + ' ms' : 'Timeout';
+                        cardLat.textContent = latency > 0 ? (latency + ' ms') : 'Timeout';
                         var actColor = '#4ade80';
                         if (latency >= 450) {
                             actColor = '#f87171';
@@ -633,34 +650,29 @@ return view.extend({
                             return;
                         }
 
-                        var resolveGroupNow = function(groupName) {
-                            var curr = groupName;
-                            var visited = {};
-                            for (var i = 0; i < 4; i++) {
-                                if (!curr || visited[curr]) {
-                                    break;
-                                }
-                                visited[curr] = true;
-                                var grp = data.proxies[curr];
-                                if (grp && grp.now && grp.now !== curr) {
-                                    curr = grp.now;
-                                } else {
-                                    break;
-                                }
-                            }
-                            return curr;
-                        };
+                        var proxyGroup = data.proxies['PROXY'] || data.proxies['proxy'];
+                        var autoGroup = data.proxies['auto'] || data.proxies['AUTO'];
+                        var autoCurrentBest = (autoGroup && autoGroup.now) ? autoGroup.now : '';
 
-                        var specialNames = ['PROXY', 'proxy', 'auto', 'AUTO', 'auto-out'];
-                        for (var s = 0; s < specialNames.length; s++) {
-                            var group = data.proxies[specialNames[s]];
-                            if (group && group.now) {
-                                var resolved = resolveGroupNow(group.now);
-                                if (resolved) {
-                                    highlightActiveNode(resolved);
-                                    break;
-                                }
+                        // Проверяем текущий выбор: auto или ручная нода
+                        if (proxyGroup && proxyGroup.now) {
+                            if (proxyGroup.now === 'auto' || proxyGroup.now === 'AUTO') {
+                                highlightActiveNode('auto', autoCurrentBest);
+                            } else {
+                                highlightActiveNode(proxyGroup.now, '');
                             }
+                        }
+
+                        // Обновляем задержку строки "auto" по выбранному ею узлу
+                        var autoDelay = 0;
+                        if (autoCurrentBest && data.proxies[autoCurrentBest]) {
+                            var bestInfo = data.proxies[autoCurrentBest];
+                            if (bestInfo.history && bestInfo.history.length > 0) {
+                                autoDelay = bestInfo.history[bestInfo.history.length - 1].delay || 0;
+                            }
+                        }
+                        if (autoDelay > 0) {
+                            updateNodeUI('auto', autoDelay);
                         }
 
                         var entries = Object.entries(data.proxies).filter(function(pair) {
@@ -707,8 +719,10 @@ return view.extend({
                         if (ipEl && data.outbound_ip) {
                             ipEl.textContent = data.outbound_ip;
                         }
-                        if (data.active_node) {
-                            highlightActiveNode(data.active_node);
+
+                        // Если уже выбран режим auto - не позволяем backend-статусу сбрасывать подсветку строки
+                        if (data.active_node && !window.cheburActiveNodeTag) {
+                            highlightActiveNode(data.active_node, '');
                         }
                     })
                     .catch(function() {
@@ -739,8 +753,9 @@ return view.extend({
                 ws.onmessage = function(event) {
                     try {
                         var msg = JSON.parse(event.data);
-                        if (msg.active_node) {
-                            highlightActiveNode(msg.active_node);
+                        // Не перебиваем режим auto при получении физического имени ноды через WS
+                        if (msg.active_node && window.cheburActiveNodeTag !== 'auto') {
+                            highlightActiveNode(msg.active_node, '');
                         }
                         if (msg.type === 'update_report' && msg.data) {
                             showUpdateNotification(msg.data);
@@ -797,27 +812,37 @@ return view.extend({
                             row.className = 'tr';
                             row.id = 'node-row-' + node.tag;
                             row.style.cursor = 'pointer';
-                            row.title = _('Нажмите, чтобы сделать этот сервер активным');
+                            row.title = (node.tag === 'auto')
+                                ? _('Нажмите, чтобы включить автоматический выбор быстрейшего сервера')
+                                : _('Нажмите, чтобы сделать этот сервер активным');
+
                             row.onclick = function() {
                                 selectProxyNode(node.tag);
                             };
 
                             var cellTag = row.insertCell(0);
                             cellTag.className = 'td';
-                            cellTag.innerHTML = '<strong>' + node.tag + '</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(' + node.protocol + ')</span>';
+
+                            if (node.tag === 'auto') {
+                                cellTag.innerHTML = '<strong style="color:#38bdf8;">⚡ Автовыбор сервера</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(urltest)</span>';
+                            } else {
+                                cellTag.innerHTML = '<strong>' + node.tag + '</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(' + node.protocol + ')</span>';
+                            }
 
                             var cellLat = row.insertCell(1);
                             cellLat.className = 'td';
                             cellLat.id = 'node-lat-' + node.tag;
-                            cellLat.textContent = 'Опрос...';
+                            cellLat.textContent = node.latency > 0 ? (node.latency + ' ms') : 'Опрос...';
 
                             var cellStatus = row.insertCell(2);
                             cellStatus.className = 'td';
                             cellStatus.id = 'node-status-' + node.tag;
-                            cellStatus.innerHTML = '<span style="color: #fbbf24; font-weight: bold;">● Ожидание</span>';
+                            cellStatus.innerHTML = (node.latency > 0)
+                                ? '<span style="color: #4ade80; font-weight: bold;">● Доступен</span>'
+                                : '<span style="color: #fbbf24; font-weight: bold;">● Ожидание</span>';
                         });
 
-                        setTimeout(syncClashDelays, 800);
+                        setTimeout(syncClashDelays, 400);
                     })
                     .catch(function(e) { console.error('Nodes fetch error:', e); });
 
@@ -825,7 +850,7 @@ return view.extend({
                 fetchDiagnosticsOnce();
                 connectWebSocket(host);
 
-                syncIntervalId = setInterval(syncClashDelays, 5000);
+                syncIntervalId = setInterval(syncClashDelays, 4000);
                 statusPollIntervalId = setInterval(syncRealtimeStatus, 5000);
                 diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 4000);
                 setTimeout(checkUpdates, 1500);
@@ -938,7 +963,6 @@ return view.extend({
         o.depends('auto_hwid', '0');
         o.placeholder = '00000000-0000-0000-0000-000000000000';
 
-        // Функция оборачивания секций GridSection в details
         function wrapGridSectionInDetails(sectionObj, titleText, descText, isOpen) {
             var orig = sectionObj.render;
             sectionObj.render = function() {
