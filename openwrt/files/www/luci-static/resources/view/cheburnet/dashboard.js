@@ -6,7 +6,7 @@
 'require network';
 'require tools.widgets as widgets';
 
-const ALLOW_DOMAIN_CATEGORIES = [
+var ALLOW_DOMAIN_CATEGORIES = [
     { tag: 'anime',          title: 'Anime' },
     { tag: 'block',          title: 'Block' },
     { tag: 'cloudflare',     title: 'Cloudflare' },
@@ -43,28 +43,31 @@ return view.extend({
     },
 
     render: function(data) {
-        const hosts = (data && data[0]) ? data[0] : {};
-        const m = new form.Map('cheburnet', _('Chebur.NET'),
+        var hosts = (data && data[0]) ? data[0] : {};
+        var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
-        const statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
+        var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
 
         statusSec.render = function() {
             window.cheburProblems = {};
             window.cheburLastDiagSnapshot = null;
+            window.cheburActiveNodeTag = '';
 
-            let isSyncingDelays = false;
-            let syncIntervalId = null;
-            let diagPollIntervalId = null;
-            let statusPollIntervalId = null;
+            var isSyncingDelays = false;
+            var syncIntervalId = null;
+            var diagPollIntervalId = null;
+            var statusPollIntervalId = null;
 
             function updateBannerContent() {
-                const banner = document.getElementById('diag-banner');
-                const content = document.getElementById('diag-banner-content');
-                if (!banner || !content) return;
+                var banner = document.getElementById('diag-banner');
+                var content = document.getElementById('diag-banner-content');
+                if (!banner || !content) {
+                    return;
+                }
 
-                const snap = window.cheburLastDiagSnapshot;
+                var snap = window.cheburLastDiagSnapshot;
                 if (!snap) {
                     banner.style.background = 'rgba(255, 255, 255, 0.05)';
                     banner.style.borderColor = 'rgba(255, 255, 255, 0.15)';
@@ -73,48 +76,68 @@ return view.extend({
                     return;
                 }
 
-                const pList = Object.values(window.cheburProblems || {});
+                var pList = Object.values(window.cheburProblems || {});
 
                 if (pList.length === 0) {
                     banner.style.background = 'rgba(74, 222, 128, 0.1)';
                     banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
                     banner.style.color = '#4ade80';
-                    content.innerHTML = `● Все системы работают штатно &middot; Проверено показателей: <strong>${snap.total_checks || 15}</strong>`;
-                    const container = document.getElementById('diag-problems-container');
-                    if (container) container.innerHTML = '';
+                    var totalCount = snap.total_checks || 15;
+                    content.innerHTML = '● Все системы работают штатно &middot; Проверено показателей: <strong>' + totalCount + '</strong>';
+                    var container = document.getElementById('diag-problems-container');
+                    if (container) {
+                        container.innerHTML = '';
+                    }
                     return;
                 }
 
-                const hasCrit = pList.some(p => p.severity === 'critical');
-                banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
-                banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
-                banner.style.color = hasCrit ? '#f87171' : '#fef08a';
+                var hasCrit = false;
+                for (var i = 0; i < pList.length; i++) {
+                    if (pList[i].severity === 'critical') {
+                        hasCrit = true;
+                        break;
+                    }
+                }
 
-                content.innerHTML = `▲ Обнаружены проблемы: <strong>${pList.length}</strong>`;
+                if (hasCrit) {
+                    banner.style.background = 'rgba(239, 68, 68, 0.15)';
+                    banner.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+                    banner.style.color = '#f87171';
+                } else {
+                    banner.style.background = 'rgba(234, 179, 8, 0.15)';
+                    banner.style.borderColor = 'rgba(234, 179, 8, 0.4)';
+                    banner.style.color = '#fef08a';
+                }
+
+                content.innerHTML = '▲ Обнаружены проблемы: <strong>' + pList.length + '</strong>';
             }
 
             function executeProblemAction(action, btnEl) {
-                if (!action) return;
+                if (!action) {
+                    return;
+                }
                 btnEl.disabled = true;
                 btnEl.textContent = _('Выполняется...');
 
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 6000);
+                var controller = new AbortController();
+                var timeoutId = setTimeout(function() { controller.abort(); }, 6000);
 
                 fetch('http://' + window.location.hostname + ':8088/api/v1/actions/' + action, {
                     method: 'POST',
                     signal: controller.signal
                 })
-                .then(r => {
+                .then(function(r) {
                     clearTimeout(timeoutId);
-                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    if (!r.ok) {
+                        throw new Error('HTTP ' + r.status);
+                    }
                     return r.json();
                 })
-                .then(() => {
+                .then(function() {
                     btnEl.textContent = _('Запрос отправлен');
                     setTimeout(fetchDiagnosticsOnce, 1200);
                 })
-                .catch(err => {
+                .catch(function(err) {
                     clearTimeout(timeoutId);
                     btnEl.disabled = false;
                     btnEl.textContent = _('Ошибка');
@@ -123,19 +146,24 @@ return view.extend({
             }
 
             function renderProblemsCards() {
-                const container = document.getElementById('diag-problems-container');
-                if (!container) return;
+                var container = document.getElementById('diag-problems-container');
+                if (!container) {
+                    return;
+                }
                 container.innerHTML = '';
 
-                const pList = Object.values(window.cheburProblems || {});
-                if (pList.length === 0) return;
+                var pList = Object.values(window.cheburProblems || {});
+                if (pList.length === 0) {
+                    return;
+                }
 
-                pList.forEach(prob => {
-                    const isCrit = prob.severity === 'critical';
-                    const cardBg = isCrit ? 'rgba(239, 68, 68, 0.08)' : 'rgba(234, 179, 8, 0.08)';
-                    const cardBorder = isCrit ? 'rgba(239, 68, 68, 0.3)' : 'rgba(234, 179, 8, 0.3)';
+                pList.forEach(function(prob) {
+                    var isCrit = (prob.severity === 'critical');
+                    var cardBg = isCrit ? 'rgba(239, 68, 68, 0.08)' : 'rgba(234, 179, 8, 0.08)';
+                    var cardBorder = isCrit ? 'rgba(239, 68, 68, 0.3)' : 'rgba(234, 179, 8, 0.3)';
+                    var msgColor = isCrit ? '#f87171' : '#fef08a';
 
-                    let actionBtn = null;
+                    var actionBtn = null;
                     if (prob.recoverable && prob.action) {
                         actionBtn = E('button', {
                             'class': 'btn cbi-button-action',
@@ -147,75 +175,94 @@ return view.extend({
                         }, _('Исправить'));
                     }
 
-                    let symptomsBlock = null;
+                    var symptomsBlock = null;
                     if (prob.symptoms && Array.isArray(prob.symptoms)) {
-                        const cleanSymptoms = prob.symptoms.filter(s => s && s !== 'null' && typeof s === 'string');
+                        var cleanSymptoms = prob.symptoms.filter(function(s) {
+                            return s && s !== 'null' && typeof s === 'string';
+                        });
                         if (cleanSymptoms.length > 0) {
+                            var liNodes = [];
+                            cleanSymptoms.forEach(function(item) {
+                                liNodes.push(E('li', {}, item));
+                            });
+
                             symptomsBlock = E('details', { 'style': 'margin-top: 6px; font-size: 11px; color: #a1a1aa;' }, [
                                 E('summary', { 'style': 'cursor: pointer; user-select: none;' }, _('Сопутствующие симптомы (%d)').format(cleanSymptoms.length)),
-                                E('ul', { 'style': 'margin: 4px 0 0 16px; padding: 0;' },
-                                    cleanSymptoms.map(s => E('li', {}, s))
-                                )
+                                E('ul', { 'style': 'margin: 4px 0 0 16px; padding: 0;' }, liNodes)
                             ]);
                         }
                     }
 
-                    const card = E('div', {
+                    var leftChildren = [
+                        E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
+                            E('span', { 'style': 'font-weight: bold; font-size: 13px; color: ' + msgColor + ';' }, prob.message),
+                            E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.1); color: #d4d4d8;' }, prob.component)
+                        ])
+                    ];
+                    if (symptomsBlock) {
+                        leftChildren.push(symptomsBlock);
+                    }
+
+                    var cardChildren = [
+                        E('div', { 'style': 'display: flex; flex-direction: column;' }, leftChildren)
+                    ];
+                    if (actionBtn) {
+                        cardChildren.push(E('div', {}, [actionBtn]));
+                    } else {
+                        cardChildren.push(E('span'));
+                    }
+
+                    var card = E('div', {
                         'id': 'problem-card-' + prob.id,
-                        'style': `padding: 10px 14px; border-radius: 6px; background: ${cardBg}; border: 1px solid ${cardBorder}; display: flex; justify-content: space-between; align-items: center; gap: 15px;`
-                    }, [
-                        E('div', { 'style': 'display: flex; flex-direction: column;' }, [
-                            E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
-                                E('span', { 'style': `font-weight: bold; font-size: 13px; color: ${isCrit ? '#f87171' : '#fef08a'};` }, prob.message),
-                                E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.1); color: #d4d4d8;' }, prob.component)
-                            ]),
-                            symptomsBlock
-                        ]),
-                        actionBtn ? E('div', {}, [actionBtn]) : E('span')
-                    ]);
+                        'style': 'padding: 10px 14px; border-radius: 6px; background: ' + cardBg + '; border: 1px solid ' + cardBorder + '; display: flex; justify-content: space-between; align-items: center; gap: 15px;'
+                    }, cardChildren);
 
                     container.appendChild(card);
                 });
             }
 
             function renderDiagnosticSnapshot(snap) {
-                if (!snap) return;
-
+                if (!snap) {
+                    return;
+                }
                 window.cheburLastDiagSnapshot = snap;
                 window.cheburProblems = {};
                 if (snap.problems && Array.isArray(snap.problems)) {
-                    snap.problems.forEach(p => {
+                    snap.problems.forEach(function(p) {
                         window.cheburProblems[p.id] = p;
                     });
                 }
-
                 updateBannerContent();
                 renderProblemsCards();
             }
 
             function fetchDiagnosticsOnce() {
-                const host = window.location.hostname;
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 3500);
+                var host = window.location.hostname;
+                var controller = new AbortController();
+                var timeoutId = setTimeout(function() { controller.abort(); }, 3500);
 
                 fetch('http://' + host + ':8088/api/v1/diagnostics', {
                     signal: controller.signal
                 })
-                .then(r => {
+                .then(function(r) {
                     clearTimeout(timeoutId);
-                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    if (!r.ok) {
+                        throw new Error('HTTP ' + r.status);
+                    }
                     return r.json();
                 })
-                .then(snap => {
+                .then(function(snap) {
                     renderDiagnosticSnapshot(snap);
                 })
-                .catch(() => {
+                .catch(function() {
                     clearTimeout(timeoutId);
                 });
             }
 
             function handleWsEvent(msg) {
-                if (!msg || !msg.type) return;
+                if (!msg || !msg.type) {
+                    return;
+                }
 
                 if (msg.type === 'diagnostic.snapshot' && msg.snapshot) {
                     renderDiagnosticSnapshot(msg.snapshot);
@@ -230,7 +277,7 @@ return view.extend({
                 }
             }
 
-            const diagBanner = E('div', {
+            var diagBanner = E('div', {
                 'id': 'diag-banner',
                 'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(74, 222, 128, 0.1); border: 1px solid rgba(74, 222, 128, 0.25); color: #4ade80; display: flex; align-items: center; justify-content: space-between;'
             }, [
@@ -240,30 +287,32 @@ return view.extend({
                     'style': 'font-size: 11px; margin: 0; padding: 2px 10px;',
                     'click': function(e) {
                         e.preventDefault();
-                        const btn = this;
-                        const origText = btn.textContent;
+                        var btn = this;
+                        var origText = btn.textContent;
                         btn.textContent = _('Опрос...');
                         btn.disabled = true;
 
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 4000);
+                        var controller = new AbortController();
+                        var timeoutId = setTimeout(function() { controller.abort(); }, 4000);
 
                         fetch('http://' + window.location.hostname + ':8088/api/v1/diagnostics', {
                             signal: controller.signal
                         })
-                        .then(r => {
+                        .then(function(r) {
                             clearTimeout(timeoutId);
-                            if (!r.ok) throw new Error('HTTP ' + r.status);
+                            if (!r.ok) {
+                                throw new Error('HTTP ' + r.status);
+                            }
                             return r.json();
                         })
-                        .then(snap => {
+                        .then(function(snap) {
                             renderDiagnosticSnapshot(snap);
                         })
-                        .catch(err => {
+                        .catch(function(err) {
                             clearTimeout(timeoutId);
                             ui.addNotification(null, E('p', {}, _('Ошибка опроса диагностики: ') + err), 'error');
                         })
-                        .finally(() => {
+                        .finally(function() {
                             btn.textContent = origText;
                             btn.disabled = false;
                         });
@@ -271,12 +320,12 @@ return view.extend({
                 }, _('Опросить'))
             ]);
 
-            const problemsContainer = E('div', {
+            var problemsContainer = E('div', {
                 'id': 'diag-problems-container',
                 'style': 'margin-bottom: 15px; display: flex; flex-direction: column; gap: 8px;'
             });
 
-            const updateBanner = E('div', {
+            var updateBanner = E('div', {
                 'id': 'update-notification-banner',
                 'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); color: #fef08a;'
             }, [
@@ -292,14 +341,16 @@ return view.extend({
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ target: 'all' })
                         })
-                        .then(r => r.json())
-                        .then(() => {
+                        .then(function(r) { return r.json(); })
+                        .then(function() {
                             ui.hideIndicator('updating-system');
                             ui.addNotification(null, E('p', {}, _('Процесс обновления запущен в фоне.')), 'info');
-                            const banner = document.getElementById('update-notification-banner');
-                            if (banner) banner.style.display = 'none';
+                            var b = document.getElementById('update-notification-banner');
+                            if (b) {
+                                b.style.display = 'none';
+                            }
                         })
-                        .catch(err => {
+                        .catch(function(err) {
                             ui.hideIndicator('updating-system');
                             ui.addNotification(null, E('p', {}, _('Ошибка запуска: ') + err), 'error');
                         });
@@ -307,7 +358,24 @@ return view.extend({
                 }, _('Обновить сейчас'))
             ]);
 
-            const table = E('table', { 'class': 'table', 'id': 'chebur-nodes-table' }, [
+            var activeServerCard = E('div', {
+                'id': 'active-server-card',
+                'style': 'margin-bottom: 12px; padding: 12px 16px; border-radius: 6px; background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); display: flex; justify-content: space-between; align-items: center; gap: 15px;'
+            }, [
+                E('div', { 'style': 'display: flex; flex-direction: column; gap: 4px;' }, [
+                    E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
+                        E('span', { 'style': 'font-size: 11px; text-transform: uppercase; font-weight: bold; color: #38bdf8; background: rgba(56, 189, 248, 0.2); padding: 2px 6px; border-radius: 4px;' }, _('АКТИВНЫЙ СЕРВЕР')),
+                        E('span', { 'id': 'active-server-name', 'style': 'font-weight: bold; font-size: 14px; color: #ffffff;' }, _('Определение...'))
+                    ]),
+                    E('span', { 'id': 'active-server-proto', 'style': 'font-size: 12px; color: #a1a1aa;' }, '')
+                ]),
+                E('div', { 'style': 'display: flex; align-items: center; gap: 12px;' }, [
+                    E('span', { 'id': 'active-server-lat', 'style': 'font-size: 13px; font-weight: bold; color: #fbbf24; font-family: monospace;' }, '--- ms'),
+                    E('span', { 'id': 'active-server-badge', 'style': 'font-size: 12px; font-weight: bold; color: #4ade80;' }, '● Онлайн')
+                ])
+            ]);
+
+            var table = E('table', { 'class': 'table', 'id': 'chebur-nodes-table' }, [
                 E('tr', { 'class': 'tr table-titles' }, [
                     E('th', { 'class': 'th' }, _('Сервер / Тег')),
                     E('th', { 'class': 'th' }, _('Задержка')),
@@ -318,13 +386,26 @@ return view.extend({
                 ])
             ]);
 
-            const badgeStyle = 'background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
+            var nodesDetails = E('details', {
+                'class': 'cbi-section',
+                'style': 'margin-bottom: 18px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 10px; background: rgba(255, 255, 255, 0.02);'
+            }, [
+                E('summary', {
+                    'style': 'font-size: 13px; font-weight: bold; cursor: pointer; padding: 6px 8px; user-select: none; color: #94a3b8; display: flex; justify-content: space-between; align-items: center;'
+                }, [
+                    E('span', {}, _('Все доступные серверы и переключение')),
+                    E('span', { 'style': 'font-size: 11px; font-weight: normal; color: #64748b;' }, _('(нажмите, чтобы развернуть)'))
+                ]),
+                E('div', { 'style': 'margin-top: 10px;' }, [table])
+            ]);
 
-            const viewContainer = E('div', { 'class': 'cbi-section' }, [
+            var badgeStyle = 'background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
+
+            var viewContainer = E('div', { 'class': 'cbi-section' }, [
                 diagBanner,
                 problemsContainer,
                 updateBanner,
-                E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 18px; flex-wrap: wrap;' }, [
+                E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap;' }, [
                     E('div', { 'style': badgeStyle }, [
                         E('span', { 'style': 'color: #8c8c8c; font-size: 13px;' }, _('Сервис демона:')),
                         E('span', { 'id': 'daemon-status', 'style': 'color: #8c8c8c; font-weight: bold; font-size: 13px;' }, '● Проверка...')
@@ -338,22 +419,25 @@ return view.extend({
                         E('span', { 'id': 'total-nodes', 'style': 'color: #fbbf24; font-weight: bold; font-size: 14px;' }, '0')
                     ])
                 ]),
-                table
+                activeServerCard,
+                nodesDetails
             ]);
 
             function formatComponentStatus(name, comp) {
                 if (!comp || !comp.installed) {
-                    return `<li>${name}: <span style="color:#71717a;">Не установлен</span></li>`;
+                    return '<li>' + name + ': <span style="color:#71717a;">Не установлен</span></li>';
                 }
                 if (comp.has_update) {
-                    return `<li>${name}: <b>${comp.current}</b> → <span style="color:#4ade80; font-weight:bold;">${comp.latest} (Доступно обновление)</span></li>`;
+                    return '<li>' + name + ': <b>' + comp.current + '</b> → <span style="color:#4ade80; font-weight:bold;">' + comp.latest + ' (Доступно обновление)</span></li>';
                 }
-                return `<li>${name}: <b>${comp.current}</b> → <span style="color:#8c8c8c;">Актуально</span></li>`;
+                return '<li>' + name + ': <b>' + comp.current + '</b> → <span style="color:#8c8c8c;">Актуально</span></li>';
             }
 
             function showUpdateNotification(data) {
-                if (!data) return;
-                let alerts = [];
+                if (!data) {
+                    return;
+                }
+                var alerts = [];
                 if (data.cheburnet && data.cheburnet.has_update) {
                     alerts.push('Chebur.NET: ' + data.cheburnet.current + ' → ' + data.cheburnet.latest);
                 }
@@ -361,8 +445,8 @@ return view.extend({
                     alerts.push('Sing-box: ' + data.sing_box.current + ' → ' + data.sing_box.latest);
                 }
                 if (alerts.length > 0) {
-                    const banner = document.getElementById('update-notification-banner');
-                    const txt = document.getElementById('update-banner-text');
+                    var banner = document.getElementById('update-notification-banner');
+                    var txt = document.getElementById('update-banner-text');
                     if (banner && txt) {
                         txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
                         banner.style.display = 'flex';
@@ -371,20 +455,20 @@ return view.extend({
             }
 
             function renderUpdateReport(r) {
-                const statusDiv = document.getElementById('ws-update-status');
-                const btnUpgrade = document.getElementById('ws-btn-upgrade');
+                var statusDiv = document.getElementById('ws-update-status');
+                var btnUpgrade = document.getElementById('ws-btn-upgrade');
 
                 if (statusDiv) {
-                    let html = `<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">`;
+                    var html = '<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">';
                     html += formatComponentStatus('Chebur.NET', r.cheburnet);
                     html += formatComponentStatus('Sing-box', r.sing_box);
-                    html += `</ul>`;
+                    html += '</ul>';
                     statusDiv.innerHTML = html;
                 }
 
                 if (btnUpgrade) {
-                    const hasAppUpdate = r.cheburnet && r.cheburnet.has_update;
-                    const hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
+                    var hasAppUpdate = r.cheburnet && r.cheburnet.has_update;
+                    var hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
 
                     if (hasAppUpdate || hasSbUpdate) {
                         btnUpgrade.style.display = 'inline-block';
@@ -395,44 +479,61 @@ return view.extend({
             }
 
             function checkUpdates() {
-                const host = window.location.hostname;
+                var host = window.location.hostname;
                 fetch('http://' + host + ':8088/api/v1/updates/check')
-                    .then(r => r.json())
-                    .then(data => {
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
                         showUpdateNotification(data);
                         renderUpdateReport(data);
                     })
-                    .catch(() => {});
+                    .catch(function() {});
             }
 
             function highlightActiveNode(activeTag) {
-                if (!activeTag) return;
-                const rows = document.querySelectorAll('#chebur-nodes-table tr[id^="node-row-"]');
-                rows.forEach(r => {
+                if (!activeTag) {
+                    return;
+                }
+                window.cheburActiveNodeTag = activeTag;
+
+                var nameEl = document.getElementById('active-server-name');
+                if (nameEl) {
+                    nameEl.textContent = activeTag;
+                }
+
+                var rows = document.querySelectorAll('#chebur-nodes-table tr[id^="node-row-"]');
+                rows.forEach(function(r) {
                     r.style.background = '';
                     r.style.boxShadow = '';
-                    const badge = r.querySelector('.active-node-badge');
-                    if (badge) badge.remove();
+                    var badge = r.querySelector('.active-node-badge');
+                    if (badge) {
+                        badge.remove();
+                    }
                 });
 
-                const activeRow = document.getElementById('node-row-' + activeTag);
+                var activeRow = document.getElementById('node-row-' + activeTag);
                 if (activeRow) {
                     activeRow.style.background = 'rgba(56, 189, 248, 0.12)';
                     activeRow.style.boxShadow = 'inset 3px 0 0 0 #38bdf8';
 
-                    const tagCell = activeRow.cells[0];
+                    var tagCell = activeRow.cells[0];
                     if (tagCell && !tagCell.querySelector('.active-node-badge')) {
-                        const badge = E('span', {
+                        var badge = E('span', {
                             'class': 'active-node-badge',
                             'style': 'margin-left: 8px; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; background: #0284c7; color: #ffffff;'
                         }, _('АКТИВЕН'));
                         tagCell.appendChild(badge);
                     }
+
+                    var protoSpan = activeRow.querySelector('.node-proto-label');
+                    var cardProto = document.getElementById('active-server-proto');
+                    if (protoSpan && cardProto) {
+                        cardProto.textContent = protoSpan.textContent;
+                    }
                 }
             }
 
             function selectProxyNode(nodeTag) {
-                const host = window.location.hostname;
+                var host = window.location.hostname;
                 ui.showIndicator('selecting-node', _('Переключение на сервер %s...').format(nodeTag));
 
                 fetch('http://' + host + ':9090/proxies/PROXY', {
@@ -440,7 +541,7 @@ return view.extend({
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name: nodeTag })
                 })
-                .then(r => {
+                .then(function(r) {
                     ui.hideIndicator('selecting-node');
                     if (r.ok || r.status === 204) {
                         highlightActiveNode(nodeTag);
@@ -449,20 +550,20 @@ return view.extend({
                         throw new Error('HTTP ' + r.status);
                     }
                 })
-                .catch(() => {
+                .catch(function() {
                     fetch('http://' + host + ':9090/proxies/auto', {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ name: nodeTag })
                     })
-                    .then(r => {
+                    .then(function(r) {
                         ui.hideIndicator('selecting-node');
                         if (r.ok || r.status === 204) {
                             highlightActiveNode(nodeTag);
                             ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + nodeTag), 'info');
                         }
                     })
-                    .catch(err => {
+                    .catch(function(err) {
                         ui.hideIndicator('selecting-node');
                         ui.addNotification(null, E('p', {}, _('Ошибка переключения узла: ') + err), 'error');
                     });
@@ -470,42 +571,77 @@ return view.extend({
             }
 
             function updateNodeUI(tag, latency) {
-                const latEl = document.getElementById('node-lat-' + tag);
-                const statusEl = document.getElementById('node-status-' + tag);
-                if (!latEl || !statusEl) return;
+                var latEl = document.getElementById('node-lat-' + tag);
+                var statusEl = document.getElementById('node-status-' + tag);
+                if (!latEl || !statusEl) {
+                    return;
+                }
 
                 if (latency > 0) {
                     latEl.textContent = latency + ' ms';
-                    latEl.style.color = latency < 200 ? '#4ade80' : (latency < 450 ? '#fb923c' : '#f87171');
+                    var color = '#4ade80';
+                    if (latency >= 450) {
+                        color = '#f87171';
+                    } else if (latency >= 200) {
+                        color = '#fb923c';
+                    }
+                    latEl.style.color = color;
                     statusEl.innerHTML = '<span style="color: #4ade80; font-weight: bold;">● Доступен</span>';
                 } else {
                     latEl.textContent = 'Timeout';
                     latEl.style.color = '#71717a';
                     statusEl.innerHTML = '<span style="color: #f87171; font-weight: bold;">● Офлайн</span>';
                 }
+
+                if (tag === window.cheburActiveNodeTag) {
+                    var cardLat = document.getElementById('active-server-lat');
+                    var cardBadge = document.getElementById('active-server-badge');
+                    if (cardLat) {
+                        cardLat.textContent = latency > 0 ? latency + ' ms' : 'Timeout';
+                        var actColor = '#4ade80';
+                        if (latency >= 450) {
+                            actColor = '#f87171';
+                        } else if (latency >= 200) {
+                            actColor = '#fb923c';
+                        }
+                        cardLat.style.color = actColor;
+                    }
+                    if (cardBadge) {
+                        cardBadge.innerHTML = latency > 0 ? '● Доступен' : '● Офлайн';
+                        cardBadge.style.color = latency > 0 ? '#4ade80' : '#f87171';
+                    }
+                }
             }
 
             function syncClashDelays() {
-                if (isSyncingDelays) return;
+                if (isSyncingDelays) {
+                    return;
+                }
                 isSyncingDelays = true;
 
-                const host = window.location.hostname;
+                var host = window.location.hostname;
 
                 fetch('http://' + host + ':9090/proxies')
-                    .then(r => {
-                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                    .then(function(r) {
+                        if (!r.ok) {
+                            throw new Error('HTTP ' + r.status);
+                        }
                         return r.json();
                     })
-                    .then(data => {
-                        if (!data || !data.proxies) return;
+                    .then(function(data) {
+                        if (!data || !data.proxies) {
+                            return;
+                        }
 
-                        const resolveGroupNow = (groupName) => {
-                            let curr = groupName;
-                            const visited = {};
-                            for (let i = 0; i < 4; i++) {
-                                if (!curr || visited[curr]) break;
+                        var resolveGroupNow = function(groupName) {
+                            var curr = groupName;
+                            var visited = {};
+                            for (var i = 0; i < 4; i++) {
+                                if (!curr || visited[curr]) {
+                                    break;
+                                }
                                 visited[curr] = true;
-                                const grp = data.proxies[curr];
+                                var grp = data.proxies[curr];
                                 if (grp && grp.now && grp.now !== curr) {
                                     curr = grp.now;
                                 } else {
@@ -515,10 +651,11 @@ return view.extend({
                             return curr;
                         };
 
-                        for (const name of ['PROXY', 'proxy', 'auto', 'AUTO', 'auto-out']) {
-                            const group = data.proxies[name];
+                        var specialNames = ['PROXY', 'proxy', 'auto', 'AUTO', 'auto-out'];
+                        for (var s = 0; s < specialNames.length; s++) {
+                            var group = data.proxies[specialNames[s]];
                             if (group && group.now) {
-                                const resolved = resolveGroupNow(group.now);
+                                var resolved = resolveGroupNow(group.now);
                                 if (resolved) {
                                     highlightActiveNode(resolved);
                                     break;
@@ -526,13 +663,16 @@ return view.extend({
                             }
                         }
 
-                        const entries = Object.entries(data.proxies).filter(([tag]) => 
-                            !['DIRECT', 'REJECT', 'PROXY', 'GLOBAL', 'auto', 'AUTO', 'auto-out'].includes(tag)
-                        );
+                        var entries = Object.entries(data.proxies).filter(function(pair) {
+                            var tag = pair[0];
+                            return !['DIRECT', 'REJECT', 'PROXY', 'GLOBAL', 'auto', 'AUTO', 'auto-out'].includes(tag);
+                        });
 
-                        entries.forEach(([tag, info]) => {
+                        entries.forEach(function(pair) {
+                            var tag = pair[0];
+                            var info = pair[1];
                             if (info.history && info.history.length > 0) {
-                                const last = info.history[info.history.length - 1];
+                                var last = info.history[info.history.length - 1];
                                 if (last.delay !== undefined && last.delay > 0) {
                                     updateNodeUI(tag, last.delay);
                                 } else if (last.delay === 0) {
@@ -543,27 +683,27 @@ return view.extend({
                             }
                         });
                     })
-                    .catch(() => {})
-                    .finally(() => {
+                    .catch(function() {})
+                    .finally(function() {
                         isSyncingDelays = false;
                     });
             }
 
             function syncRealtimeStatus() {
-                const host = window.location.hostname;
+                var host = window.location.hostname;
                 fetch('http://' + host + ':8088/api/v1/status')
-                    .then(r => r.json())
-                    .then(data => {
-                        const statusEl = document.getElementById('daemon-status');
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        var statusEl = document.getElementById('daemon-status');
                         if (statusEl) {
                             statusEl.textContent = '● Онлайн';
                             statusEl.style.color = '#4ade80';
                         }
-                        const countEl = document.getElementById('total-nodes');
+                        var countEl = document.getElementById('total-nodes');
                         if (countEl && data.nodes_count !== undefined) {
                             countEl.textContent = data.nodes_count;
                         }
-                        const ipEl = document.getElementById('outbound-ip');
+                        var ipEl = document.getElementById('outbound-ip');
                         if (ipEl && data.outbound_ip) {
                             ipEl.textContent = data.outbound_ip;
                         }
@@ -571,8 +711,8 @@ return view.extend({
                             highlightActiveNode(data.active_node);
                         }
                     })
-                    .catch(() => {
-                        const statusEl = document.getElementById('daemon-status');
+                    .catch(function() {
+                        var statusEl = document.getElementById('daemon-status');
                         if (statusEl) {
                             statusEl.textContent = '● Офлайн';
                             statusEl.style.color = '#f87171';
@@ -585,11 +725,11 @@ return view.extend({
                     return;
                 }
 
-                const ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
+                var ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
                 window.cheburWs = ws;
 
                 ws.onopen = function() {
-                    const statusEl = document.getElementById('daemon-status');
+                    var statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
                         statusEl.textContent = '● Онлайн';
                         statusEl.style.color = '#4ade80';
@@ -598,23 +738,20 @@ return view.extend({
 
                 ws.onmessage = function(event) {
                     try {
-                        const msg = JSON.parse(event.data);
-
+                        var msg = JSON.parse(event.data);
                         if (msg.active_node) {
                             highlightActiveNode(msg.active_node);
                         }
-
                         if (msg.type === 'update_report' && msg.data) {
                             showUpdateNotification(msg.data);
                             renderUpdateReport(msg.data);
                         }
-
                         handleWsEvent(msg);
                     } catch (e) {}
                 };
 
                 ws.onerror = function() {
-                    const statusEl = document.getElementById('daemon-status');
+                    var statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
                         statusEl.textContent = '● Ошибка связи';
                         statusEl.style.color = '#f87171';
@@ -622,39 +759,41 @@ return view.extend({
                 };
 
                 ws.onclose = function() {
-                    const statusEl = document.getElementById('daemon-status');
+                    var statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
                         statusEl.textContent = '● Офлайн';
                         statusEl.style.color = '#f87171';
                     }
-                    setTimeout(() => connectWebSocket(host), 5000);
+                    setTimeout(function() { connectWebSocket(host); }, 5000);
                 };
             }
 
             function initTelemetry() {
-                const host = window.location.hostname;
-                const tbl = document.getElementById('chebur-nodes-table');
+                var host = window.location.hostname;
+                var tbl = document.getElementById('chebur-nodes-table');
 
                 if (syncIntervalId) clearInterval(syncIntervalId);
                 if (diagPollIntervalId) clearInterval(diagPollIntervalId);
                 if (statusPollIntervalId) clearInterval(statusPollIntervalId);
 
                 fetch('http://' + host + ':8088/api/v1/nodes')
-                    .then(r => r.json())
-                    .then(nodes => {
+                    .then(function(r) { return r.json(); })
+                    .then(function(nodes) {
                         if (!nodes || nodes.length === 0) {
                             return;
                         }
 
-                        const countEl = document.getElementById('total-nodes');
-                        if (countEl) countEl.textContent = nodes.length;
+                        var countEl = document.getElementById('total-nodes');
+                        if (countEl) {
+                            countEl.textContent = nodes.length;
+                        }
 
                         while (tbl.rows.length > 1) {
                             tbl.deleteRow(1);
                         }
 
-                        nodes.forEach(node => {
-                            const row = tbl.insertRow(-1);
+                        nodes.forEach(function(node) {
+                            var row = tbl.insertRow(-1);
                             row.className = 'tr';
                             row.id = 'node-row-' + node.tag;
                             row.style.cursor = 'pointer';
@@ -663,16 +802,16 @@ return view.extend({
                                 selectProxyNode(node.tag);
                             };
 
-                            const cellTag = row.insertCell(0);
+                            var cellTag = row.insertCell(0);
                             cellTag.className = 'td';
-                            cellTag.innerHTML = '<strong>' + node.tag + '</strong> <span style="color:#71717a; font-size: 0.85em;">(' + node.protocol + ')</span>';
+                            cellTag.innerHTML = '<strong>' + node.tag + '</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(' + node.protocol + ')</span>';
 
-                            const cellLat = row.insertCell(1);
+                            var cellLat = row.insertCell(1);
                             cellLat.className = 'td';
                             cellLat.id = 'node-lat-' + node.tag;
                             cellLat.textContent = 'Опрос...';
 
-                            const cellStatus = row.insertCell(2);
+                            var cellStatus = row.insertCell(2);
                             cellStatus.className = 'td';
                             cellStatus.id = 'node-status-' + node.tag;
                             cellStatus.innerHTML = '<span style="color: #fbbf24; font-weight: bold;">● Ожидание</span>';
@@ -680,15 +819,15 @@ return view.extend({
 
                         setTimeout(syncClashDelays, 800);
                     })
-                    .catch(e => console.error('Nodes fetch error:', e));
+                    .catch(function(e) { console.error('Nodes fetch error:', e); });
 
                 syncRealtimeStatus();
                 fetchDiagnosticsOnce();
                 connectWebSocket(host);
 
-                syncIntervalId = setInterval(syncClashDelays, 15000);
-                statusPollIntervalId = setInterval(syncRealtimeStatus, 15000);
-                diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 14000);
+                syncIntervalId = setInterval(syncClashDelays, 5000);
+                statusPollIntervalId = setInterval(syncRealtimeStatus, 5000);
+                diagPollIntervalId = setInterval(fetchDiagnosticsOnce, 4000);
                 setTimeout(checkUpdates, 1500);
             }
 
@@ -698,21 +837,29 @@ return view.extend({
 
         window.cheburCheckUpdates = function(e) {
             e.preventDefault();
-            const statusDiv = document.getElementById('ws-update-status');
-            if (statusDiv) statusDiv.innerHTML = '<span style="color:#fbbf24;">Запрос отправлен. Выполняется проверка GitHub и пакетов...</span>';
+            var statusDiv = document.getElementById('ws-update-status');
+            if (statusDiv) {
+                statusDiv.innerHTML = '<span style="color:#fbbf24;">Запрос отправлен. Выполняется проверка GitHub и пакетов...</span>';
+            }
             if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
                 window.cheburWs.send(JSON.stringify({ action: 'check_updates' }));
             } else {
-                if (statusDiv) statusDiv.innerHTML = '<span style="color:#f87171;">Ошибка: соединение с сервером не установлено.</span>';
+                if (statusDiv) {
+                    statusDiv.innerHTML = '<span style="color:#f87171;">Ошибка: соединение с сервером не установлено.</span>';
+                }
             }
         };
 
         window.cheburPerformUpgrade = function(e) {
             e.preventDefault();
-            const statusDiv = document.getElementById('ws-update-status');
-            const btnUpgrade = document.getElementById('ws-btn-upgrade');
-            if (statusDiv) statusDiv.innerHTML = '<span style="color:#38bdf8;">Процесс обновления запущен в фоне. Демон перезапустится автоматически...</span>';
-            if (btnUpgrade) btnUpgrade.style.display = 'none';
+            var statusDiv = document.getElementById('ws-update-status');
+            var btnUpgrade = document.getElementById('ws-btn-upgrade');
+            if (statusDiv) {
+                statusDiv.innerHTML = '<span style="color:#38bdf8;">Процесс обновления запущен в фоне. Демон перезапустится автоматически...</span>';
+            }
+            if (btnUpgrade) {
+                btnUpgrade.style.display = 'none';
+            }
 
             if (window.cheburWs && window.cheburWs.readyState === WebSocket.OPEN) {
                 window.cheburWs.send(JSON.stringify({ action: 'perform_upgrade', target: 'all' }));
@@ -722,11 +869,11 @@ return view.extend({
         // ==========================================
         // 2. СЕКЦИЯ КОНФИГУРАЦИИ (АККОРДЕОН)
         // ==========================================
-        const s = m.section(form.NamedSection, 'main', 'cheburnet');
+        var s = m.section(form.NamedSection, 'main', 'cheburnet');
         s.anonymous = true;
         s.addremove = false;
 
-        const origRender = s.render;
+        var origRender = s.render;
         s.render = function() {
             return Promise.resolve(origRender.apply(this, arguments)).then(function(contentNode) {
                 return E('details', {
@@ -747,7 +894,7 @@ return view.extend({
         s.tab('updates', _('Менеджер обновлений'));
 
         // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
-        let o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
+        var o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
         o.value('rules', _('По спискам (Избирательный обход)'));
         o.value('global', _('Весь трафик (Полный туннель / Global VPN)'));
         o.default = 'rules';
@@ -791,11 +938,48 @@ return view.extend({
         o.depends('auto_hwid', '0');
         o.placeholder = '00000000-0000-0000-0000-000000000000';
 
+        // Функция оборачивания секций GridSection в details
+        function wrapGridSectionInDetails(sectionObj, titleText, descText, isOpen) {
+            var orig = sectionObj.render;
+            sectionObj.render = function() {
+                var self = this;
+                var args = arguments;
+                return Promise.resolve(orig.apply(self, args)).then(function(node) {
+                    var detailsNode = document.createElement('details');
+                    detailsNode.className = 'cbi-section';
+                    detailsNode.style.marginTop = '15px';
+                    detailsNode.style.border = '1px solid rgba(255, 255, 255, 0.1)';
+                    detailsNode.style.borderRadius = '6px';
+                    detailsNode.style.padding = '10px';
+                    detailsNode.style.background = 'rgba(255, 255, 255, 0.01)';
+                    if (isOpen) {
+                        detailsNode.open = true;
+                    }
+
+                    var summaryNode = E('summary', {
+                        'style': 'font-size: 14px; font-weight: bold; cursor: pointer; padding: 6px 8px; user-select: none; color: #38bdf8; display: flex; justify-content: space-between; align-items: center;'
+                    }, [
+                        E('span', {}, titleText),
+                        E('span', { 'style': 'font-size: 11px; font-weight: normal; color: #64748b;' }, _('(нажмите, чтобы развернуть/свернуть)'))
+                    ]);
+
+                    detailsNode.appendChild(summaryNode);
+                    if (descText) {
+                        var p = E('p', { 'class': 'cbi-section-descr', 'style': 'margin: 6px 8px 12px 8px; color: #94a3b8;' }, descText);
+                        detailsNode.appendChild(p);
+                    }
+                    detailsNode.appendChild(node);
+                    return detailsNode;
+                });
+            };
+        }
+
         // --- ТАБЛИЦА ПОДПИСОК ---
-        const subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
+        var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
         subSec.sortable = true;
+        wrapGridSectionInDetails(subSec, _('▶ Таблица ссылок подписок'), null, true);
 
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -808,8 +992,8 @@ return view.extend({
         o.rmempty = false;
         o.editable = true;
         o.renderWidget = function() {
-            const node = form.Value.prototype.renderWidget.apply(this, arguments);
-            const input = node.querySelector('input');
+            var node = form.Value.prototype.renderWidget.apply(this, arguments);
+            var input = node.querySelector('input');
             if (input) {
                 input.style.maxWidth = '260px';
                 input.style.width = '100%';
@@ -852,11 +1036,12 @@ return view.extend({
         o.modalonly = true;
 
         // --- ТАБЛИЦА ПОЛИТИК КЛИЕНТОВ ---
-        const clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'),
+        var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'),
             _('Индивидуальные правила маршрутизации для устройств локальной сети. Направляют трафик устройства мимо общих списков.'));
         clientSec.anonymous = true;
         clientSec.addremove = true;
         clientSec.sortable = true;
+        wrapGridSectionInDetails(clientSec, _('▶ Политики для устройств (Client Policy)'), _('Индивидуальные правила маршрутизации для устройств локальной сети.'), false);
 
         o = clientSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -872,11 +1057,11 @@ return view.extend({
         o.rmempty = false;
         o.editable = true;
 
-        for (let mac in hosts) {
-            let host = hosts[mac];
+        for (var mac in hosts) {
+            var host = hosts[mac];
             if (host.ipv4 && host.ipv4.length > 0) {
-                let ip = host.ipv4[0];
-                let title = (host.name ? host.name + ' (' + ip + ')' : ip) + ' [' + mac + ']';
+                var ip = host.ipv4[0];
+                var title = (host.name ? host.name + ' (' + ip + ')' : ip) + ' [' + mac + ']';
                 o.value(ip, title);
             }
         }
@@ -889,11 +1074,12 @@ return view.extend({
         o.editable = true;
 
         // --- ТАБЛИЦА СЕКЦИЙ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
-        const routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'),
+        var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'),
             _('Выборочная привязка сервисных списков, доменов и подсетей к конкретным нодам выхода.'));
         routeSec.anonymous = true;
         routeSec.addremove = true;
         routeSec.sortable = true;
+        wrapGridSectionInDetails(routeSec, _('▶ Секции маршрутизации сервисов (Route Policies)'), _('Выборочная привязка сервисных списков, доменов и подсетей к конкретным нодам выхода.'), false);
 
         o = routeSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -907,7 +1093,7 @@ return view.extend({
 
         o = routeSec.option(form.DynamicList, 'rulesets', _('Сервисные списки'));
         o.placeholder = _('Выберите списки');
-        ALLOW_DOMAIN_CATEGORIES.forEach(cat => {
+        ALLOW_DOMAIN_CATEGORIES.forEach(function(cat) {
             o.value(cat.tag, cat.tag + ' — ' + cat.title);
         });
         o.editable = true;
@@ -919,17 +1105,17 @@ return view.extend({
         o.rmempty = false;
         o.editable = true;
 
-        const outboundSelect = o;
+        var outboundSelect = o;
         fetch('http://' + window.location.hostname + ':8088/api/v1/nodes')
-            .then(r => r.json())
-            .then(nodes => {
+            .then(function(r) { return r.json(); })
+            .then(function(nodes) {
                 if (Array.isArray(nodes)) {
-                    nodes.forEach(n => {
+                    nodes.forEach(function(n) {
                         outboundSelect.value(n.tag, n.tag + ' (' + n.protocol + ')');
                     });
                 }
             })
-            .catch(() => {});
+            .catch(function() {});
 
         o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены секции'));
         o.rows = 4;
@@ -954,7 +1140,7 @@ return view.extend({
 
         o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Service list (Предопределенные списки по умолчанию)'));
         o.depends('routing_mode', 'rules');
-        ALLOW_DOMAIN_CATEGORIES.forEach(cat => {
+        ALLOW_DOMAIN_CATEGORIES.forEach(function(cat) {
             o.value(cat.tag, cat.tag + ' — ' + cat.title);
         });
 
@@ -969,8 +1155,8 @@ return view.extend({
         o.wrap = 'off';
         o.placeholder = 'evadex.com\namazonaws.com\nweatherapi.com\nletsencrypt.org\nsms222.us\nmexc.com\ngoogleusercontent.com\n2ip.io';
         o.renderWidget = function() {
-            const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
-            const textarea = node.querySelector('textarea');
+            var node = form.TextValue.prototype.renderWidget.apply(this, arguments);
+            var textarea = node.querySelector('textarea');
             if (textarea) {
                 textarea.style.fontFamily = 'monospace, "Courier New", Courier';
                 textarea.style.fontSize = '12px';
@@ -995,8 +1181,8 @@ return view.extend({
         o.wrap = 'off';
         o.placeholder = '185.252.177.39\n104.16.0.0/12\n1.1.1.1/32';
         o.renderWidget = function() {
-            const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
-            const textarea = node.querySelector('textarea');
+            var node = form.TextValue.prototype.renderWidget.apply(this, arguments);
+            var textarea = node.querySelector('textarea');
             if (textarea) {
                 textarea.style.fontFamily = 'monospace, "Courier New", Courier';
                 textarea.style.fontSize = '12px';
@@ -1022,8 +1208,8 @@ return view.extend({
         o.placeholder = '443\n50000:65535\n8080-8090';
         o.description = _('Укажите одиночные порты или диапазоны (через двоеточие или дефис), которые нужно перенаправлять в прокси.');
         o.renderWidget = function() {
-            const node = form.TextValue.prototype.renderWidget.apply(this, arguments);
-            const textarea = node.querySelector('textarea');
+            var node = form.TextValue.prototype.renderWidget.apply(this, arguments);
+            var textarea = node.querySelector('textarea');
             if (textarea) {
                 textarea.style.fontFamily = 'monospace, "Courier New", Courier';
                 textarea.style.fontSize = '12px';
@@ -1078,19 +1264,18 @@ return view.extend({
         o.default = '1';
 
         // --- ВКЛАДКА 4: МЕНЕДЖЕР ОБНОВЛЕНИЙ ---
-        let o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
+        var o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
         o_upd.rawhtml = true;
-        o_upd.default = `
-            <div style="margin-bottom:15px; padding:15px; border:1px solid rgba(255,255,255,0.15); border-radius:6px; background:rgba(0,0,0,0.25);">
-                <div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:#8c8c8c; font-size:13px;">
-                    Ожидание ручной проверки релизов...
-                </div>
-                <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                    <button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">Проверить наличие обновлений</button>
-                    <button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">Установить все обновления</button>
-                </div>
-            </div>
-        `;
+        o_upd.default = '' +
+            '<div style="margin-bottom:15px; padding:15px; border:1px solid rgba(255,255,255,0.15); border-radius:6px; background:rgba(0,0,0,0.25);">' +
+                '<div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:#8c8c8c; font-size:13px;">' +
+                    'Ожидание ручной проверки релизов...' +
+                '</div>' +
+                '<div style="display:flex; gap:10px; flex-wrap:wrap;">' +
+                    '<button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">Проверить наличие обновлений</button>' +
+                    '<button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">Установить все обновления</button>' +
+                '</div>' +
+            '</div>';
 
         o = s.taboption('updates', form.Flag, 'auto_update', _('Автоматическое обновление'));
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
@@ -1108,7 +1293,7 @@ return view.extend({
                     ui.hideIndicator('saving-cheburnet');
                     ui.showIndicator('reloading-cheburnet', _('Применение настроек в Chebur.NET...'));
 
-                    const host = window.location.hostname;
+                    var host = window.location.hostname;
                     return fetch('http://' + host + ':8088/api/v1/reload', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' }
