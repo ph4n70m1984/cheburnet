@@ -452,24 +452,65 @@ func extractFileFromTarGz(tarGzPath, targetFileName, outPath string) error {
 }
 
 func replaceFileCrossDevice(src, dst string) error {
+	// 1. Пытаемся сделать атомарный rename (работает, если src и dst на одной FS)
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
 
+	// 2. Если файловые системы разные (cross-device: tmpfs -> overlayfs):
+	// Создаем временный файл СТРОГО в той же папке, что и dst
+	dstDir := filepath.Dir(dst)
+	tmpDst, err := os.CreateTemp(dstDir, ".bin_replace_*")
+	if err != nil {
+		// Если не удалось создать файл рядом (например, read-only или нет прав),
+		// пробуем удалить старый файл напрямую (разблокирует ETXTBSY)
+		_ = os.Remove(dst)
+		out, errCreate := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if errCreate != nil {
+			return fmt.Errorf("open target: %w", errCreate)
+		}
+		defer out.Close()
+
+		in, errOpen := os.Open(src)
+		if errOpen != nil {
+			return errOpen
+		}
+		defer in.Close()
+
+		if _, err := io.Copy(out, in); err != nil {
+			return err
+		}
+		_ = os.Remove(src)
+		return nil
+	}
+	tmpDstPath := tmpDst.Name()
+	defer os.Remove(tmpDstPath)
+
 	in, err := os.Open(src)
 	if err != nil {
+		tmpDst.Close()
 		return err
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
+	if _, err := io.Copy(tmpDst, in); err != nil {
+		tmpDst.Close()
 		return err
 	}
-	defer out.Close()
+	tmpDst.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
+	// Выставляем права на запуск
+	if err := os.Chmod(tmpDstPath, 0755); err != nil {
 		return err
+	}
+
+	// Атомарно подменяем запущенный файл (rename внутри одной FS overlayfs легален даже для запущенного процесса)
+	if err := os.Rename(tmpDstPath, dst); err != nil {
+		// Fallback: принудительный unlink перед заменой
+		_ = os.Remove(dst)
+		if errRetry := os.Rename(tmpDstPath, dst); errRetry != nil {
+			return fmt.Errorf("rename to target: %w", errRetry)
+		}
 	}
 
 	_ = os.Remove(src)
