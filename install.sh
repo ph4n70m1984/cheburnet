@@ -109,8 +109,20 @@ fi
 
 CURRENT_CHEBUR_VER=""
 if command -v cheburnetd >/dev/null 2>&1; then
-    CURRENT_CHEBUR_VER=$(cheburnetd -version 2>/dev/null | awk '{print $NF}')
-    [ -z "$CURRENT_CHEBUR_VER" ] && CURRENT_CHEBUR_VER="установлен (версия н/д)"
+    VER_RAW=$(cheburnetd show_version 2>/dev/null || true)
+    CURRENT_CHEBUR_VER=$(echo "$VER_RAW" | awk '{print $NF}' | tr -d 'v')
+fi
+
+if [ -z "$CURRENT_CHEBUR_VER" ]; then
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        CURRENT_CHEBUR_VER=$(apk info -e luci-app-cheburnet 2>/dev/null | awk -F'-' '{print $(NF-1)}' || true)
+    elif [ "$PKG_MANAGER" = "opkg" ]; then
+        CURRENT_CHEBUR_VER=$(opkg status luci-app-cheburnet 2>/dev/null | awk '/^Version:/ {print $2}')
+    fi
+fi
+
+if [ -z "$CURRENT_CHEBUR_VER" ] && [ -f /usr/bin/cheburnetd ]; then
+    CURRENT_CHEBUR_VER="установлен (версия не определена)"
 fi
 
 printf "\n${C}====================================================${N}\n"
