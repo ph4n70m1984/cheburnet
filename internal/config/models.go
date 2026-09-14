@@ -106,3 +106,99 @@ type CheburConfig struct {
 	ClientPolicies        []ClientPolicy       `json:"client_policies"`     // Правила маршрутизации по клиентам
 	RoutePolicies         []RoutePolicy        `json:"route_policies"`      // Секции маршрутизации по сервисам
 }
+
+func (c *CheburConfig) Clone() *CheburConfig {
+	if c == nil {
+		return nil
+	}
+
+	// 1. Поверхностное копирование скаляров (string, int, bool)
+	cp := *c
+
+	// 2. Срезы строк
+	if c.ManualNodes != nil {
+		cp.ManualNodes = append([]string(nil), c.ManualNodes...)
+	}
+	if c.RuleSets != nil {
+		cp.RuleSets = append([]string(nil), c.RuleSets...)
+	}
+	if c.CustomDomains != nil {
+		cp.CustomDomains = append([]string(nil), c.CustomDomains...)
+	}
+	if c.CustomSubnets != nil {
+		cp.CustomSubnets = append([]string(nil), c.CustomSubnets...)
+	}
+	if c.CustomPorts != nil {
+		cp.CustomPorts = append([]string(nil), c.CustomPorts...)
+	}
+	if c.LocalListFiles != nil {
+		cp.LocalListFiles = append([]string(nil), c.LocalListFiles...)
+	}
+
+	// 3. CustomSRSRulesets ([]CustomSRSRule)
+	if c.CustomSRSRulesets != nil {
+		cp.CustomSRSRulesets = append([]CustomSRSRule(nil), c.CustomSRSRulesets...)
+	}
+
+	// 4. Nodes ([]*GenericNode)
+	if c.Nodes != nil {
+		cp.Nodes = make([]*GenericNode, len(c.Nodes))
+		for i, n := range c.Nodes {
+			if n != nil {
+				nodeCopy := *n
+				cp.Nodes[i] = &nodeCopy
+			}
+		}
+	}
+
+	// 5. Groups ([]*BalancingGroup) со вложенным срезом Nodes
+	if c.Groups != nil {
+		cp.Groups = make([]*BalancingGroup, len(c.Groups))
+		for i, g := range c.Groups {
+			if g != nil {
+				grpCopy := *g
+				if g.Nodes != nil {
+					grpCopy.Nodes = append([]string(nil), g.Nodes...)
+				}
+				cp.Groups[i] = &grpCopy
+			}
+		}
+	}
+
+	// 6. Subscriptions ([]SubscriptionConfig) со вложенным ExcludeRegex
+	if c.Subscriptions != nil {
+		cp.Subscriptions = make([]SubscriptionConfig, len(c.Subscriptions))
+		for i, s := range c.Subscriptions {
+			subCopy := s
+			if s.ExcludeRegex != nil {
+				subCopy.ExcludeRegex = append([]string(nil), s.ExcludeRegex...)
+			}
+			cp.Subscriptions[i] = subCopy
+		}
+	}
+
+	// 7. ClientPolicies ([]ClientPolicy)
+	if c.ClientPolicies != nil {
+		cp.ClientPolicies = append([]ClientPolicy(nil), c.ClientPolicies...)
+	}
+
+	// 8. RoutePolicies ([]RoutePolicy) со всеми вложенными срезами строк
+	if c.RoutePolicies != nil {
+		cp.RoutePolicies = make([]RoutePolicy, len(c.RoutePolicies))
+		for i, rp := range c.RoutePolicies {
+			rpCopy := rp
+			if rp.RuleSets != nil {
+				rpCopy.RuleSets = append([]string(nil), rp.RuleSets...)
+			}
+			if rp.Domains != nil {
+				rpCopy.Domains = append([]string(nil), rp.Domains...)
+			}
+			if rp.Subnets != nil {
+				rpCopy.Subnets = append([]string(nil), rp.Subnets...)
+			}
+			cp.RoutePolicies[i] = rpCopy
+		}
+	}
+
+	return &cp
+}

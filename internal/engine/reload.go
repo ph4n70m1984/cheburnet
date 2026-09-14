@@ -2,19 +2,36 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"cheburnet/internal/config"
+)
+
+var (
+	// ErrReloadInProgress возвращается при попытке параллельного запуска перезагрузки
+	ErrReloadInProgress = errors.New("engine reload is already in progress")
+
+	// reloadGateMu гарантирует атомарность фаз сборки, перезапуска и отката ядра
+	reloadGateMu sync.Mutex
 )
 
 // SafeReload атомарно генерирует новый конфиг, валидирует его силами sing-box check,
 // бэкапит рабочий конфиг, перезапускает процесс,
 // проводит проверку здоровья и выполняет автоматический откат при сбое.
 func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targetPath string) error {
+	// Неблокирующий вход: предотвращает накопление очереди и гонки за .new.json/.bak.json
+	if !reloadGateMu.TryLock() {
+		log.Printf("[engine-reload] Rejecting concurrent reload request: operation already in progress")
+		return ErrReloadInProgress
+	}
+	defer reloadGateMu.Unlock()
+
 	stagingPath := strings.TrimSuffix(targetPath, ".json") + ".new.json"
 	backupPath := strings.TrimSuffix(targetPath, ".json") + ".bak.json"
 
@@ -77,6 +94,13 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 func triggerRollback(ctx context.Context, eng Engine, targetPath, backupPath string, hasBackup bool, originalErr error) error {
 	log.Printf("[engine-reload] Initiating ROLLBACK due to: %v", originalErr)
 
+	// 1. Гарантированно глушим неудачный или зависший экземпляр ядра
+	if stopErr := eng.Stop(); stopErr != nil {
+		log.Printf("[engine-reload] warning: stop failed during rollback cleanup: %v", stopErr)
+	}
+	// Даем ядру и сокетам ОС время полностью освободиться
+	time.Sleep(300 * time.Millisecond)
+
 	if !hasBackup {
 		return fmt.Errorf("%w; rollback impossible: no previous backup exists", originalErr)
 	}
@@ -85,10 +109,15 @@ func triggerRollback(ctx context.Context, eng Engine, targetPath, backupPath str
 		return fmt.Errorf("%w; rollback failed: backup file missing: %v", originalErr, statErr)
 	}
 
+	// 2. Восстанавливаем резервный рабочий конфиг
 	if err := os.Rename(backupPath, targetPath); err != nil {
-		return fmt.Errorf("%w; rollback failed to restore file: %v", originalErr, err)
+		if copyErr := copyFile(backupPath, targetPath); copyErr != nil {
+			return fmt.Errorf("%w; rollback failed to restore file: %v (copy fallback error: %v)", originalErr, err, copyErr)
+		}
+		_ = os.Remove(backupPath)
 	}
 
+	// 3. Запускаем проверенную рабочую конфигурацию
 	if rbErr := eng.Start(ctx, targetPath); rbErr != nil {
 		log.Printf("[engine-reload] FATAL: rollback start failed: %v", rbErr)
 		return fmt.Errorf("%w; rollback start also failed: %v", originalErr, rbErr)
