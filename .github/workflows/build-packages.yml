@@ -121,7 +121,6 @@ jobs:
               chmod 644 "$PKG_DIR/data/etc/config/cheburnet"
           fi
 
-          # Копируем LuCI Web UI
           if [ -d openwrt/files/www/luci-static/resources/view/cheburnet ]; then
               cp -r openwrt/files/www/luci-static/resources/view/cheburnet/* "$PKG_DIR/data/www/luci-static/resources/view/cheburnet/"
           elif [ -d luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet ]; then
@@ -136,7 +135,6 @@ jobs:
               cp luci-app-cheburnet/root/usr/share/luci/menu.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/luci/menu.d/"
           fi
 
-          # ACL манифест для rpcd
           if [ -f openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
               cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/rpcd/acl.d/"
           elif [ -f luci-app-cheburnet/root/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
@@ -179,13 +177,20 @@ jobs:
 
           mv "$IPK_NAME" dist/
 
+      - name: Install apk-tools
+        run: |
+          docker run --rm -v /usr/local/bin:/mnt alpine:edge sh -c "apk add --no-cache apk-tools-static && cp /sbin/apk.static /mnt/apk && chmod +x /mnt/apk"
+
       - name: Pack .apk Package
         run: |
           APK_DATA_DIR="apk_data"
+          APK_SCRIPTS_DIR="apk_scripts"
           mkdir -p "$APK_DATA_DIR/usr/bin" "$APK_DATA_DIR/etc/init.d" "$APK_DATA_DIR/etc/config" \
                    "$APK_DATA_DIR/www/luci-static/resources/view/cheburnet" \
-                   "$APK_DATA_DIR/usr/share/luci/menu.d" "$APK_DATA_DIR/usr/share/rpcd/acl.d"
+                   "$APK_DATA_DIR/usr/share/luci/menu.d" "$APK_DATA_DIR/usr/share/rpcd/acl.d" \
+                   "$APK_SCRIPTS_DIR" dist
 
+          # Копирование бинарников и конфигов
           cp bin/cheburnetd "$APK_DATA_DIR/usr/bin/cheburnetd"
           chmod 755 "$APK_DATA_DIR/usr/bin/cheburnetd"
 
@@ -233,43 +238,71 @@ jobs:
           EOF
           fi
 
-          # Нормализация формата версии для apk (число-rчисло)
+          # Валидация формата версии APK (-rX)
           CLEAN_VER="${{ steps.vars.outputs.version }}"
           if [[ "$CLEAN_VER" != *-r* ]]; then
               CLEAN_VER="${CLEAN_VER}-r1"
           fi
 
-          mkdir -p apk_meta dist
-          CALC_SIZE=$(du -sb "$APK_DATA_DIR" | awk '{print $1}')
+          # Установочные скрипты
+          cat <<'EOF' > "$APK_SCRIPTS_DIR/pre-install"
+          #!/bin/sh
+          if [ -f /etc/config/cheburnet ]; then
+              cp /etc/config/cheburnet /tmp/.cheburnet_config_preserved
+          fi
+          exit 0
+          EOF
+          chmod 755 "$APK_SCRIPTS_DIR/pre-install"
 
-          # Формирование строго валидного .PKGINFO без недопустимых директив
-          cat <<EOF > apk_meta/.PKGINFO
-          pkgname = luci-app-cheburnet
-          pkgver = ${CLEAN_VER}
-          pkgdesc = Transparent proxy and routing daemon on top of sing-box/xray
-          url = https://github.com/${{ github.repository }}
-          builddate = $(date +%s)
-          packager = GitHub Actions
-          size = ${CALC_SIZE}
-          arch = ${{ matrix.apk_arch }}
-          depend = sing-box
-          depend = nftables
-          depend = ip-full
-          depend = ca-bundle
+          cat <<'EOF' > "$APK_SCRIPTS_DIR/post-install"
+          #!/bin/sh
+          if [ -f /tmp/.cheburnet_config_preserved ]; then
+              mv -f /tmp/.cheburnet_config_preserved /etc/config/cheburnet
+          fi
+          exit 0
+          EOF
+          chmod 755 "$APK_SCRIPTS_DIR/post-install"
+
+          # Создаем фейковый root для apk mkpkg
+          APK_ROOT_DIR=$(mktemp -d)
+          mkdir -p "$APK_ROOT_DIR/etc"
+          cat > "$APK_ROOT_DIR/etc/passwd" <<EOF
+          root:x:$(id -u):$(id -g):root:/root:/sbin/nologin
+          EOF
+          cat > "$APK_ROOT_DIR/etc/group" <<EOF
+          root:x:$(id -g):root
           EOF
 
-          # Удаление пробелов в начале строк манифеста (требование парсера apk-tools)
-          sed -i 's/^[[:blank:]]*//' apk_meta/.PKGINFO
+          # Метаданные файлов для OpenWrt
+          PACKAGES_DIR="$APK_DATA_DIR/lib/apk/packages"
+          mkdir -p "$PACKAGES_DIR"
+          
+          if [ -f "$APK_DATA_DIR/etc/config/cheburnet" ]; then
+              echo "/etc/config/cheburnet" > "$PACKAGES_DIR/.conffiles"
+              sha256=$(sha256sum "$APK_DATA_DIR/etc/config/cheburnet" | cut -d' ' -f1)
+              echo "/etc/config/cheburnet $sha256" > "$PACKAGES_DIR/.conffiles_static"
+          fi
+
+          (cd "$APK_DATA_DIR" && find . -type f -o -type l) \
+            | sed 's|^\./|/|' \
+            | grep -v '^/lib/apk/packages/' \
+            | sort > "$PACKAGES_DIR/.list"
 
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета через официальный инструмент Alpine apk mkpkg
-          docker run --rm -v "$(pwd):/work" -w /work alpine:edge sh -c "
-            apk add --no-cache apk-tools >/dev/null 2>&1
-            apk mkpkg --info apk_meta/.PKGINFO \
-                      --output dist/$APK_FILE \
-                      apk_data
-          "
+          # Сборка пакета через встроенный apk
+          apk --root "$APK_ROOT_DIR" mkpkg \
+              --info "name:luci-app-cheburnet" \
+              --info "version:${CLEAN_VER}" \
+              --info "description:Transparent proxy and routing daemon on top of sing-box/xray" \
+              --info "arch:${{ matrix.apk_arch }}" \
+              --info "url:https://github.com/${{ github.repository }}" \
+              --info "maintainer:Developer <dev@example.com>" \
+              --info "depends:sing-box nftables ip-full ca-bundle" \
+              --script "pre-install:$APK_SCRIPTS_DIR/pre-install" \
+              --script "post-install:$APK_SCRIPTS_DIR/post-install" \
+              --files "$APK_DATA_DIR" \
+              --output "dist/$APK_FILE"
 
       - name: Generate Checksums
         run: |
