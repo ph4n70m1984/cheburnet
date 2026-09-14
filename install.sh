@@ -69,7 +69,7 @@ api_get() {
     fi
 }
 
-# 3. Пакетный менеджер и архитектура
+# 3. Определение пакетного менеджера и точной системной архитектуры OpenWrt
 PKG_MANAGER=""
 PKG_EXT=""
 if command -v apk >/dev/null 2>&1 && [ "$(command -v apk)" != "/opt/bin/apk" ]; then
@@ -86,11 +86,20 @@ HOST_ARCH=$(uname -m)
 DISTRIB_ARCH=""
 if [ -f "/etc/openwrt_release" ]; then
     DISTRIB_ARCH=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH")
-    case "$DISTRIB_ARCH" in
-        *mipsel* | *mipsle*) HOST_ARCH="mipsel" ;;
-        *mips64el* | *mips64le*) HOST_ARCH="mips64el" ;;
-    esac
 fi
+
+# Специфика архитектуры OpenWrt APK
+APK_SYSTEM_ARCH=""
+if [ "$PKG_MANAGER" = "apk" ]; then
+    if [ -f "/etc/apk/arch" ]; then
+        APK_SYSTEM_ARCH=$(head -n 1 /etc/apk/arch | tr -d ' \r\n')
+    fi
+    if [ -z "$APK_SYSTEM_ARCH" ]; then
+        APK_SYSTEM_ARCH=$(apk --print-arch 2>/dev/null | tr -d ' \r\n')
+    fi
+fi
+
+TARGET_PACKAGE_ARCH="${APK_SYSTEM_ARCH:-$DISTRIB_ARCH}"
 
 case "$HOST_ARCH" in
     aarch64)              ARCH_SUFFIX="arm64"; CHEBUR_ARCH="aarch64" ;;
@@ -101,7 +110,6 @@ case "$HOST_ARCH" in
     *)                    fail "Архитектура $HOST_ARCH не поддерживается." ;;
 esac
 
-# Определение текущих установленных версий
 CURRENT_SB_VER=""
 if [ -f "$DEST_FILE" ]; then
     CURRENT_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
@@ -128,7 +136,8 @@ fi
 printf "\n${C}====================================================${N}\n"
 printf "${C}   Установка / Обновление Chebur.NET & Sing-Box     ${N}\n"
 printf "${C}====================================================${N}\n"
-printf "  Архитектура:          ${Y}%s (%s / %s)${N}\n" "$HOST_ARCH" "$ARCH_SUFFIX" "$CHEBUR_ARCH"
+printf "  Архитектура хоста:    ${Y}%s (%s)${N}\n" "$HOST_ARCH" "$ARCH_SUFFIX"
+printf "  Таргет OpenWrt:       ${Y}%s${N}\n" "${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
 printf "  Пакетный менеджер:    ${Y}%s (%s)${N}\n" "$PKG_MANAGER" "$PKG_EXT"
 printf "  Текущий sing-box:     ${Y}%s${N}\n" "${CURRENT_SB_VER:-не установлен}"
 printf "  Текущий Chebur.NET:   ${Y}%s${N}\n\n" "${CURRENT_CHEBUR_VER:-не установлен}"
@@ -200,7 +209,6 @@ case "$CHOICE_SB" in
                 REL_JSON=$(api_get "https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/${TARGET_TAG}" 2>/dev/null || true)
             fi
 
-            # Ищем сначала сжатый, затем обычный архив tar.gz
             SHORT_ARCH="${ARCH_SUFFIX%%-*}"
             DOWNLOAD_URL=$(echo "$REL_JSON" | tr ',' '\n' | grep -E "browser_download_url.*linux-(${ARCH_SUFFIX}|${SHORT_ARCH}).*compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
             if [ -z "$DOWNLOAD_URL" ]; then
@@ -312,16 +320,26 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 
     if [ "$PKG_MANAGER" = "apk" ]; then
-        CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*${CHEBUR_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
-        [ -z "$CHEBUR_URL" ] && CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*\.apk" | head -n 1 | cut -d '"' -f 4)
-        [ -z "$CHEBUR_URL" ] && fail "Не найден .apk пакет под архитектуру $CHEBUR_ARCH."
+        # Приоритетный поиск пакета с префиксом _p и точным именем таргета OpenWrt
+        MATCH_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
+        CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*_p[0-9]+.*${MATCH_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
+        if [ -z "$CHEBUR_URL" ]; then
+            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*${MATCH_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
+        fi
+        if [ -z "$CHEBUR_URL" ]; then
+            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*_p[0-9]+.*${CHEBUR_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
+        fi
+        if [ -z "$CHEBUR_URL" ]; then
+            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*\.apk" | head -n 1 | cut -d '"' -f 4)
+        fi
+        [ -z "$CHEBUR_URL" ] && fail "Не найден подходящий .apk пакет для $MATCH_ARCH."
 
         printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
         $DOWNLOAD "/tmp/cheburnet.apk" "$CHEBUR_URL" || fail "Сбой при скачивании cheburnet.apk"
 
         printf "${C}[*] Применение пакета Chebur.NET...${N}\n"
         if ! apk add --allow-untrusted --force-overwrite /tmp/cheburnet.apk 2>/dev/null; then
-            printf "${Y}[!] Обход валидации v2 пакета через прямую распаковку...${N}\n"
+            printf "${Y}[!] Обход валидации пакета через распаковку архива...${N}\n"
             (tar -xzf /tmp/cheburnet.apk -C / 2>/dev/null || (dd if=/tmp/cheburnet.apk bs=1024 skip=1 2>/dev/null | tar -xzf - -C /))
         fi
         rm -f /tmp/cheburnet.apk /.PKGINFO /.pre-install /.post-install 2>/dev/null || true
@@ -343,7 +361,8 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 fi
 
-# 7. Финализация прав, очистка кеша LuCI и запуск службы
+# 7. Финализация прав, каталогов и запуск службы
+mkdir -p /var/etc/cheburnet /var/run/cheburnet
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
 
