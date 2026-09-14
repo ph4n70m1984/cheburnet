@@ -36,23 +36,60 @@ func parseTextLines(raw string) []string {
 	return result
 }
 
+func parseCustomSRSRules(rawList []string) []CustomSRSRule {
+	var rules []CustomSRSRule
+	for _, raw := range rawList {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+
+		parts := strings.Split(raw, "|")
+		rule := CustomSRSRule{
+			Enabled:        true,
+			DownloadDetour: "direct",
+		}
+
+		if len(parts) == 1 {
+			rule.URL = strings.TrimSpace(parts[0])
+			rule.Name = "custom"
+		} else if len(parts) == 2 {
+			rule.Name = strings.TrimSpace(parts[0])
+			rule.URL = strings.TrimSpace(parts[1])
+		} else if len(parts) >= 3 {
+			rule.Name = strings.TrimSpace(parts[0])
+			rule.URL = strings.TrimSpace(parts[1])
+			detour := strings.ToLower(strings.TrimSpace(parts[2]))
+			if detour == "proxy" {
+				rule.DownloadDetour = "proxy"
+			}
+		}
+
+		if rule.URL != "" {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
 func (u *UCIStorage) Load() (*CheburConfig, error) {
 	cfg := &CheburConfig{
-		Engine:       u.get("cheburnet.main.engine", "sing-box"),
-		RoutingMode:  u.get("cheburnet.main.routing_mode", "rules"),
-		SourceMode:   u.get("cheburnet.main.source_mode", "subscription"),
-		AutoHWID:     u.get("cheburnet.main.auto_hwid", "1") == "1",
-		CustomHWID:   u.get("cheburnet.main.custom_hwid", ""),
-		TProxyPort:   u.getInt("cheburnet.main.tproxy_port", 1602),
-		DNSPort:      u.getInt("cheburnet.main.dns_port", 53),
-		MixedPort:    u.getInt("cheburnet.main.mixed_port", 4534),
-		SourceIface:  u.get("cheburnet.main.source_interface", "br-lan"),
-		DNSProtocol:  u.get("cheburnet.main.dns_protocol", "udp"),
-		DNSServer:    u.get("cheburnet.main.dns_server", "8.8.8.8"),
-		BootstrapDNS: u.get("cheburnet.main.bootstrap_dns", "77.88.8.8"),
-		DNSTTL:       u.getInt("cheburnet.main.dns_ttl", 60),
-		EnableYACD:   u.get("cheburnet.main.enable_yacd", "1") == "1",
-		AutoUpdate:   u.get("cheburnet.main.auto_update", "0") == "1",
+		Engine:                u.get("cheburnet.main.engine", "sing-box"),
+		RoutingMode:           u.get("cheburnet.main.routing_mode", "rules"),
+		SourceMode:            u.get("cheburnet.main.source_mode", "subscription"),
+		AutoHWID:              u.get("cheburnet.main.auto_hwid", "1") == "1",
+		CustomHWID:            u.get("cheburnet.main.custom_hwid", ""),
+		RulesetUpdateInterval: u.get("cheburnet.main.ruleset_update_interval", "72h"),
+		TProxyPort:            u.getInt("cheburnet.main.tproxy_port", 1602),
+		DNSPort:               u.getInt("cheburnet.main.dns_port", 53),
+		MixedPort:             u.getInt("cheburnet.main.mixed_port", 4534),
+		SourceIface:           u.get("cheburnet.main.source_interface", "br-lan"),
+		DNSProtocol:           u.get("cheburnet.main.dns_protocol", "udp"),
+		DNSServer:             u.get("cheburnet.main.dns_server", "8.8.8.8"),
+		BootstrapDNS:          u.get("cheburnet.main.bootstrap_dns", "77.88.8.8"),
+		DNSTTL:                u.getInt("cheburnet.main.dns_ttl", 60),
+		EnableYACD:            u.get("cheburnet.main.enable_yacd", "1") == "1",
+		AutoUpdate:            u.get("cheburnet.main.auto_update", "0") == "1",
 	}
 
 	// 1. Чтение секций 'subscription'
@@ -105,6 +142,23 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 	} else {
 		cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
 	}
+
+	// Чтение пользовательских списков SRS (custom_srs_rulesets)
+	var rawCustomSRS []string
+	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.custom_srs_rulesets").Output(); err == nil {
+		trimmed := strings.TrimSpace(string(out))
+		if len(trimmed) > 0 {
+			// UCI может возвращать несколько записей списком через перенос строки или пробел
+			rawLines := strings.Split(trimmed, "\n")
+			for _, rl := range rawLines {
+				rl = strings.TrimSpace(rl)
+				if rl != "" {
+					rawCustomSRS = append(rawCustomSRS, rl)
+				}
+			}
+		}
+	}
+	cfg.CustomSRSRulesets = parseCustomSRSRules(rawCustomSRS)
 
 	// Чтение кастомных доменов, подсетей и портов
 	cfg.CustomDomains = parseTextLines(u.get("cheburnet.main.custom_domains", ""))

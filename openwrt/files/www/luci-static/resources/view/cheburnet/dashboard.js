@@ -186,122 +186,19 @@ return view.extend({
             };
         }
 
-        // --- Подписки ---
-        var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
-        subSec.anonymous = true;
-        subSec.addremove = true;
-        subSec.sortable = true;
-        wrapGridSection(subSec, _('▶ Таблица ссылок подписок'), false);
-
-        o = subSec.option(form.Flag, 'enabled', _('Вкл'));
-        o.default = '1';
-        o.editable = true;
-
-        o = subSec.option(form.Value, 'name', _('Наименование провайдера'));
-        o.editable = true;
-
-        o = subSec.option(form.Value, 'url', _('URL подписки'));
-        o.modalonly = true;
-
-        o = subSec.option(form.ListValue, 'filter_mode', _('Режим фильтрации серверов'));
-        o.value('exclude', _('Исключить (Blacklist)'));
-        o.value('include', _('Оставить только совпадающие (Whitelist)'));
-        o.default = 'exclude';
-        o.modalonly = true;
-
-        o = subSec.option(form.DynamicList, 'exclude_regex', _('Регулярные выражения (RegExp)'));
-        o.modalonly = true;
-
-        o = subSec.option(form.Value, 'user_agent', _('User-Agent'));
-        o.default = 'Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)';
-        o.modalonly = true;
-
-        o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
-        o.modalonly = true;
-
-        // --- Клиенты ---
-        var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств'));
-        clientSec.anonymous = true;
-        clientSec.addremove = true;
-        clientSec.sortable = true;
-        wrapGridSection(clientSec, _('▶ Политики для устройств (Client Policy)'), false);
-
-        o = clientSec.option(form.Flag, 'enabled', _('Вкл'));
-        o.default = '1';
-        o.editable = true;
-
-        o = clientSec.option(form.Value, 'name', _('Имя устройства'));
-        o.editable = true;
-
-        o = clientSec.option(form.Value, 'target', _('IP или MAC'));
-        o.editable = true;
-        for (var mac in hosts) {
-            if (hosts[mac].ipv4 && hosts[mac].ipv4.length > 0) {
-                var hostIP = hosts[mac].ipv4[0];
-                var hostLabel = (hosts[mac].name ? hosts[mac].name + ' (' + hostIP + ')' : hostIP) + ' [' + mac + ']';
-                o.value(hostIP, hostLabel);
-            }
-        }
-
-        o = clientSec.option(form.ListValue, 'mode', _('Политика'));
-        o.value('rules', _('По спискам'));
-        o.value('full_proxy', _('Всё в прокси'));
-        o.value('direct', _('Direct'));
-        o.default = 'rules';
-        o.editable = true;
-
-        // --- Маршруты сервисов ---
-        var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации'));
-        routeSec.anonymous = true;
-        routeSec.addremove = true;
-        routeSec.sortable = true;
-        wrapGridSection(routeSec, _('▶ Секции маршрутизации сервисов (Route Policies)'), false);
-
-        o = routeSec.option(form.Flag, 'enabled', _('Вкл'));
-        o.default = '1';
-        o.editable = true;
-
-        o = routeSec.option(form.Value, 'name', _('Имя секции'));
-        o.editable = true;
-
-        o = routeSec.option(form.DynamicList, 'rulesets', _('Списки'));
-        constants.categories.forEach(function(cat) {
-            o.value(cat.tag, cat.tag + ' — ' + cat.title);
-        });
-        o.editable = true;
-
-        o = routeSec.option(form.ListValue, 'outbound', _('Сервер выхода'));
-        o.value('PROXY', _('PROXY / AUTO'));
-        o.value('direct-out', _('Direct'));
-        o.editable = true;
-
-        var outboundSelect = o;
-        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes')
-            .then(function(r) { return r.json(); })
-            .then(function(nodes) {
-                if (Array.isArray(nodes)) {
-                    nodes.forEach(function(n) {
-                        outboundSelect.value(n.tag, n.tag + ' (' + n.protocol + ')');
-                    });
-                }
-            })
-            .catch(function() {});
-
-        o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены'));
-        o.rows = 4;
-        o.modalonly = true;
-
-        o = routeSec.option(form.TextValue, 'custom_subnets', _('Дополнительные подсети'));
-        o.rows = 4;
-        o.modalonly = true;
-
         // --- ВКЛАДКА 2: МАРШРУТИЗАЦИЯ СПИСКОВ ---
-        o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления'));
-        o.value('24h', '24 часа');
-        o.value('72h', '72 часа');
+        o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
+        o.value('24h', _('24 часа (каждый день)'));
+        o.value('72h', _('72 часа (раз в 3 дня)'));
+        o.value('168h', _('1 неделя'));
         o.default = '72h';
 
-        o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Списки по умолчанию'));
+        // --- Пользовательские SRS правила (Sing-box) внутри вкладки ---
+        o = s.taboption('routing_rules', form.DynamicList, 'custom_srs_rulesets', _('Пользовательские SRS списки (Sing-box)'));
+        o.description = _('Формат ввода: <code>Имя|URL|[direct|proxy]</code> (например: <code>antizapret|https://example.com/rule.srs|direct</code>). Загружаются демоном с валидацией и резервированием.');
+        o.placeholder = 'my_list|https://example.com/rule.srs|direct';
+
+        o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Списки сервисов по умолчанию'));
         constants.categories.forEach(function(cat) {
             o.value(cat.tag, cat.tag + ' — ' + cat.title);
         });
@@ -347,6 +244,117 @@ return view.extend({
         o = s.taboption('updates', form.Flag, 'auto_update', _('Автоматическое обновление'));
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
         o.default = '0';
+
+        // --- ВНЕШНИЕ АККОРДЕОНЫ (СЕКЦИИ КАРТЫ) ---
+
+        // 1. Подписки
+        var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
+        subSec.anonymous = true;
+        subSec.addremove = true;
+        subSec.sortable = true;
+        wrapGridSection(subSec, _('▶ Таблица ссылок подписок'), false);
+
+        o = subSec.option(form.Flag, 'enabled', _('Вкл'));
+        o.default = '1';
+        o.editable = true;
+
+        o = subSec.option(form.Value, 'name', _('Наименование провайдера'));
+        o.editable = true;
+
+        o = subSec.option(form.Value, 'url', _('URL подписки'));
+        o.modalonly = true;
+
+        o = subSec.option(form.ListValue, 'filter_mode', _('Режим фильтрации серверов'));
+        o.value('exclude', _('Исключить (Blacklist)'));
+        o.value('include', _('Оставить только совпадающие (Whitelist)'));
+        o.default = 'exclude';
+        o.modalonly = true;
+
+        o = subSec.option(form.DynamicList, 'exclude_regex', _('Регулярные выражения (RegExp)'));
+        o.modalonly = true;
+
+        o = subSec.option(form.Value, 'user_agent', _('User-Agent'));
+        o.default = 'Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)';
+        o.modalonly = true;
+
+        o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
+        o.modalonly = true;
+
+        // 2. Клиенты
+        var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств'));
+        clientSec.anonymous = true;
+        clientSec.addremove = true;
+        clientSec.sortable = true;
+        wrapGridSection(clientSec, _('▶ Политики для устройств (Client Policy)'), false);
+
+        o = clientSec.option(form.Flag, 'enabled', _('Вкл'));
+        o.default = '1';
+        o.editable = true;
+
+        o = clientSec.option(form.Value, 'name', _('Имя устройства'));
+        o.editable = true;
+
+        o = clientSec.option(form.Value, 'target', _('IP или MAC'));
+        o.editable = true;
+        for (var mac in hosts) {
+            if (hosts[mac].ipv4 && hosts[mac].ipv4.length > 0) {
+                var hostIP = hosts[mac].ipv4[0];
+                var hostLabel = (hosts[mac].name ? hosts[mac].name + ' (' + hostIP + ')' : hostIP) + ' [' + mac + ']';
+                o.value(hostIP, hostLabel);
+            }
+        }
+
+        o = clientSec.option(form.ListValue, 'mode', _('Политика'));
+        o.value('rules', _('По спискам'));
+        o.value('full_proxy', _('Всё в прокси'));
+        o.value('direct', _('Direct'));
+        o.default = 'rules';
+        o.editable = true;
+
+        // 3. Маршруты сервисов
+        var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации'));
+        routeSec.anonymous = true;
+        routeSec.addremove = true;
+        routeSec.sortable = true;
+        wrapGridSection(routeSec, _('▶ Секции маршрутизации сервисов (Route Policies)'), false);
+
+        o = routeSec.option(form.Flag, 'enabled', _('Вкл'));
+        o.default = '1';
+        o.editable = true;
+
+        o = routeSec.option(form.Value, 'name', _('Имя секции'));
+        o.editable = true;
+
+        o = routeSec.option(form.DynamicList, 'rulesets', _('Списки'));
+        constants.categories.forEach(function(cat) {
+            o.value(cat.tag, cat.tag + ' — ' + cat.title);
+        });
+        o.editable = true;
+
+        o = routeSec.option(form.ListValue, 'outbound', _('Сервер выхода'));
+        o.value('PROXY', _('PROXY / AUTO'));
+        o.value('direct-out', _('Direct'));
+        o.editable = true;
+
+        var outboundSelect = o;
+        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes')
+            .then(function(r) { return r.json(); })
+            .then(function(nodes) {
+                if (Array.isArray(nodes)) {
+                    nodes.forEach(function(n) {
+                        outboundSelect.value(n.tag, n.tag + ' (' + n.protocol + ')');
+                    });
+                }
+            })
+            .catch(function() {});
+
+        o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены'));
+        o.rows = 4;
+        o.modalonly = true;
+
+        o = routeSec.option(form.TextValue, 'custom_subnets', _('Дополнительные подсети'));
+        o.rows = 4;
+        o.modalonly = true;
 
         return m.render();
     },

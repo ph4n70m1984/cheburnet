@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	"cheburnet/internal/config"
 	"cheburnet/internal/network"
+	"cheburnet/internal/ruleset"
 )
 
 type BuilderV14 struct {
@@ -138,7 +140,30 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		activeOutboundTag = selectorTag
 	}
 
-	// 2. DNS-конфигурация v1.14
+	// 2. Определение валидных локальных SRS файлов
+	type localSRS struct {
+		tag  string
+		path string
+	}
+	var customSRSObjects []localSRS
+	var customSRSTags []string
+
+	for idx, srs := range cfg.CustomSRSRulesets {
+		if !srs.Enabled || strings.TrimSpace(srs.URL) == "" {
+			continue
+		}
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(srs.URL)))[:12]
+		filePath := filepath.Join(ruleset.RulesetDir, fmt.Sprintf("srs_%s.srs", hash))
+
+		// Подключаем только реально существующий проверенный файл
+		if _, err := os.Stat(filePath); err == nil {
+			tag := fmt.Sprintf("custom-srs-%d", idx+1)
+			customSRSObjects = append(customSRSObjects, localSRS{tag: tag, path: filePath})
+			customSRSTags = append(customSRSTags, tag)
+		}
+	}
+
+	// 3. DNS-конфигурация v1.14
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -173,6 +198,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		allRuleSets = append(allRuleSets, rs)
 	}
 
+	dnsRuleSetList := append([]string(nil), allRuleSets...)
+	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
+
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
@@ -194,11 +222,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"domain_suffix": fakeipDomains,
 			})
 		}
-		if len(allRuleSets) > 0 {
+		if len(dnsRuleSetList) > 0 {
 			dnsRules = append(dnsRules, map[string]interface{}{
 				"action":   "route",
 				"server":   "fakeip-dns",
-				"rule_set": allRuleSets,
+				"rule_set": dnsRuleSetList,
 			})
 		}
 	}
@@ -231,7 +259,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"strategy": "ipv4_only",
 	}
 
-	// 3. Inbounds (чистый tproxy без устаревшего поля sniff)
+	// 4. Inbounds
 	tproxyPort := cfg.TProxyPort
 	if tproxyPort == 0 {
 		tproxyPort = 1602
@@ -260,7 +288,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// 4. Правила маршрутизации (со сниффингом через route.rules)
+	// 5. Правила маршрутизации
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",
@@ -433,12 +461,23 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
+			// Маршрутизация стандартных списков правил в PROXY
 			if len(defaultRuleSets) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
 					"inbound":  []string{"tproxy-in"},
 					"outbound": activeOutboundTag,
 					"rule_set": defaultRuleSets,
+				})
+			}
+
+			// Маршрутизация проверенных пользовательских SRS в PROXY
+			if len(customSRSTags) > 0 {
+				routeRules = append(routeRules, map[string]interface{}{
+					"action":   "route",
+					"inbound":  []string{"tproxy-in"},
+					"outbound": activeOutboundTag,
+					"rule_set": customSRSTags,
 				})
 			}
 		}
@@ -450,8 +489,10 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
+	// 6. Формирование объектов rule_set
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
+		// Системные удаленные правила
 		for _, rs := range allRuleSets {
 			srsName := mapToSRSName(rs)
 			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
@@ -461,6 +502,16 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
 				"download_detour": "direct-out",
 				"update_interval": "1d",
+			})
+		}
+
+		// Пользовательские бинарные локальные правила
+		for _, srs := range customSRSObjects {
+			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+				"type":   "local",
+				"tag":    srs.tag,
+				"format": "binary",
+				"path":   srs.path,
 			})
 		}
 	}

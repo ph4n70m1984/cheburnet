@@ -69,6 +69,13 @@ type SubscriptionConfig struct {
 	ExcludeRegex []string `json:"exclude_regex,omitempty"` // Регулярные выражения фильтра
 }
 
+type CustomSRSRule struct {
+	Name           string `json:"name"`
+	URL            string `json:"url"`
+	DownloadDetour string `json:"download_detour"` // "direct" или "proxy"
+	Enabled        bool   `json:"enabled"`
+}
+
 type CheburConfig struct {
 	Engine                string               `json:"engine"`       // Всегда "sing-box"
 	RoutingMode           string               `json:"routing_mode"` // "rules" или "global"
@@ -91,10 +98,11 @@ type CheburConfig struct {
 	Subscriptions         []SubscriptionConfig `json:"subscriptions"`
 	ManualNodes           []string             `json:"manual_nodes"`
 	RuleSets              []string             `json:"rule_sets"`
-	CustomDomains         []string             `json:"custom_domains"`   // Введенные вручную домены
-	CustomSubnets         []string             `json:"custom_subnets"`   // Введенные вручную IP/CIDR
-	CustomPorts           []string             `json:"custom_ports"`     // Введенные вручную порты и диапазоны
-	LocalListFiles        []string             `json:"local_list_files"` // Пути к .lst файлам на роутере
-	ClientPolicies        []ClientPolicy       `json:"client_policies"`  // Правила маршрутизации по клиентам
-	RoutePolicies         []RoutePolicy        `json:"route_policies"`   // Секции маршрутизации по сервисам
+	CustomSRSRulesets     []CustomSRSRule      `json:"custom_srs_rulesets"` // Пользовательские бинарные SRS
+	CustomDomains         []string             `json:"custom_domains"`      // Введенные вручную домены
+	CustomSubnets         []string             `json:"custom_subnets"`      // Введенные вручную IP/CIDR
+	CustomPorts           []string             `json:"custom_ports"`        // Введенные вручную порты и диапазоны
+	LocalListFiles        []string             `json:"local_list_files"`    // Пути к .lst файлам на роутере
+	ClientPolicies        []ClientPolicy       `json:"client_policies"`     // Правила маршрутизации по клиентам
+	RoutePolicies         []RoutePolicy        `json:"route_policies"`      // Секции маршрутизации по сервисам
 }

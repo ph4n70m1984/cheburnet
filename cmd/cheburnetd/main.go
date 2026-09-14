@@ -23,6 +23,7 @@ import (
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
+	"cheburnet/internal/ruleset"
 	"cheburnet/internal/subscription"
 	"cheburnet/internal/telemetry"
 	"cheburnet/internal/updater"
@@ -36,6 +37,47 @@ var (
 	PIDFile                  = "/var/run/cheburnetd.pid"
 )
 
+// diagReporterAdapter связывает diagnostics.DiagnosticsEngine с ruleset.DiagnosticReporter
+type diagReporterAdapter struct {
+	diag *diagnostics.DiagnosticsEngine
+}
+
+func (a *diagReporterAdapter) ReportProblem(id, component, severity, message, action string, recoverable bool) {
+	if a.diag == nil {
+		return
+	}
+
+	var sev diagnostics.Severity
+	switch strings.ToLower(severity) {
+	case "critical":
+		sev = diagnostics.SeverityCritical
+	case "warning":
+		sev = diagnostics.SeverityWarning
+	default:
+		sev = diagnostics.SeverityError
+	}
+
+	a.diag.Report(diagnostics.CheckResult{
+		CheckID:   id,
+		Component: component,
+		Healthy:   false,
+		Severity:  sev,
+		Message:   message,
+		Action:    action,
+	})
+}
+
+func (a *diagReporterAdapter) ResolveProblem(id string) {
+	if a.diag == nil {
+		return
+	}
+
+	a.diag.Report(diagnostics.CheckResult{
+		CheckID: id,
+		Healthy: true,
+	})
+}
+
 type App struct {
 	state         *config.StateManager
 	singboxEng    *engine.SingBoxEngine
@@ -46,6 +88,7 @@ type App struct {
 	rulesCron     *network.RulesetCron
 	healthTracker *engine.HealthTracker
 	diagEngine    *diagnostics.DiagnosticsEngine
+	rulesMgr      *ruleset.Manager
 	mu            sync.RWMutex
 	engineOpMu    sync.Mutex
 }
@@ -392,6 +435,15 @@ func runDaemon() {
 
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
 
+	// Инициализация менеджера кастомных бинарных SRS правил
+	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
+
+	// Синхронизируем SRS файлы ДО построения и валидации конфига sing-box
+	if len(initialConfig.CustomSRSRulesets) > 0 {
+		log.Printf("[INFO] Syncing %d custom SRS rulesets...", len(initialConfig.CustomSRSRulesets))
+		rulesMgr.SyncAll(initialConfig.CustomSRSRulesets)
+	}
+
 	app := &App{
 		state:         state,
 		singboxEng:    sbEngine,
@@ -400,6 +452,7 @@ func runDaemon() {
 		rulesLoader:   rulesLoader,
 		healthTracker: healthTracker,
 		diagEngine:    diagEngine,
+		rulesMgr:      rulesMgr,
 	}
 
 	sourceIface := initialConfig.SourceIface
@@ -554,6 +607,12 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	if eng == nil {
 		return fmt.Errorf("no active engine")
+	}
+
+	// Синхронизируем SRS файлы перед перезагрузкой конфигурации
+	if a.rulesMgr != nil && len(cfg.CustomSRSRulesets) > 0 {
+		log.Printf("[INFO] Reload: Syncing %d custom SRS rulesets...", len(cfg.CustomSRSRulesets))
+		a.rulesMgr.SyncAll(cfg.CustomSRSRulesets)
 	}
 
 	targetPath := RuntimeConfigPathSingBox
