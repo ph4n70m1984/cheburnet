@@ -192,7 +192,7 @@ jobs:
                    "$APK_DATA_DIR/usr/share/luci/menu.d" "$APK_DATA_DIR/usr/share/rpcd/acl.d" \
                    "$APK_SCRIPTS_DIR" dist
 
-          # Копирование бинарников и конфигов
+          # Копирование исполняемого файла и скриптов инициализации
           cp bin/cheburnetd "$APK_DATA_DIR/usr/bin/cheburnetd"
           chmod 755 "$APK_DATA_DIR/usr/bin/cheburnetd"
 
@@ -248,7 +248,7 @@ jobs:
 
           echo "[+] Сформирована валидная APK-версия: $CLEAN_VER"
 
-          # Установочные скрипты
+          # Установочные хуки (сохранение пользовательского конфига)
           cat <<'EOF' > "$APK_SCRIPTS_DIR/pre-install"
           #!/bin/sh
           if [ -f /etc/config/cheburnet ]; then
@@ -267,7 +267,7 @@ jobs:
           EOF
           chmod 755 "$APK_SCRIPTS_DIR/post-install"
 
-          # Создаем fakeroot-окружение для apk mkpkg
+          # Создаем изолированный fakeroot для корректного маппинга UID/GID
           APK_ROOT_DIR=$(mktemp -d)
           mkdir -p "$APK_ROOT_DIR/etc"
           cat > "$APK_ROOT_DIR/etc/passwd" <<EOF
@@ -277,7 +277,7 @@ jobs:
           root:x:$(id -g):root
           EOF
 
-          # Метаданные файлов для OpenWrt
+          # Формирование пакета метаданных conffiles для OpenWrt
           PACKAGES_DIR="$APK_DATA_DIR/lib/apk/packages"
           mkdir -p "$PACKAGES_DIR"
           
@@ -294,7 +294,7 @@ jobs:
 
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета через нативный статический apk
+          # Сборка пакета без директивы provides (устраняет ошибку self-conflict)
           apk --root "$APK_ROOT_DIR" mkpkg \
               --info "name:luci-app-cheburnet" \
               --info "version:${CLEAN_VER}" \
@@ -303,7 +303,6 @@ jobs:
               --info "url:https://github.com/${{ github.repository }}" \
               --info "maintainer:Developer <dev@example.com>" \
               --info "depends:nftables ip-full ca-bundle" \
-              --info "provides:luci-app-cheburnet" \
               --script "pre-install:$APK_SCRIPTS_DIR/pre-install" \
               --script "post-install:$APK_SCRIPTS_DIR/post-install" \
               --files "$APK_DATA_DIR" \
