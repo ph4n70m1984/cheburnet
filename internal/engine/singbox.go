@@ -21,6 +21,7 @@ type ConfigBuilder interface {
 
 type SingBoxEngine struct {
 	builder12 ConfigBuilder
+	builder13 ConfigBuilder
 	builder14 ConfigBuilder
 	cmd       *exec.Cmd
 	cfg       *config.CheburConfig
@@ -30,6 +31,7 @@ type SingBoxEngine struct {
 func NewSingBoxEngine() *SingBoxEngine {
 	return &SingBoxEngine{
 		builder12: singbox.NewBuilder(),
+		builder13: singbox.NewBuilderV13(),
 		builder14: singbox.NewBuilderV14(),
 	}
 }
@@ -48,10 +50,17 @@ func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string)
 	s.mu.Unlock()
 
 	ver := singbox.DetectVersion("/usr/bin/sing-box")
-	if ver.Minor >= 13 {
-		return s.builder14.Build(cfg, targetPath)
+	switch ver.Minor {
+	case 12:
+		return s.builder12.Build(cfg, targetPath)
+	case 13:
+		return s.builder13.Build(cfg, targetPath)
+	default:
+		if ver.Minor >= 14 {
+			return s.builder14.Build(cfg, targetPath)
+		}
+		return s.builder12.Build(cfg, targetPath)
 	}
-	return s.builder12.Build(cfg, targetPath)
 }
 
 func (s *SingBoxEngine) ValidateConfig(configPath string) error {
