@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"cheburnet/internal/config"
@@ -32,31 +34,70 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		bootstrapServer = "77.88.8.8"
 	}
 
-	// 1. Формирование схемы DNS адреса для Sing-Box 1.13
-	var remoteDNSAddress string
-	remoteServer := cfg.DNSServer
-	if remoteServer == "" {
-		remoteServer = "8.8.8.8"
+	// 1. Формирование параметров DNS серверов для Sing-Box 1.12 - 1.14+
+	var remoteDNSType string
+	var remoteDNSServer string
+	var remoteDNSPort uint16 = 53
+	var remoteServerName string
+
+	remoteRaw := cfg.DNSServer
+	if remoteRaw == "" {
+		remoteRaw = "8.8.8.8"
 	}
 
 	switch cfg.DNSProtocol {
 	case "doh", "https":
-		if strings.HasPrefix(remoteServer, "https://") {
-			remoteDNSAddress = remoteServer
+		remoteDNSType = "https"
+		clean := strings.TrimPrefix(remoteRaw, "https://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
 		} else {
-			remoteDNSAddress = fmt.Sprintf("https://%s/dns-query", remoteServer)
+			remoteDNSServer = clean
+			remoteDNSPort = 443
 		}
+		remoteServerName = remoteDNSServer
+
 	case "dot", "tls":
-		if strings.HasPrefix(remoteServer, "tls://") {
-			remoteDNSAddress = remoteServer
+		remoteDNSType = "tls"
+		clean := strings.TrimPrefix(remoteRaw, "tls://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
 		} else {
-			remoteDNSAddress = fmt.Sprintf("tls://%s", remoteServer)
+			remoteDNSServer = clean
+			remoteDNSPort = 853
 		}
-	default:
-		if strings.HasPrefix(remoteServer, "udp://") {
-			remoteDNSAddress = remoteServer
+		remoteServerName = remoteDNSServer
+
+	case "tcp":
+		remoteDNSType = "tcp"
+		clean := strings.TrimPrefix(remoteRaw, "tcp://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
 		} else {
-			remoteDNSAddress = fmt.Sprintf("udp://%s:53", remoteServer)
+			remoteDNSServer = clean
+			remoteDNSPort = 53
+		}
+
+	default:
+		remoteDNSType = "udp"
+		clean := strings.TrimPrefix(remoteRaw, "udp://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
+		} else {
+			remoteDNSServer = clean
+			remoteDNSPort = 53
 		}
 	}
 
@@ -111,7 +152,7 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 	dnsRuleSetList := append([]string(nil), allRuleSets...)
 	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
 
-	// 4. DNS Rules (v1.13 формат: server указывается напрямую)
+	// 4. Правила DNS
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -150,25 +191,36 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
+	// Спецификация серверов DNS (Sing-Box 1.12 - 1.14+)
+	remoteServerEntry := map[string]interface{}{
+		"tag":         "remote-dns",
+		"type":        remoteDNSType,
+		"server":      remoteDNSServer,
+		"server_port": remoteDNSPort,
+	}
+
+	if net.ParseIP(remoteDNSServer) == nil {
+		remoteServerEntry["domain_resolver"] = "bootstrap-dns"
+	}
+
+	if remoteServerName != "" {
+		remoteServerEntry["server_name"] = remoteServerName
+	}
+
 	dnsConfig := map[string]interface{}{
 		"servers": []map[string]interface{}{
 			{
-				"tag":      "bootstrap-dns",
-				"address":  fmt.Sprintf("udp://%s:53", bootstrapServer),
-				"detour":   "direct-out",
-				"strategy": "ipv4_only",
+				"tag":         "bootstrap-dns",
+				"type":        "udp",
+				"server":      bootstrapServer,
+				"server_port": 53,
 			},
 			{
 				"tag":         "fakeip-dns",
-				"address":     "fakeip",
+				"type":        "fakeip",
 				"inet4_range": "198.18.0.0/15",
 			},
-			{
-				"tag":              "remote-dns",
-				"address":          remoteDNSAddress,
-				"address_resolver": "bootstrap-dns",
-				"strategy":         "ipv4_only",
-			},
+			remoteServerEntry,
 		},
 		"rules":             dnsRules,
 		"final":             "remote-dns",
@@ -214,7 +266,6 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 				"listen_port":   tproxyPort,
 				"tcp_fast_open": true,
 				"udp_fragment":  true,
-				"sniff":         true,
 			},
 			{
 				"type":        "direct",
@@ -318,7 +369,7 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	sbConfig["outbounds"] = outbounds
 
-	// 7. Route Rules
+	// 7. Route Rules (сниффинг выполняется здесь)
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",

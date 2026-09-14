@@ -128,9 +128,24 @@ func detectPackageManager() string {
 
 func detectTargetArch(pkgMgr string) string {
 	if pkgMgr == "apk" {
+		// Приоритетно берем точную архитектуру OpenWrt из /etc/apk/arch
+		if archBytes, err := os.ReadFile("/etc/apk/arch"); err == nil {
+			firstLine := strings.TrimSpace(strings.Split(string(archBytes), "\n")[0])
+			if firstLine != "" {
+				return firstLine
+			}
+		}
+
 		out, err := exec.Command("apk", "--print-arch").Output()
 		if err == nil {
-			return strings.TrimSpace(string(out))
+			arch := strings.TrimSpace(string(out))
+			if arch != "" {
+				// Маппинг для семейств ARM/MIPS
+				if arch == "aarch64" {
+					return "aarch64_cortex-a53"
+				}
+				return arch
+			}
 		}
 	} else {
 		out, err := exec.Command("opkg", "print-architecture").Output()
@@ -151,17 +166,16 @@ func detectTargetArch(pkgMgr string) string {
 		}
 	}
 
+	// Fallback по GOARCH
 	switch runtime.GOARCH {
 	case "arm64":
-		if pkgMgr == "apk" {
-			return "aarch64"
-		}
 		return "aarch64_cortex-a53"
 	case "arm":
-		if pkgMgr == "apk" {
-			return "armhf"
-		}
 		return "arm_cortex-a7_neon-vfpv4"
+	case "mipsle":
+		return "mipsel_24kc"
+	case "mips":
+		return "mips_24kc"
 	default:
 		return runtime.GOARCH
 	}
@@ -172,6 +186,8 @@ func parseSemVer(v string) []int {
 	if idx := strings.Index(v, "-"); idx != -1 {
 		v = v[:idx]
 	}
+	// Учитываем нормализацию для OpenWrt APK (_p26)
+	v = strings.ReplaceAll(v, "_p", ".")
 	parts := strings.Split(v, ".")
 	res := make([]int, 4)
 	for i := 0; i < len(parts) && i < 4; i++ {
@@ -548,19 +564,47 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		targetExt = ".apk"
 	}
 
+	targetArchLower := strings.ToLower(m.targetArch)
+
+	// Поиск пакета с учетом приоритетов
+	var bestPkgAsset releaseAsset
+	var fallbackPkgAsset releaseAsset
+
 	for _, a := range rel.Assets {
 		name := strings.ToLower(a.Name)
 		if strings.Contains(name, "sha256") || strings.Contains(name, "checksum") {
 			checksumsURL = a.BrowserDownloadURL
 		}
+
 		if strings.HasSuffix(name, targetExt) {
-			if strings.Contains(name, strings.ToLower(m.targetArch)) || strings.Contains(name, runtime.GOARCH) {
-				pkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+			if m.pkgManager == "apk" {
+				// Для OpenWrt 25 APK: отдаем приоритет пакетам с _p и точным именем таргета
+				if strings.Contains(name, "_p") && strings.Contains(name, targetArchLower) {
+					bestPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+				} else if strings.Contains(name, targetArchLower) && bestPkgAsset.URL == "" {
+					fallbackPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+				} else if strings.Contains(name, runtime.GOARCH) && fallbackPkgAsset.URL == "" && bestPkgAsset.URL == "" {
+					fallbackPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+				}
+			} else {
+				// Для OPKG (.ipk)
+				if strings.Contains(name, targetArchLower) {
+					bestPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+				} else if strings.Contains(name, runtime.GOARCH) && fallbackPkgAsset.URL == "" {
+					fallbackPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
+				}
 			}
 		}
+
 		if strings.Contains(name, fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)) {
 			binAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
 		}
+	}
+
+	if bestPkgAsset.URL != "" {
+		pkgAsset = bestPkgAsset
+	} else {
+		pkgAsset = fallbackPkgAsset
 	}
 
 	return tag, pkgAsset, binAsset, checksumsURL, nil
@@ -701,7 +745,7 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 
 		var cmd *exec.Cmd
 		if m.pkgManager == "apk" {
-			cmd = exec.CommandContext(ctx, "apk", "add", tmpFile)
+			cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", "--force-overwrite", tmpFile)
 		} else {
 			cmd = exec.CommandContext(ctx, "opkg", "--tmp-dir", "/tmp", "install", "--force-reinstall", tmpFile)
 		}
