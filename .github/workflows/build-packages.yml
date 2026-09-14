@@ -38,7 +38,7 @@ jobs:
             apk_arch: armhf
             use_upx: true
 
-          # MediaTek MT7621, MT7628, ramips/mipsel (Cudy, Keenetic, Xiaomi и др.)
+          # MediaTek MT7621, MT7628, ramips/mipsel (Cudy, Keenetic, Xiaomi, TP-Link Archer C6U и др.)
           - arch: mipsel_24kc
             goarch: mipsle
             goarm: ""
@@ -266,9 +266,13 @@ jobs:
           EOF
           chmod 755 "$CONTROL_DIR/.post-install"
 
-          # Сборка структуры v2: control.tar.gz + data.tar.gz
-          tar --numeric-owner --owner=0 --group=0 -czf control.tar.gz -C "$CONTROL_DIR" .
-          tar --numeric-owner --owner=0 --group=0 -czf data.tar.gz -C "$DATA_DIR" .
+          # Формирование архивов строгого формата ustar без PAX-расширений
+          tar --numeric-owner --owner=0 --group=0 --format=ustar -cf control.tar -C "$CONTROL_DIR" .
+          tar --numeric-owner --owner=0 --group=0 --format=ustar -cf data.tar -C "$DATA_DIR" .
+
+          # Сжатие gzip без сохранения временных меток и имен (-n)
+          gzip -n -9 control.tar
+          gzip -n -9 data.tar
 
           APK_NAME="luci-app-cheburnet-${{ steps.vars.outputs.version }}.${{ matrix.apk_arch }}.apk"
           cat control.tar.gz data.tar.gz > "dist/$APK_NAME"
