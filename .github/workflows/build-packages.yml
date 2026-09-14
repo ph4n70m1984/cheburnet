@@ -121,6 +121,7 @@ jobs:
               chmod 644 "$PKG_DIR/data/etc/config/cheburnet"
           fi
 
+          # Копируем LuCI Web UI
           if [ -d openwrt/files/www/luci-static/resources/view/cheburnet ]; then
               cp -r openwrt/files/www/luci-static/resources/view/cheburnet/* "$PKG_DIR/data/www/luci-static/resources/view/cheburnet/"
           elif [ -d luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet ]; then
@@ -135,6 +136,7 @@ jobs:
               cp luci-app-cheburnet/root/usr/share/luci/menu.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/luci/menu.d/"
           fi
 
+          # ACL манифест для rpcd
           if [ -f openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
               cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$PKG_DIR/data/usr/share/rpcd/acl.d/"
           elif [ -f luci-app-cheburnet/root/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
@@ -238,11 +240,16 @@ jobs:
           EOF
           fi
 
-          # Валидация формата версии APK (-rX)
-          CLEAN_VER="${{ steps.vars.outputs.version }}"
-          if [[ "$CLEAN_VER" != *-r* ]]; then
-              CLEAN_VER="${CLEAN_VER}-r1"
-          fi
+          # Валидация и нормализация формата версии для APK
+          RAW_VER="${{ steps.vars.outputs.version }}"
+          # 1. Заменяем 4-ю группу чисел (0.0.8.26 -> 0.0.8_p26), чтобы уложиться в лимит 3 групп
+          CLEAN_VER=$(echo "$RAW_VER" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/\1.\2.\3_p\4/')
+          # 2. Удаляем дефисы (например, хэши коммитов в dev-версиях 0.0.1-abc -> 0.0.1)
+          CLEAN_VER=$(echo "$CLEAN_VER" | sed -E 's/-.*//' | tr -cd '0-9.a-zA-Z_')
+          # 3. Добавляем суффикс ревизии -r1
+          CLEAN_VER="${CLEAN_VER}-r1"
+
+          echo "[+] Сформирована валидная APK-версия: $CLEAN_VER"
 
           # Установочные скрипты
           cat <<'EOF' > "$APK_SCRIPTS_DIR/pre-install"
@@ -263,7 +270,7 @@ jobs:
           EOF
           chmod 755 "$APK_SCRIPTS_DIR/post-install"
 
-          # Создаем фейковый root для apk mkpkg
+          # Создаем fakeroot-окружение для apk mkpkg
           APK_ROOT_DIR=$(mktemp -d)
           mkdir -p "$APK_ROOT_DIR/etc"
           cat > "$APK_ROOT_DIR/etc/passwd" <<EOF
@@ -290,7 +297,7 @@ jobs:
 
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета через встроенный apk
+          # Сборка пакета через бинарник apk
           apk --root "$APK_ROOT_DIR" mkpkg \
               --info "name:luci-app-cheburnet" \
               --info "version:${CLEAN_VER}" \
