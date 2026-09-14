@@ -121,7 +121,7 @@ jobs:
               chmod 644 "$PKG_DIR/data/etc/config/cheburnet"
           fi
 
-          # Копируем LuCI Web UI (включая dashboard.js и поддиректорию modules/)
+          # Копируем LuCI Web UI
           if [ -d openwrt/files/www/luci-static/resources/view/cheburnet ]; then
               cp -r openwrt/files/www/luci-static/resources/view/cheburnet/* "$PKG_DIR/data/www/luci-static/resources/view/cheburnet/"
           elif [ -d luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet ]; then
@@ -181,44 +181,44 @@ jobs:
 
       - name: Pack .apk Package
         run: |
-          APK_BUILD_DIR="apk_build"
-          mkdir -p "$APK_BUILD_DIR/usr/bin" "$APK_BUILD_DIR/etc/init.d" "$APK_BUILD_DIR/etc/config" \
-                   "$APK_BUILD_DIR/www/luci-static/resources/view/cheburnet" \
-                   "$APK_BUILD_DIR/usr/share/luci/menu.d" "$APK_BUILD_DIR/usr/share/rpcd/acl.d"
+          APK_DATA_DIR="apk_data"
+          mkdir -p "$APK_DATA_DIR/usr/bin" "$APK_DATA_DIR/etc/init.d" "$APK_DATA_DIR/etc/config" \
+                   "$APK_DATA_DIR/www/luci-static/resources/view/cheburnet" \
+                   "$APK_DATA_DIR/usr/share/luci/menu.d" "$APK_DATA_DIR/usr/share/rpcd/acl.d"
 
-          cp bin/cheburnetd "$APK_BUILD_DIR/usr/bin/cheburnetd"
-          chmod 755 "$APK_BUILD_DIR/usr/bin/cheburnetd"
+          cp bin/cheburnetd "$APK_DATA_DIR/usr/bin/cheburnetd"
+          chmod 755 "$APK_DATA_DIR/usr/bin/cheburnetd"
 
           if [ -f openwrt/files/etc/init.d/cheburnet ]; then
-              cp openwrt/files/etc/init.d/cheburnet "$APK_BUILD_DIR/etc/init.d/cheburnet"
+              cp openwrt/files/etc/init.d/cheburnet "$APK_DATA_DIR/etc/init.d/cheburnet"
           fi
-          chmod 755 "$APK_BUILD_DIR/etc/init.d/cheburnet"
+          chmod 755 "$APK_DATA_DIR/etc/init.d/cheburnet"
 
           if [ -f openwrt/files/etc/config/cheburnet ]; then
-              cp openwrt/files/etc/config/cheburnet "$APK_BUILD_DIR/etc/config/cheburnet"
-              chmod 644 "$APK_BUILD_DIR/etc/config/cheburnet"
+              cp openwrt/files/etc/config/cheburnet "$APK_DATA_DIR/etc/config/cheburnet"
+              chmod 644 "$APK_DATA_DIR/etc/config/cheburnet"
           fi
 
           if [ -d openwrt/files/www/luci-static/resources/view/cheburnet ]; then
-              cp -r openwrt/files/www/luci-static/resources/view/cheburnet/* "$APK_BUILD_DIR/www/luci-static/resources/view/cheburnet/"
+              cp -r openwrt/files/www/luci-static/resources/view/cheburnet/* "$APK_DATA_DIR/www/luci-static/resources/view/cheburnet/"
           elif [ -d luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet ]; then
-              cp -r luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet/* "$APK_BUILD_DIR/www/luci-static/resources/view/cheburnet/"
+              cp -r luci-app-cheburnet/htdocs/luci-static/resources/view/cheburnet/* "$APK_DATA_DIR/www/luci-static/resources/view/cheburnet/"
           elif [ -d www/luci-static/resources/view/cheburnet ]; then
-              cp -r www/luci-static/resources/view/cheburnet/* "$APK_BUILD_DIR/www/luci-static/resources/view/cheburnet/"
+              cp -r www/luci-static/resources/view/cheburnet/* "$APK_DATA_DIR/www/luci-static/resources/view/cheburnet/"
           fi
 
           if [ -f openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json ]; then
-              cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_BUILD_DIR/usr/share/luci/menu.d/"
+              cp openwrt/files/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_DATA_DIR/usr/share/luci/menu.d/"
           elif [ -f luci-app-cheburnet/root/usr/share/luci/menu.d/luci-app-cheburnet.json ]; then
-              cp luci-app-cheburnet/root/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_BUILD_DIR/usr/share/luci/menu.d/"
+              cp luci-app-cheburnet/root/usr/share/luci/menu.d/luci-app-cheburnet.json "$APK_DATA_DIR/usr/share/luci/menu.d/"
           fi
 
           if [ -f openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
-              cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$APK_BUILD_DIR/usr/share/rpcd/acl.d/"
+              cp openwrt/files/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$APK_DATA_DIR/usr/share/rpcd/acl.d/"
           elif [ -f luci-app-cheburnet/root/usr/share/rpcd/acl.d/luci-app-cheburnet.json ]; then
-              cp luci-app-cheburnet/root/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$APK_BUILD_DIR/usr/share/rpcd/acl.d/"
+              cp luci-app-cheburnet/root/usr/share/rpcd/acl.d/luci-app-cheburnet.json "$APK_DATA_DIR/usr/share/rpcd/acl.d/"
           else
-              cat <<'EOF' > "$APK_BUILD_DIR/usr/share/rpcd/acl.d/luci-app-cheburnet.json"
+              cat <<'EOF' > "$APK_DATA_DIR/usr/share/rpcd/acl.d/luci-app-cheburnet.json"
           {
               "luci-app-cheburnet": {
                   "description": "Grant UCI access for Chebur.NET LuCI app",
@@ -233,35 +233,42 @@ jobs:
           EOF
           fi
 
-          # Валидация формата версии для APK (число-rчисло)
+          # Нормализация формата версии для apk (число-rчисло)
           CLEAN_VER="${{ steps.vars.outputs.version }}"
           if [[ "$CLEAN_VER" != *-r* ]]; then
               CLEAN_VER="${CLEAN_VER}-r1"
           fi
 
-          cat <<EOF > "$APK_BUILD_DIR/.PKGINFO"
+          mkdir -p apk_meta dist
+          CALC_SIZE=$(du -sb "$APK_DATA_DIR" | awk '{print $1}')
+
+          # Формирование строго валидного .PKGINFO без недопустимых директив
+          cat <<EOF > apk_meta/.PKGINFO
           pkgname = luci-app-cheburnet
           pkgver = ${CLEAN_VER}
-          arch = ${{ matrix.apk_arch }}
-          size = $(du -sb "$APK_BUILD_DIR" | awk '{print $1}')
           pkgdesc = Transparent proxy and routing daemon on top of sing-box/xray
           url = https://github.com/${{ github.repository }}
+          builddate = $(date +%s)
+          packager = GitHub Actions
+          size = ${CALC_SIZE}
+          arch = ${{ matrix.apk_arch }}
           depend = sing-box
           depend = nftables
           depend = ip-full
           depend = ca-bundle
-          datahash = none
           EOF
 
-          mkdir -p dist
+          # Удаление пробелов в начале строк манифеста (требование парсера apk-tools)
+          sed -i 's/^[[:blank:]]*//' apk_meta/.PKGINFO
+
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета через официальный инструмент Alpine apk-tools (apk mkpkg)
-          docker run --rm -v "$(pwd):/work" alpine:edge sh -c "
+          # Сборка пакета через официальный инструмент Alpine apk mkpkg
+          docker run --rm -v "$(pwd):/work" -w /work alpine:edge sh -c "
             apk add --no-cache apk-tools >/dev/null 2>&1
-            apk mkpkg --info /work/$APK_BUILD_DIR/.PKGINFO \
-                      -o /work/dist/$APK_FILE \
-                      /work/$APK_BUILD_DIR
+            apk mkpkg --info apk_meta/.PKGINFO \
+                      --output dist/$APK_FILE \
+                      apk_data
           "
 
       - name: Generate Checksums
