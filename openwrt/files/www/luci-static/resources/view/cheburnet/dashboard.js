@@ -23,11 +23,157 @@ return view.extend({
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
+        // Внедрение универсальной дизайн-системы
+        var styleId = 'cheburnet-theme-vars';
+        if (!document.getElementById(styleId)) {
+            var css = document.createElement('style');
+            css.id = styleId;
+            css.textContent = `
+                :root {
+                    /* Светлая тема (базовая палитра для светлого LuCI) */
+                    --cb-bg-card: #ffffff;
+                    --cb-bg-surface: #f8fafc;
+                    --cb-border: #cbd5e1;
+                    --cb-text-main: #0f172a;
+                    --cb-text-muted: #475569;
+                    --cb-text-accent: #0284c7;
+
+                    --cb-badge-bg: #f1f5f9;
+                    --cb-badge-border: #cbd5e1;
+                    --cb-badge-text: #334155;
+
+                    --cb-ok-bg: #f0fdf4;
+                    --cb-ok-border: #86efac;
+                    --cb-ok-text: #166534;
+
+                    --cb-warn-bg: #fffbeb;
+                    --cb-warn-border: #fcd34d;
+                    --cb-warn-text: #92400e;
+
+                    --cb-err-bg: #fef2f2;
+                    --cb-err-border: #fca5a5;
+                    --cb-err-text: #991b1b;
+
+                    --cb-card-active-bg: #f0f9ff;
+                    --cb-card-active-border: #7dd3fc;
+                    --cb-table-hover: rgba(0, 0, 0, 0.04);
+                }
+
+                /* Тёмная тема активируется ТОЛЬКО если у html/body реально включён тёмный класс темы LuCI */
+                html[data-darkmode="true"],
+                html[data-theme="dark"],
+                html[data-bs-theme="dark"],
+                body.dark,
+                body.dark-mode,
+                body[class*="dark"] {
+                    --cb-bg-card: #1e293b !important;
+                    --cb-bg-surface: #0f172a !important;
+                    --cb-border: rgba(255, 255, 255, 0.12) !important;
+                    --cb-text-main: #f8fafc !important;
+                    --cb-text-muted: #94a3b8 !important;
+                    --cb-text-accent: #38bdf8 !important;
+
+                    --cb-badge-bg: rgba(255, 255, 255, 0.06) !important;
+                    --cb-badge-border: rgba(255, 255, 255, 0.15) !important;
+                    --cb-badge-text: #cbd5e1 !important;
+
+                    --cb-ok-bg: rgba(74, 222, 128, 0.12) !important;
+                    --cb-ok-border: rgba(74, 222, 128, 0.35) !important;
+                    --cb-ok-text: #4ade80 !important;
+
+                    --cb-warn-bg: rgba(234, 179, 8, 0.15) !important;
+                    --cb-warn-border: rgba(234, 179, 8, 0.45) !important;
+                    --cb-warn-text: #fde047 !important;
+
+                    --cb-err-bg: rgba(239, 68, 68, 0.15) !important;
+                    --cb-err-border: rgba(239, 68, 68, 0.45) !important;
+                    --cb-err-text: #f87171 !important;
+
+                    --cb-card-active-bg: rgba(56, 189, 248, 0.12) !important;
+                    --cb-card-active-border: rgba(56, 189, 248, 0.4) !important;
+                    --cb-table-hover: rgba(255, 255, 255, 0.05) !important;
+                }
+
+                /* Стили раскрывающихся панелей (details / summary) */
+                .cb-details {
+                    border: 1px solid var(--cb-border) !important;
+                    border-radius: 8px !important;
+                    background: var(--cb-bg-card) !important;
+                    padding: 12px !important;
+                    margin-top: 15px !important;
+                    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05) !important;
+                }
+                .cb-details summary {
+                    color: var(--cb-text-accent) !important;
+                    cursor: pointer;
+                    user-select: none;
+                }
+
+                /* Исправление вкладок табов внутри аккордеона */
+                .cb-details .cbi-tabmenu {
+                    border-bottom: 1px solid var(--cb-border) !important;
+                    margin-bottom: 15px !important;
+                }
+                .cb-details .cbi-tabmenu > li > a {
+                    color: var(--cb-text-muted) !important;
+                }
+                .cb-details .cbi-tabmenu > li.cbi-tab > a {
+                    color: var(--cb-text-accent) !important;
+                    font-weight: bold !important;
+                    border-bottom: 2px solid var(--cb-text-accent) !important;
+                }
+
+                /* Исправление фонов и текста для контролов ввода в светлой теме */
+                .cb-details input[type="text"],
+                .cb-details input[type="password"],
+                .cb-details select,
+                .cb-details textarea,
+                .cb-details .cbi-dynlist {
+                    background-color: var(--cb-bg-surface) !important;
+                    border: 1px solid var(--cb-border) !important;
+                    color: var(--cb-text-main) !important;
+                    border-radius: 4px !important;
+                }
+
+                .cb-details .cbi-dynlist > .item {
+                    background: var(--cb-badge-bg) !important;
+                    border: 1px solid var(--cb-badge-border) !important;
+                    color: var(--cb-text-main) !important;
+                }
+
+                /* Таблица списка серверов */
+                #chebur-nodes-table {
+                    background: var(--cb-bg-card) !important;
+                    color: var(--cb-text-main) !important;
+                    border-collapse: collapse !important;
+                    width: 100% !important;
+                }
+                #chebur-nodes-table tr.tr {
+                    background: transparent !important;
+                    transition: background 0.15s ease;
+                }
+                #chebur-nodes-table tr.tr:hover {
+                    background-color: var(--cb-table-hover) !important;
+                }
+                #chebur-nodes-table th, 
+                #chebur-nodes-table .table-titles {
+                    background: var(--cb-bg-surface) !important;
+                    color: var(--cb-text-muted) !important;
+                    border-bottom: 1px solid var(--cb-border) !important;
+                }
+                #chebur-nodes-table td {
+                    color: var(--cb-text-main) !important;
+                    border-bottom: 1px solid var(--cb-border) !important;
+                }
+            `;
+            document.head.appendChild(css);
+        }
+
         window.cheburCheckUpdates = function(e) {
             e.preventDefault();
             var statusDiv = document.getElementById('ws-update-status');
             if (statusDiv) {
-                statusDiv.innerHTML = '<span style="color:#fbbf24;">Выполняется проверка GitHub и пакетов...</span>';
+                statusDiv.innerHTML = '<span style="color:var(--cb-warn-text);">' + _('Выполняется проверка GitHub и пакетов...') + '</span>';
             }
 
             var host = window.location.hostname;
@@ -46,7 +192,7 @@ return view.extend({
                 })
                 .catch(function(err) {
                     if (statusDiv) {
-                        statusDiv.innerHTML = '<span style="color:#f87171;">Ошибка проверки обновлений: ' + err.message + '</span>';
+                        statusDiv.innerHTML = '<span style="color:var(--cb-err-text);">' + _('Ошибка проверки обновлений: ') + err.message + '</span>';
                     }
                 });
         };
@@ -56,7 +202,7 @@ return view.extend({
             var statusDiv = document.getElementById('ws-update-status');
             var btnUpgrade = document.getElementById('ws-btn-upgrade');
             if (statusDiv) {
-                statusDiv.innerHTML = '<span style="color:#38bdf8;">Процесс обновления запущен в фоне. Демон перезапустится автоматически...</span>';
+                statusDiv.innerHTML = '<span style="color:var(--cb-text-accent);">' + _('Процесс обновления запущен в фоне. Демон перезапустится автоматически...') + '</span>';
             }
             if (btnUpgrade) {
                 btnUpgrade.style.display = 'none';
@@ -71,7 +217,7 @@ return view.extend({
             .then(function(data) {
                 if (data && data.error) {
                     if (statusDiv) {
-                        statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сбой: ' + data.error + '</span>';
+                        statusDiv.innerHTML = '<span style="color:var(--cb-err-text);">✖ ' + _('Сбой: ') + data.error + '</span>';
                     }
                     if (btnUpgrade) {
                         btnUpgrade.style.display = 'inline-block';
@@ -81,7 +227,7 @@ return view.extend({
             })
             .catch(function(err) {
                 if (statusDiv) {
-                    statusDiv.innerHTML = '<span style="color:#f87171;">✖ Сетевая ошибка: ' + err + '</span>';
+                    statusDiv.innerHTML = '<span style="color:var(--cb-err-text);">✖ ' + _('Сетевая ошибка: ') + err + '</span>';
                 }
                 if (btnUpgrade) {
                     btnUpgrade.style.display = 'inline-block';
@@ -103,11 +249,11 @@ return view.extend({
         s.render = function() {
             return Promise.resolve(origRender.apply(this, arguments)).then(function(contentNode) {
                 return E('details', {
-                    'class': 'cbi-section',
-                    'style': 'margin-top: 20px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; padding: 10px; background: rgba(255, 255, 255, 0.02);'
+                    'class': 'cbi-section cb-details',
+                    'style': 'margin-top: 20px;'
                 }, [
                     E('summary', {
-                        'style': 'font-size: 15px; font-weight: bold; cursor: pointer; padding: 8px 10px; user-select: none; color: #38bdf8;'
+                        'style': 'font-size: 15px; font-weight: bold; padding: 8px 10px;'
                     }, _('▶ Параметры маршрутизации, сети и обновлений (нажмите, чтобы развернуть)')),
                     contentNode
                 ]);
@@ -169,14 +315,13 @@ return view.extend({
                 var self = this, args = arguments;
                 return Promise.resolve(orig.apply(self, args)).then(function(node) {
                     var detailsNode = E('details', {
-                        'class': 'cbi-section',
-                        'style': 'margin-top: 15px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 10px; background: rgba(255, 255, 255, 0.01);'
+                        'class': 'cbi-section cb-details'
                     }, [
                         E('summary', {
-                            'style': 'font-size: 14px; font-weight: bold; cursor: pointer; padding: 6px 8px; user-select: none; color: #38bdf8; display: flex; justify-content: space-between;'
+                            'style': 'font-size: 14px; font-weight: bold; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center;'
                         }, [
                             E('span', {}, titleText),
-                            E('span', { 'style': 'font-size: 11px; font-weight: normal; color: #64748b;' }, _('(нажмите, чтобы развернуть/свернуть)'))
+                            E('span', { 'style': 'font-size: 11px; font-weight: normal; color: var(--cb-text-muted);' }, _('(нажмите, чтобы развернуть/свернуть)'))
                         ]),
                         node
                     ]);
@@ -193,7 +338,7 @@ return view.extend({
         o.value('168h', _('1 неделя'));
         o.default = '72h';
 
-        // --- Пользовательские SRS правила (Sing-box) внутри вкладки ---
+        // Пользовательские SRS списки правил
         o = s.taboption('routing_rules', form.DynamicList, 'custom_srs_rulesets', _('Пользовательские SRS списки (Sing-box)'));
         o.description = _('Формат ввода: <code>Имя|URL|[direct|proxy]</code> (например: <code>antizapret|https://example.com/rule.srs|direct</code>). Загружаются демоном с валидацией и резервированием.');
         o.placeholder = 'my_list|https://example.com/rule.srs|direct';
@@ -231,13 +376,13 @@ return view.extend({
         var o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
         o_upd.rawhtml = true;
         o_upd.default = '' +
-            '<div style="margin-bottom:15px; padding:15px; border:1px solid rgba(255,255,255,0.15); border-radius:6px; background:rgba(0,0,0,0.25);">' +
-                '<div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:#8c8c8c; font-size:13px;">' +
-                    'Ожидание ручной проверки релизов...' +
+            '<div style="margin-bottom:15px; padding:15px; border:1px solid var(--cb-border); border-radius:6px; background:var(--cb-bg-card);">' +
+                '<div id="ws-update-status" style="margin-bottom:15px; font-family:monospace; color:var(--cb-text-muted); font-size:13px;">' +
+                    _('Ожидание ручной проверки релизов...') +
                 '</div>' +
                 '<div style="display:flex; gap:10px; flex-wrap:wrap;">' +
-                    '<button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">Проверить наличие обновлений</button>' +
-                    '<button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">Установить все обновления</button>' +
+                    '<button class="btn cbi-button-apply" onclick="window.cheburCheckUpdates(event)">' + _('Проверить наличие обновлений') + '</button>' +
+                    '<button class="btn cbi-button-action" id="ws-btn-upgrade" style="display:none;" onclick="window.cheburPerformUpgrade(event)">' + _('Установить все обновления') + '</button>' +
                 '</div>' +
             '</div>';
 
@@ -245,9 +390,7 @@ return view.extend({
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
         o.default = '0';
 
-        // --- ВНЕШНИЕ АККОРДЕОНЫ (СЕКЦИИ КАРТЫ) ---
-
-        // 1. Подписки
+        // --- ВНЕШНИЕ АККОРДЕОНЫ ---
         var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
@@ -280,7 +423,6 @@ return view.extend({
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
         o.modalonly = true;
 
-        // 2. Клиенты
         var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств'));
         clientSec.anonymous = true;
         clientSec.addremove = true;
@@ -311,7 +453,6 @@ return view.extend({
         o.default = 'rules';
         o.editable = true;
 
-        // 3. Маршруты сервисов
         var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации'));
         routeSec.anonymous = true;
         routeSec.addremove = true;

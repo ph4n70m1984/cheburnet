@@ -5,15 +5,15 @@
 return baseclass.extend({
     formatComponentStatus: function(name, comp) {
         if (!comp || !comp.installed) {
-            return '<li>' + name + ': <span style="color:#71717a;">Не установлен</span></li>';
+            return '<li>' + name + ': <span style="color:var(--cb-text-muted);">' + _('Не установлен') + '</span></li>';
         }
-        var currentVer = comp.current ? ('v' + comp.current.replace(/^v/, '')) : 'неизвестно';
+        var currentVer = comp.current ? ('v' + comp.current.replace(/^v/, '')) : _('неизвестно');
         var latestVer = comp.latest ? ('v' + comp.latest.replace(/^v/, '')) : currentVer;
 
         if (comp.has_update) {
-            return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:#4ade80; font-weight:bold;">' + latestVer + ' (Доступно обновление)</span></li>';
+            return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:var(--cb-ok-text); font-weight:bold;">' + latestVer + ' (' + _('Доступно обновление') + ')</span></li>';
         }
-        return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:#8c8c8c;">Актуально</span></li>';
+        return '<li>' + name + ': <b>' + currentVer + '</b> → <span style="color:var(--cb-text-muted);">' + _('Актуально') + '</span></li>';
     },
 
     renderUpdateReport: function(r) {
@@ -23,11 +23,11 @@ return baseclass.extend({
         if (!statusDiv) return;
 
         if (!r || (!r.cheburnet && !r.sing_box)) {
-            statusDiv.innerHTML = '<span style="color:#f87171;">Не удалось получить данные о версиях релизов.</span>';
+            statusDiv.innerHTML = '<span style="color:var(--cb-err-text);">' + _('Не удалось получить данные о версиях релизов.') + '</span>';
             return;
         }
 
-        var html = '<ul style="margin:0; padding-left:20px; line-height: 1.8; color:#c9d1d9;">';
+        var html = '<ul style="margin:0; padding-left:20px; line-height: 1.8; color:var(--cb-text-main);">';
         html += this.formatComponentStatus('Chebur.NET', r.cheburnet);
         html += this.formatComponentStatus('Sing-box', r.sing_box);
         html += '</ul>';
@@ -36,7 +36,7 @@ return baseclass.extend({
         var hasSbUpdate = r.sing_box && r.sing_box.installed && r.sing_box.has_update;
 
         if (!hasAppUpdate && !hasSbUpdate) {
-            html += '<div style="margin-top:8px; color:#4ade80; font-size:12px;">✔ Все компоненты обновлены до актуальных версий.</div>';
+            html += '<div style="margin-top:8px; color:var(--cb-ok-text); font-size:12px;">✔ ' + _('Все компоненты обновлены до актуальных версий.') + '</div>';
         }
         statusDiv.innerHTML = html;
 
@@ -58,11 +58,11 @@ return baseclass.extend({
             var banner = document.getElementById('update-notification-banner');
             var txt = document.getElementById('update-banner-text');
             if (banner && txt) {
-                txt.textContent = 'Доступны обновления компонентов: ' + alerts.join(' | ');
+                txt.textContent = _('Доступны обновления компонентов: ') + alerts.join(' | ');
                 banner.style.display = 'flex';
-                banner.style.background = 'rgba(234, 179, 8, 0.15)';
-                banner.style.borderColor = 'rgba(234, 179, 8, 0.4)';
-                banner.style.color = '#fef08a';
+                banner.style.background = 'var(--cb-warn-bg)';
+                banner.style.border = '1px solid var(--cb-warn-border)';
+                banner.style.color = 'var(--cb-warn-text)';
             }
         }
     },
@@ -85,30 +85,29 @@ return baseclass.extend({
 
             var snap = window.cheburLastDiagSnapshot;
             if (!snap) {
-                banner.style.background = 'rgba(255, 255, 255, 0.05)';
-                banner.style.borderColor = 'rgba(255, 255, 255, 0.15)';
-                banner.style.color = '#a1a1aa';
+                banner.style.background = 'var(--cb-badge-bg)';
+                banner.style.border = '1px solid var(--cb-badge-border)';
+                banner.style.color = 'var(--cb-text-muted)';
                 content.textContent = _('● Инициализация системы диагностики...');
                 return;
             }
 
             var pList = Object.values(window.cheburProblems || {});
             if (pList.length === 0) {
-                banner.style.background = 'rgba(74, 222, 128, 0.1)';
-                banner.style.borderColor = 'rgba(74, 222, 128, 0.25)';
-                banner.style.color = '#4ade80';
-                content.innerHTML = '● Все системы работают штатно &middot; Проверено показателей: <strong>' + (snap.total_checks || 15) + '</strong>';
+                banner.style.background = 'var(--cb-ok-bg)';
+                banner.style.border = '1px solid var(--cb-ok-border)';
+                banner.style.color = 'var(--cb-ok-text)';
+                content.innerHTML = '● ' + _('Все системы работают штатно &middot; Проверено показателей: ') + '<strong>' + (snap.total_checks || 15) + '</strong>';
                 var container = document.getElementById('diag-problems-container');
                 if (container) container.innerHTML = '';
                 return;
             }
 
-            // Красный цвет баннера только для critical, для error/warning — янтарно-желтый
             var hasCrit = pList.some(function(p) { return p.severity === 'critical'; });
-            banner.style.background = hasCrit ? 'rgba(239, 68, 68, 0.15)' : 'rgba(234, 179, 8, 0.15)';
-            banner.style.borderColor = hasCrit ? 'rgba(239, 68, 68, 0.4)' : 'rgba(234, 179, 8, 0.4)';
-            banner.style.color = hasCrit ? '#f87171' : '#b45309';
-            content.innerHTML = '▲ Обнаружены проблемы: <strong>' + pList.length + '</strong>';
+            banner.style.background = hasCrit ? 'var(--cb-err-bg)' : 'var(--cb-warn-bg)';
+            banner.style.border = hasCrit ? '1px solid var(--cb-err-border)' : '1px solid var(--cb-warn-border)';
+            banner.style.color = hasCrit ? 'var(--cb-err-text)' : 'var(--cb-warn-text)';
+            content.innerHTML = '▲ ' + _('Обнаружены проблемы: ') + '<strong>' + pList.length + '</strong>';
         }
 
         function executeProblemAction(action, btnEl) {
@@ -150,9 +149,9 @@ return baseclass.extend({
 
             pList.forEach(function(prob) {
                 var isCrit = (prob.severity === 'critical');
-                var cardBg = isCrit ? 'rgba(239, 68, 68, 0.1)' : 'rgba(234, 179, 8, 0.12)';
-                var cardBorder = isCrit ? '#ef4444' : '#eab308';
-                var msgColor = isCrit ? '#dc2626' : '#b45309';
+                var cardBg = isCrit ? 'var(--cb-err-bg)' : 'var(--cb-warn-bg)';
+                var cardBorder = isCrit ? 'var(--cb-err-border)' : 'var(--cb-warn-border)';
+                var msgColor = isCrit ? 'var(--cb-err-text)' : 'var(--cb-warn-text)';
 
                 var actionBtn = null;
                 if (prob.recoverable && prob.action) {
@@ -168,8 +167,8 @@ return baseclass.extend({
 
                 var leftChildren = [
                     E('div', { 'style': 'display: flex; align-items: center; gap: 8px; flex-wrap: wrap;' }, [
-                        E('span', { 'style': 'font-weight: bold; font-size: 13px; color: ' + msgColor + ';' }, prob.message || 'Ошибка системы'),
-                        E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,0.08); color: #475569; font-weight: 600;' }, prob.component || 'система')
+                        E('span', { 'style': 'font-weight: bold; font-size: 13px; color: ' + msgColor + ';' }, prob.message || _('Ошибка системы')),
+                        E('span', { 'style': 'font-size: 10px; padding: 1px 6px; border-radius: 4px; background: var(--cb-badge-bg); border: 1px solid var(--cb-border); color: var(--cb-text-muted); font-weight: 600;' }, prob.component || _('система'))
                     ])
                 ];
 
@@ -282,8 +281,8 @@ return baseclass.extend({
                 .then(function(data) {
                     var statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
-                        statusEl.textContent = '● Онлайн';
-                        statusEl.style.color = '#4ade80';
+                        statusEl.textContent = '● ' + _('Онлайн');
+                        statusEl.style.color = 'var(--cb-ok-text)';
                     }
                     var countEl = document.getElementById('total-nodes');
                     if (countEl && data.nodes_count !== undefined) countEl.textContent = data.nodes_count;
@@ -297,8 +296,8 @@ return baseclass.extend({
                 .catch(function() {
                     var statusEl = document.getElementById('daemon-status');
                     if (statusEl) {
-                        statusEl.textContent = '● Офлайн';
-                        statusEl.style.color = '#f87171';
+                        statusEl.textContent = '● ' + _('Офлайн');
+                        statusEl.style.color = 'var(--cb-err-text)';
                     }
                 });
         }
@@ -335,10 +334,10 @@ return baseclass.extend({
                         var txt = document.getElementById('update-banner-text');
                         if (b && txt) {
                             b.style.display = 'flex';
-                            b.style.background = 'rgba(239, 68, 68, 0.15)';
-                            b.style.borderColor = 'rgba(239, 68, 68, 0.4)';
-                            b.style.color = '#f87171';
-                            txt.innerHTML = '✖ <strong>Сбой:</strong> ' + msg.error;
+                            b.style.background = 'var(--cb-err-bg)';
+                            b.style.border = '1px solid var(--cb-err-border)';
+                            b.style.color = 'var(--cb-err-text)';
+                            txt.innerHTML = '✖ <strong>' + _('Сбой:') + '</strong> ' + msg.error;
                         }
                     }
                 } catch (e) {}
@@ -349,9 +348,9 @@ return baseclass.extend({
 
         var diagBanner = E('div', {
             'id': 'diag-banner',
-            'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(74, 222, 128, 0.1); border: 1px solid rgba(74, 222, 128, 0.25); color: #4ade80; display: flex; align-items: center; justify-content: space-between;'
+            'style': 'margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: var(--cb-ok-bg); border: 1px solid var(--cb-ok-border); color: var(--cb-ok-text); display: flex; align-items: center; justify-content: space-between;'
         }, [
-            E('div', { 'id': 'diag-banner-content', 'style': 'font-size: 13px; font-weight: 500;' }, '● Проверка диагностических показателей...'),
+            E('div', { 'id': 'diag-banner-content', 'style': 'font-size: 13px; font-weight: 500;' }, '● ' + _('Проверка диагностических показателей...')),
             E('button', {
                 'class': 'btn cbi-button-neutral',
                 'style': 'font-size: 11px; margin: 0; padding: 2px 10px;',
@@ -369,9 +368,9 @@ return baseclass.extend({
 
         var updateBanner = E('div', {
             'id': 'update-notification-banner',
-            'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: rgba(234, 179, 8, 0.15); border: 1px solid rgba(234, 179, 8, 0.4); color: #fef08a;'
+            'style': 'display: none; align-items: center; justify-content: space-between; margin-bottom: 15px; padding: 12px 16px; border-radius: 6px; background: var(--cb-warn-bg); border: 1px solid var(--cb-warn-border); color: var(--cb-warn-text);'
         }, [
-            E('span', { 'id': 'update-banner-text', 'style': 'font-size: 13px; font-weight: 500;' }, ''),
+            E('span', { 'id': 'update-banner-text', 'style': 'font-size: 13px; font-weight: 600;' }, ''),
             E('button', {
                 'class': 'btn cbi-button-action',
                 'style': 'font-size: 12px; margin: 0; padding: 4px 12px;',
@@ -400,46 +399,46 @@ return baseclass.extend({
 
         var activeServerCard = E('div', {
             'id': 'active-server-card',
-            'style': 'margin-bottom: 12px; padding: 12px 16px; border-radius: 6px; background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.3); display: flex; justify-content: space-between; align-items: center; gap: 15px;'
+            'style': 'margin-bottom: 12px; padding: 12px 16px; border-radius: 6px; background: var(--cb-card-active-bg); border: 1px solid var(--cb-card-active-border); display: flex; justify-content: space-between; align-items: center; gap: 15px;'
         }, [
             E('div', { 'style': 'display: flex; flex-direction: column; gap: 4px;' }, [
                 E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
-                    E('span', { 'style': 'font-size: 11px; text-transform: uppercase; font-weight: bold; color: #38bdf8; background: rgba(56, 189, 248, 0.2); padding: 2px 6px; border-radius: 4px;' }, _('АКТИВНЫЙ СЕРВЕР')),
-                    E('span', { 'id': 'active-server-name', 'style': 'font-weight: bold; font-size: 14px; color: #ffffff;' }, _('Определение...'))
+                    E('span', { 'style': 'font-size: 11px; text-transform: uppercase; font-weight: bold; color: var(--cb-text-accent); background: var(--cb-badge-bg); border: 1px solid var(--cb-border); padding: 2px 6px; border-radius: 4px;' }, _('АКТИВНЫЙ СЕРВЕР')),
+                    E('span', { 'id': 'active-server-name', 'style': 'font-weight: bold; font-size: 14px; color: var(--cb-text-main);' }, _('Определение...'))
                 ]),
-                E('span', { 'id': 'active-server-proto', 'style': 'font-size: 12px; color: #a1a1aa;' }, '')
+                E('span', { 'id': 'active-server-proto', 'style': 'font-size: 12px; color: var(--cb-text-muted); font-weight: 500;' }, '')
             ]),
             E('div', { 'style': 'display: flex; align-items: center; gap: 12px;' }, [
-                E('span', { 'id': 'active-server-lat', 'style': 'font-size: 13px; font-weight: bold; color: #fbbf24; font-family: monospace;' }, '--- ms'),
-                E('span', { 'id': 'active-server-badge', 'style': 'font-size: 12px; font-weight: bold; color: #4ade80;' }, '● Онлайн')
+                E('span', { 'id': 'active-server-lat', 'style': 'font-size: 13px; font-weight: bold; color: var(--cb-warn-text); font-family: monospace;' }, '--- ms'),
+                E('span', { 'id': 'active-server-badge', 'style': 'font-size: 12px; font-weight: bold; color: var(--cb-ok-text);' }, '● ' + _('Онлайн'))
             ])
         ]);
 
-        var table = E('table', { 'class': 'table', 'id': 'chebur-nodes-table' }, [
-            E('tr', { 'class': 'tr table-titles' }, [
-                E('th', { 'class': 'th' }, _('Сервер / Тег')),
-                E('th', { 'class': 'th' }, _('Задержка')),
-                E('th', { 'class': 'th' }, _('Статус'))
+        var table = E('table', { 'class': 'table', 'id': 'chebur-nodes-table', 'style': 'width: 100%; border-collapse: collapse;' }, [
+            E('tr', { 'class': 'tr table-titles', 'style': 'background: var(--cb-bg-surface);' }, [
+                E('th', { 'class': 'th', 'style': 'padding: 8px; color: var(--cb-text-muted); border-bottom: 1px solid var(--cb-border);' }, _('Сервер / Тег')),
+                E('th', { 'class': 'th', 'style': 'padding: 8px; color: var(--cb-text-muted); border-bottom: 1px solid var(--cb-border);' }, _('Задержка')),
+                E('th', { 'class': 'th', 'style': 'padding: 8px; color: var(--cb-text-muted); border-bottom: 1px solid var(--cb-border);' }, _('Статус'))
             ]),
             E('tr', { 'class': 'tr', 'id': 'loading-row' }, [
-                E('td', { 'class': 'td', 'colspan': '3' }, _('Загрузка списка серверов...'))
+                E('td', { 'class': 'td', 'colspan': '3', 'style': 'padding: 12px; color: var(--cb-text-muted);' }, _('Загрузка списка серверов...'))
             ])
         ]);
 
         var nodesDetails = E('details', {
-            'class': 'cbi-section',
-            'style': 'margin-bottom: 18px; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 10px; background: rgba(255, 255, 255, 0.02);'
+            'class': 'cbi-section cb-details',
+            'style': 'margin-bottom: 18px;'
         }, [
             E('summary', {
-                'style': 'font-size: 13px; font-weight: bold; cursor: pointer; padding: 6px 8px; user-select: none; color: #94a3b8; display: flex; justify-content: space-between; align-items: center;'
+                'style': 'font-size: 13px; font-weight: bold; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center;'
             }, [
                 E('span', {}, _('Все доступные серверы и переключение')),
-                E('span', { 'style': 'font-size: 11px; font-weight: normal; color: #64748b;' }, _('(нажмите, чтобы развернуть)'))
+                E('span', { 'style': 'font-size: 11px; font-weight: normal; color: var(--cb-text-muted);' }, _('(нажмите, чтобы развернуть)'))
             ]),
-            E('div', { 'style': 'margin-top: 10px;' }, [table])
+            E('div', { 'style': 'margin-top: 10px; overflow-x: auto;' }, [table])
         ]);
 
-        var badgeStyle = 'background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
+        var badgeStyle = 'background: var(--cb-badge-bg); border: 1px solid var(--cb-badge-border); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
 
         var viewContainer = E('div', { 'class': 'cbi-section' }, [
             diagBanner,
@@ -447,16 +446,16 @@ return baseclass.extend({
             updateBanner,
             E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap;' }, [
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: #8c8c8c; font-size: 13px;' }, _('Сервис демона:')),
-                    E('span', { 'id': 'daemon-status', 'style': 'color: #8c8c8c; font-weight: bold; font-size: 13px;' }, '● Проверка...')
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Сервис демона:')),
+                    E('span', { 'id': 'daemon-status', 'style': 'color: var(--cb-text-muted); font-weight: bold; font-size: 13px;' }, '● ' + _('Проверка...'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: #8c8c8c; font-size: 13px;' }, _('Внешний IP:')),
-                    E('span', { 'id': 'outbound-ip', 'style': 'color: #38bdf8; font-weight: bold; font-family: monospace; font-size: 13px;' }, 'Определение...')
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Внешний IP:')),
+                    E('span', { 'id': 'outbound-ip', 'style': 'color: var(--cb-text-accent); font-weight: bold; font-family: monospace; font-size: 13px;' }, _('Определение...'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: #8c8c8c; font-size: 13px;' }, _('Всего серверов:')),
-                    E('span', { 'id': 'total-nodes', 'style': 'color: #fbbf24; font-weight: bold; font-size: 14px;' }, '0')
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Всего серверов:')),
+                    E('span', { 'id': 'total-nodes', 'style': 'color: var(--cb-text-main); font-weight: bold; font-size: 14px;' }, '0')
                 ])
             ]),
             activeServerCard,
@@ -482,29 +481,36 @@ return baseclass.extend({
                         row.className = 'tr';
                         row.id = 'node-row-' + node.tag;
                         row.style.cursor = 'pointer';
+                        row.style.borderBottom = '1px solid var(--cb-border)';
                         row.onclick = function() {
                             nodesModule.selectProxyNode(node.tag, syncClashDelays);
                         };
 
                         var cellTag = row.insertCell(0);
                         cellTag.className = 'td';
+                        cellTag.style.padding = '8px';
                         if (node.tag === 'auto') {
-                            cellTag.innerHTML = '<strong style="color:#38bdf8;">⚡ Автовыбор сервера</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(urltest)</span>';
+                            cellTag.innerHTML = '<strong style="color:var(--cb-text-accent);">⚡ ' + _('Автовыбор сервера') + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(urltest)</span>';
                         } else {
-                            cellTag.innerHTML = '<strong>' + node.tag + '</strong> <span class="node-proto-label" style="color:#71717a; font-size: 0.85em;">(' + node.protocol + ')</span>';
+                            cellTag.innerHTML = '<strong style="color:var(--cb-text-main);">' + node.tag + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(' + node.protocol + ')</span>';
                         }
 
                         var cellLat = row.insertCell(1);
                         cellLat.className = 'td';
                         cellLat.id = 'node-lat-' + node.tag;
-                        cellLat.textContent = node.latency > 0 ? (node.latency + ' ms') : 'Опрос...';
+                        cellLat.style.padding = '8px';
+                        cellLat.style.fontWeight = 'bold';
+                        cellLat.style.fontFamily = 'monospace';
+                        cellLat.style.color = 'var(--cb-text-main)';
+                        cellLat.textContent = node.latency > 0 ? (node.latency + ' ms') : _('Опрос...');
 
                         var cellStatus = row.insertCell(2);
                         cellStatus.className = 'td';
                         cellStatus.id = 'node-status-' + node.tag;
+                        cellStatus.style.padding = '8px';
                         cellStatus.innerHTML = (node.latency > 0)
-                            ? '<span style="color: #4ade80; font-weight: bold;">● Доступен</span>'
-                            : '<span style="color: #fbbf24; font-weight: bold;">● Ожидание</span>';
+                            ? '<span style="color: var(--cb-ok-text); font-weight: bold;">● ' + _('Доступен') + '</span>'
+                            : '<span style="color: var(--cb-warn-text); font-weight: bold;">● ' + _('Ожидание') + '</span>';
                     });
 
                     setTimeout(syncClashDelays, 400);
