@@ -27,7 +27,7 @@ jobs:
             goarm: ""
             gomips: ""
             opkg_arch: aarch64_cortex-a53
-            apk_arch: aarch64
+            apk_arch: aarch64_cortex-a53
             use_upx: true
 
           - arch: arm_cortex-a7
@@ -35,7 +35,7 @@ jobs:
             goarm: "7"
             gomips: ""
             opkg_arch: arm_cortex-a7_neon-vfpv4
-            apk_arch: armhf
+            apk_arch: arm_cortex-a7_neon-vfpv4
             use_upx: true
 
           # MediaTek MT7621, MT7628, ramips/mipsel (Cudy, Keenetic, Xiaomi, TP-Link Archer C6U и др.)
@@ -44,7 +44,7 @@ jobs:
             goarm: ""
             gomips: "softfloat"
             opkg_arch: mipsel_24kc
-            apk_arch: mipsle
+            apk_arch: mipsel_24kc
             use_upx: false
 
           # Qualcomm Atheros / Big-Endian MIPS (AR7xxx/AR9xxx)
@@ -53,7 +53,7 @@ jobs:
             goarm: ""
             gomips: "softfloat"
             opkg_arch: mips_24kc
-            apk_arch: mips
+            apk_arch: mips_24kc
             use_upx: false
 
     steps:
@@ -242,11 +242,8 @@ jobs:
 
           # Валидация и нормализация формата версии для APK
           RAW_VER="${{ steps.vars.outputs.version }}"
-          # 1. Заменяем 4-ю группу чисел (0.0.8.26 -> 0.0.8_p26), чтобы уложиться в лимит 3 групп
           CLEAN_VER=$(echo "$RAW_VER" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/\1.\2.\3_p\4/')
-          # 2. Удаляем дефисы (например, хэши коммитов в dev-версиях 0.0.1-abc -> 0.0.1)
           CLEAN_VER=$(echo "$CLEAN_VER" | sed -E 's/-.*//' | tr -cd '0-9.a-zA-Z_')
-          # 3. Добавляем суффикс ревизии -r1
           CLEAN_VER="${CLEAN_VER}-r1"
 
           echo "[+] Сформирована валидная APK-версия: $CLEAN_VER"
@@ -297,7 +294,7 @@ jobs:
 
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета через бинарник apk
+          # Сборка пакета через нативный статический apk
           apk --root "$APK_ROOT_DIR" mkpkg \
               --info "name:luci-app-cheburnet" \
               --info "version:${CLEAN_VER}" \
@@ -305,7 +302,8 @@ jobs:
               --info "arch:${{ matrix.apk_arch }}" \
               --info "url:https://github.com/${{ github.repository }}" \
               --info "maintainer:Developer <dev@example.com>" \
-              --info "depends:sing-box nftables ip-full ca-bundle" \
+              --info "depends:nftables ip-full ca-bundle" \
+              --info "provides:luci-app-cheburnet" \
               --script "pre-install:$APK_SCRIPTS_DIR/pre-install" \
               --script "post-install:$APK_SCRIPTS_DIR/post-install" \
               --files "$APK_DATA_DIR" \
