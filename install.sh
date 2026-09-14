@@ -148,7 +148,7 @@ install_sb_binary_tar() {
     rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
     cd "$WORK_DIR" || fail "Не удалось перейти в $WORK_DIR"
 
-    printf "${C}[*] Скачивание архива sing-box...${N}\n"
+    printf "${C}[*] Скачивание архива: %s...${N}\n" "$(basename "$_url")"
     $DOWNLOAD "sb_dist.tar.gz" "$_url" || fail "Сбой при скачивании sing-box."
 
     printf "${C}[*] Распаковка...${N}\n"
@@ -182,20 +182,32 @@ CHOICE_SB="${READ_VALUE:-1}"
 case "$CHOICE_SB" in
     1)
         TARGET_TAG="v1.14.0-extended-2.7.1"
+        DO_INSTALL="1"
         if [ "$CURRENT_SB_VER" = "1.14.0-extended-2.7.1" ]; then
             printf "${Y}[i] sing-box %s уже установлен. Переустановить принудительно? [y/N]: ${N}" "$TARGET_TAG"
             read_input 15
             case "$READ_VALUE" in
-                y|Y|д|Д) 
-                    SB_FILE="sing-box-extended-1.14.0-extended-2.7.1-linux-${ARCH_SUFFIX}-compressed.tar.gz"
-                    DOWNLOAD_URL="https://github.com/shtorm-7/sing-box-extended/releases/download/${TARGET_TAG}/${SB_FILE}"
-                    install_sb_binary_tar "$DOWNLOAD_URL"
-                    ;;
-                *) printf "${G}[✓] Пропуск обновления sing-box.${N}\n" ;;
+                y|Y|д|Д) DO_INSTALL="1" ;;
+                *) DO_INSTALL="0"; printf "${G}[✓] Пропуск обновления sing-box.${N}\n" ;;
             esac
-        else
-            SB_FILE="sing-box-extended-1.14.0-extended-2.7.1-linux-${ARCH_SUFFIX}-compressed.tar.gz"
-            DOWNLOAD_URL="https://github.com/shtorm-7/sing-box-extended/releases/download/${TARGET_TAG}/${SB_FILE}"
+        fi
+
+        if [ "$DO_INSTALL" = "1" ]; then
+            printf "${C}[*] Поиск ссылки для %s (%s)...${N}\n" "$TARGET_TAG" "$ARCH_SUFFIX"
+            REL_JSON=$(api_get "https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/${TARGET_TAG}" 2>/dev/null || true)
+            if [ -z "$REL_JSON" ] || ! echo "$REL_JSON" | grep -q "browser_download_url"; then
+                TARGET_TAG="1.14.0-extended-2.7.1"
+                REL_JSON=$(api_get "https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/${TARGET_TAG}" 2>/dev/null || true)
+            fi
+
+            # Ищем сначала сжатый, затем обычный архив tar.gz
+            SHORT_ARCH="${ARCH_SUFFIX%%-*}"
+            DOWNLOAD_URL=$(echo "$REL_JSON" | tr ',' '\n' | grep -E "browser_download_url.*linux-(${ARCH_SUFFIX}|${SHORT_ARCH}).*compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+            if [ -z "$DOWNLOAD_URL" ]; then
+                DOWNLOAD_URL=$(echo "$REL_JSON" | tr ',' '\n' | grep -E "browser_download_url.*linux-(${ARCH_SUFFIX}|${SHORT_ARCH}).*\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+            fi
+
+            [ -z "$DOWNLOAD_URL" ] && fail "Не удалось найти подходящий архив для $ARCH_SUFFIX в релизе $TARGET_TAG."
             install_sb_binary_tar "$DOWNLOAD_URL"
         fi
         ;;
@@ -234,9 +246,10 @@ case "$CHOICE_SB" in
             in_rel && /browser_download_url/ { print }
         ')
 
-        URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep "linux-$ARCH_SUFFIX-compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+        SHORT_ARCH="${ARCH_SUFFIX%%-*}"
+        URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep -E "linux-(${ARCH_SUFFIX}|${SHORT_ARCH})-compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
         if [ -z "$URL_TO_FETCH" ]; then
-            URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep "linux-$ARCH_SUFFIX\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+            URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep -E "linux-(${ARCH_SUFFIX}|${SHORT_ARCH})\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
         fi
         [ -z "$URL_TO_FETCH" ] && fail "Архив для архитектуры $ARCH_SUFFIX не найден в $SELECTED_TAG."
 
@@ -294,7 +307,6 @@ fi
 if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     stop_cheburnet_service
 
-    # Сохраняем текущий конфиг во временный файл, если он уже есть
     if [ -f "/etc/config/cheburnet" ]; then
         cp -f "/etc/config/cheburnet" "/tmp/cheburnet_config_backup"
     fi
@@ -326,7 +338,6 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
         rm -f /tmp/cheburnet.ipk
     fi
 
-    # Восстанавливаем сохраненный конфиг пользователя
     if [ -f "/tmp/cheburnet_config_backup" ]; then
         mv -f "/tmp/cheburnet_config_backup" "/etc/config/cheburnet"
     fi
@@ -336,7 +347,6 @@ fi
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
 
-# Сброс индекса и кэша меню LuCI для мгновенного отображения изменений
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/
 
 /etc/init.d/cheburnet enable >/dev/null 2>&1 || true
