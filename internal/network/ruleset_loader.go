@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	RulesStorageDir = "/etc/cheburnet/rules"
+	RulesStorageDir = "tmp/cheburnet/rulesets"
 	TempDownloadDir = "/tmp"
 	DownloadTimeout = 30 * time.Second
 )
@@ -36,16 +36,16 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 
 // GetSubnets читает локальный .gz кэш или скачивает его при первом запуске
 func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, error) {
-	normName := strings.ToLower(strings.TrimSpace(rulesetName))
+	normName := l.normalizeName(rulesetName)
 	if normName == "" {
 		return nil, nil
 	}
 
-	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", normName))
+	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.txt.gz", normName))
 
-	if _, err := os.Stat(targetGz); os.IsNotExist(err) {
+	// Если файла нет или он пустой (артефакт старого бага) — скачиваем
+	if stat, err := os.Stat(targetGz); os.IsNotExist(err) || (err == nil && stat.Size() <= 30) {
 		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
-			// 404 означает отсутствие IP-подсетей для данной категории
 			return nil, nil
 		}
 	}
@@ -53,43 +53,64 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 	return l.readCIDRsFromGz(targetGz)
 }
 
-// UpdateRuleset принудительно обновляет и упаковывает .lst.gz
+// UpdateRuleset принудительно обновляет и упаковывает .txt.gz
 func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
-	normName := strings.ToLower(strings.TrimSpace(rulesetName))
+	normName := l.normalizeName(rulesetName)
 	if normName == "" {
 		return nil
 	}
-	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.lst.gz", normName))
+	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.txt.gz", normName))
 	return l.downloadAndCompressAtomic(normName, targetGz)
 }
 
-// downloadAndCompressAtomic запрашивает файл подсетей (в репозитории имена в UPPERCASE: DISCORD.lst)
-func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
-	fileName := strings.ToUpper(rulesetName) + ".lst"
-	url := fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s", fileName)
-	tmpGz := filepath.Join(TempDownloadDir, fmt.Sprintf("%s.lst.gz.tmp", rulesetName))
-	defer os.Remove(tmpGz)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
+func (l *CompressedRulesetLoader) normalizeName(name string) string {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	switch clean {
+	case "google-ai", "google_ai":
+		return "google_ai"
+	case "russia-inside", "russia_inside":
+		return "russia_inside"
+	default:
+		return clean
 	}
-	req.Header.Set("User-Agent", "CheburNET-Daemon")
+}
 
-	resp, err := l.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("http get: %w", err)
+// downloadAndCompressAtomic пробует скачать .txt файл из репозитория
+func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
+	// В репозитории itdoginfo/allow-domains/Subnets/IPv4 файлы лежат в формате: telegram.txt, discord.txt
+	candidates := []string{
+		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.txt", rulesetName),
+		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.lst", rulesetName),
+		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.txt", strings.ToUpper(rulesetName)),
+	}
+
+	var resp *http.Response
+	var err error
+
+	for _, url := range candidates {
+		req, reqErr := http.NewRequest("GET", url, nil)
+		if reqErr != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "CheburNET-Daemon")
+
+		r, doErr := l.client.Do(req)
+		if doErr == nil && r.StatusCode == http.StatusOK {
+			resp = r
+			break
+		}
+		if r != nil {
+			_ = r.Body.Close()
+		}
+	}
+
+	if resp == nil {
+		return fmt.Errorf("subnets for ruleset '%s' not found on github", rulesetName)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		_ = l.createEmptyGz(targetGz)
-		return fmt.Errorf("subnets not found (404)")
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
-	}
+	tmpGz := filepath.Join(TempDownloadDir, fmt.Sprintf("%s.txt.gz.tmp", rulesetName))
+	defer os.Remove(tmpGz)
 
 	outFile, err := os.OpenFile(tmpGz, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
@@ -114,18 +135,6 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	}
 
 	return l.safeCopyToFlash(tmpGz, targetGz)
-}
-
-func (l *CompressedRulesetLoader) createEmptyGz(targetPath string) error {
-	f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	gw := gzip.NewWriter(f)
-	defer gw.Close()
-	return nil
 }
 
 func (l *CompressedRulesetLoader) validateGzFile(filePath string) error {

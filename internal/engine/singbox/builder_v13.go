@@ -16,12 +16,14 @@ import (
 )
 
 type BuilderV13 struct {
-	rulesLoader *network.CompressedRulesetLoader
+	rulesLoader    *network.CompressedRulesetLoader
+	rulesetManager *ruleset.Manager
 }
 
 func NewBuilderV13() *BuilderV13 {
 	return &BuilderV13{
-		rulesLoader: network.NewCompressedRulesetLoader(),
+		rulesLoader:    network.NewCompressedRulesetLoader(),
+		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
 }
 
@@ -191,7 +193,6 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// Спецификация серверов DNS (Sing-Box 1.12 - 1.14+)
 	remoteServerEntry := map[string]interface{}{
 		"tag":         "remote-dns",
 		"type":        remoteDNSType,
@@ -434,15 +435,24 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 
 				totalPolicySubnets := append([]string(nil), rp.Subnets...)
 				var policyRuleSets []string
+				hasPolicyTelegram := false
+
 				for _, rs := range rp.RuleSets {
 					cleanRS := strings.ToLower(strings.TrimSpace(rs))
 					if cleanRS == "" {
 						continue
 					}
 					policyRuleSets = append(policyRuleSets, cleanRS)
+					if cleanRS == "telegram" {
+						hasPolicyTelegram = true
+					}
 					if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 						totalPolicySubnets = append(totalPolicySubnets, subnets...)
 					}
+				}
+
+				if hasPolicyTelegram {
+					totalPolicySubnets = append(totalPolicySubnets, getTelegramSubnets()...)
 				}
 
 				if len(totalPolicySubnets) > 0 {
@@ -476,6 +486,7 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			var defaultRuleSets []string
 			hasDiscord := false
+			hasTelegram := false
 
 			for _, rs := range cfg.RuleSets {
 				cleanRS := strings.ToLower(strings.TrimSpace(rs))
@@ -486,10 +497,17 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 				if cleanRS == "discord" {
 					hasDiscord = true
 				}
+				if cleanRS == "telegram" {
+					hasTelegram = true
+				}
 				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
 				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
+			}
+
+			if hasTelegram {
+				totalSubnets = append(totalSubnets, getTelegramSubnets()...)
 			}
 
 			if len(totalSubnets) > 0 {
@@ -565,19 +583,29 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// 8. Remote и Local RuleSets
+	// 8. Локальные RuleSets (предзагрузка выбранных категорий в /tmp)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
-			srsName := mapToSRSName(rs)
-			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
-				"type":            "remote",
-				"tag":             rs,
-				"format":          "binary",
-				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
-				"download_detour": "direct-out",
-				"update_interval": "1d",
-			})
+			localPath, err := b.rulesetManager.FetchSystemRuleSet(rs)
+			if err == nil && localPath != "" {
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":   "local",
+					"tag":    rs,
+					"format": "binary",
+					"path":   localPath,
+				})
+			} else {
+				srsName := ruleset.MapToSRSName(rs)
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":            "remote",
+					"tag":             rs,
+					"format":          "binary",
+					"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
+					"download_detour": "direct-out",
+					"update_interval": "1d",
+				})
+			}
 		}
 
 		for _, srs := range customSRSObjects {
@@ -614,6 +642,21 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	return os.WriteFile(outputPath, data, 0644)
+}
+
+func getTelegramSubnets() []string {
+	return []string{
+		"91.108.4.0/22",
+		"91.108.8.0/22",
+		"91.108.12.0/22",
+		"91.108.16.0/22",
+		"91.108.20.0/22",
+		"91.108.56.0/22",
+		"149.154.160.0/20",
+		"149.154.164.0/22",
+		"149.154.168.0/22",
+		"149.154.172.0/22",
+	}
 }
 
 func (b *BuilderV13) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
@@ -663,6 +706,20 @@ func (b *BuilderV13) buildNodeOutbound(node *config.GenericNode) (map[string]int
 				"type":         "grpc",
 				"service_name": node.Path,
 			}
+		} else if node.Network == "xhttp" || node.Network == "splithttp" {
+			path := node.Path
+			if path == "" {
+				path = "/"
+			}
+			xhttpMap := map[string]interface{}{
+				"type": "xhttp",
+				"path": path,
+				"mode": "auto",
+			}
+			if node.Host != "" {
+				xhttpMap["host"] = node.Host
+			}
+			out["transport"] = xhttpMap
 		}
 
 	case "hysteria2":

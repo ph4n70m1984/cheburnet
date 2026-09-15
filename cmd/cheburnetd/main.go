@@ -362,6 +362,12 @@ func runDaemon() {
 	_ = os.WriteFile(PIDFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 	defer os.Remove(PIDFile)
 
+	// 1. Детекция и гарантированное отключение IPv6
+	ipv6Mgr := network.NewIPv6Manager()
+	if err := ipv6Mgr.EnsureIPv6Disabled(); err != nil {
+		log.Printf("[WARN] Failed to configure IPv6 state: %v", err)
+	}
+
 	uciStorage := config.NewUCIStorage()
 	initialConfig, err := uciStorage.Load()
 	if err != nil {
@@ -435,13 +441,26 @@ func runDaemon() {
 
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
 
-	// Инициализация менеджера кастомных бинарных SRS правил
+	// Инициализация менеджера SRS правил
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
-	// Синхронизируем SRS файлы ДО построения и валидации конфига sing-box
+	// 2. Синхронизируем кастомные SRS
 	if len(initialConfig.CustomSRSRulesets) > 0 {
 		log.Printf("[INFO] Syncing %d custom SRS rulesets...", len(initialConfig.CustomSRSRulesets))
 		rulesMgr.SyncAll(initialConfig.CustomSRSRulesets)
+	}
+
+	// 3. Предзагрузка системных SRS в /tmp/cheburnet/rulesets до запуска sing-box
+	if len(allRuleSets) > 0 {
+		log.Printf("[INFO] Pre-caching %d system SRS files to /tmp/cheburnet/rulesets...", len(allRuleSets))
+		for _, rs := range allRuleSets {
+			path, srsErr := rulesMgr.FetchSystemRuleSet(rs)
+			if srsErr != nil {
+				log.Printf("[WARN] Pre-cache failed for %s: %v", rs, srsErr)
+			} else {
+				log.Printf("[INFO] Pre-cached SRS ready: %s -> %s", rs, path)
+			}
+		}
 	}
 
 	app := &App{
@@ -617,6 +636,13 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	targetPath := RuntimeConfigPathSingBox
 	allRuleSets := collectAllRuleSets(&cfg)
+
+	// Предзагрузка системных SRS перед перезагрузкой ядра
+	if a.rulesMgr != nil && len(allRuleSets) > 0 {
+		for _, rs := range allRuleSets {
+			_, _ = a.rulesMgr.FetchSystemRuleSet(rs)
+		}
+	}
 
 	if a.rulesCron != nil {
 		a.rulesCron.UpdateRulesets(allRuleSets)

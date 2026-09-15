@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"cheburnet/internal/config"
@@ -14,12 +16,14 @@ import (
 )
 
 type BuilderV14 struct {
-	rulesLoader *network.CompressedRulesetLoader
+	rulesLoader    *network.CompressedRulesetLoader
+	rulesetManager *ruleset.Manager
 }
 
 func NewBuilderV14() *BuilderV14 {
 	return &BuilderV14{
-		rulesLoader: network.NewCompressedRulesetLoader(),
+		rulesLoader:    network.NewCompressedRulesetLoader(),
+		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
 }
 
@@ -27,36 +31,81 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	routerIP := getRouterLANIP()
 	clashController := fmt.Sprintf("%s:9090", routerIP)
 
-	remoteDNSType := "udp"
-	remoteDNSServer := cfg.DNSServer
-	if remoteDNSServer == "" {
-		remoteDNSServer = "8.8.8.8"
-	}
-	remoteDNSPort := 53
-
-	switch cfg.DNSProtocol {
-	case "doh", "https":
-		remoteDNSType = "https"
-		if !strings.HasPrefix(remoteDNSServer, "https://") {
-			remoteDNSServer = fmt.Sprintf("https://%s/dns-query", remoteDNSServer)
-		}
-		remoteDNSPort = 443
-	case "dot", "tls":
-		remoteDNSType = "tls"
-		remoteDNSPort = 853
-	default:
-		remoteDNSType = "udp"
-		remoteDNSPort = 53
-	}
-
 	bootstrapServer := cfg.BootstrapDNS
 	if bootstrapServer == "" {
 		bootstrapServer = "77.88.8.8"
 	}
 
+	// 1. Формирование параметров DNS серверов для Sing-Box 1.12 - 1.14+
+	var remoteDNSType string
+	var remoteDNSServer string
+	var remoteDNSPort uint16 = 53
+	var remoteServerName string
+
+	remoteRaw := cfg.DNSServer
+	if remoteRaw == "" {
+		remoteRaw = "8.8.8.8"
+	}
+
+	switch cfg.DNSProtocol {
+	case "doh", "https":
+		remoteDNSType = "https"
+		clean := strings.TrimPrefix(remoteRaw, "https://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
+		} else {
+			remoteDNSServer = clean
+			remoteDNSPort = 443
+		}
+		remoteServerName = remoteDNSServer
+
+	case "dot", "tls":
+		remoteDNSType = "tls"
+		clean := strings.TrimPrefix(remoteRaw, "tls://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
+		} else {
+			remoteDNSServer = clean
+			remoteDNSPort = 853
+		}
+		remoteServerName = remoteDNSServer
+
+	case "tcp":
+		remoteDNSType = "tcp"
+		clean := strings.TrimPrefix(remoteRaw, "tcp://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
+		} else {
+			remoteDNSServer = clean
+			remoteDNSPort = 53
+		}
+
+	default:
+		remoteDNSType = "udp"
+		clean := strings.TrimPrefix(remoteRaw, "udp://")
+		hostPart, portPart, err := net.SplitHostPort(clean)
+		if err == nil {
+			remoteDNSServer = hostPart
+			p, _ := strconv.Atoi(portPart)
+			remoteDNSPort = uint16(p)
+		} else {
+			remoteDNSServer = clean
+			remoteDNSPort = 53
+		}
+	}
+
 	isGlobal := cfg.RoutingMode == "global"
 
-	// 1. Аутбаунды (ноды, urltest auto и селекторы)
+	// 2. Аутбаунды (ноды, urltest auto и селекторы)
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -140,7 +189,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		activeOutboundTag = selectorTag
 	}
 
-	// 2. Определение валидных локальных SRS файлов
+	// 3. Локальные пользовательские SRS
 	type localSRS struct {
 		tag  string
 		path string
@@ -155,7 +204,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(srs.URL)))[:12]
 		filePath := filepath.Join(ruleset.RulesetDir, fmt.Sprintf("srs_%s.srs", hash))
 
-		// Подключаем только реально существующий проверенный файл
 		if _, err := os.Stat(filePath); err == nil {
 			tag := fmt.Sprintf("custom-srs-%d", idx+1)
 			customSRSObjects = append(customSRSObjects, localSRS{tag: tag, path: filePath})
@@ -163,7 +211,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 3. DNS-конфигурация v1.14
+	// 4. DNS-конфигурация v1.14
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -203,7 +251,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
-			"action": "route",
 			"server": "fakeip-dns",
 		})
 	} else {
@@ -217,18 +264,31 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 		if len(fakeipDomains) > 0 {
 			dnsRules = append(dnsRules, map[string]interface{}{
-				"action":        "route",
 				"server":        "fakeip-dns",
 				"domain_suffix": fakeipDomains,
 			})
 		}
 		if len(dnsRuleSetList) > 0 {
 			dnsRules = append(dnsRules, map[string]interface{}{
-				"action":   "route",
 				"server":   "fakeip-dns",
 				"rule_set": dnsRuleSetList,
 			})
 		}
+	}
+
+	remoteServerEntry := map[string]interface{}{
+		"tag":         "remote-dns",
+		"type":        remoteDNSType,
+		"server":      remoteDNSServer,
+		"server_port": remoteDNSPort,
+	}
+
+	if net.ParseIP(remoteDNSServer) == nil {
+		remoteServerEntry["domain_resolver"] = "bootstrap-dns"
+	}
+
+	if remoteServerName != "" {
+		remoteServerEntry["server_name"] = remoteServerName
 	}
 
 	dnsServers := []map[string]interface{}{
@@ -243,23 +303,18 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"type":        "fakeip",
 			"inet4_range": "198.18.0.0/15",
 		},
-		{
-			"tag":         "remote-dns",
-			"type":        remoteDNSType,
-			"server":      remoteDNSServer,
-			"server_port": remoteDNSPort,
-			"detour":      activeOutboundTag,
-		},
+		remoteServerEntry,
 	}
 
 	dnsConfig := map[string]interface{}{
-		"servers":  dnsServers,
-		"rules":    dnsRules,
-		"final":    "remote-dns",
-		"strategy": "ipv4_only",
+		"servers":           dnsServers,
+		"rules":             dnsRules,
+		"final":             "remote-dns",
+		"strategy":          "ipv4_only",
+		"independent_cache": true,
 	}
 
-	// 4. Inbounds
+	// 5. Inbounds
 	tproxyPort := cfg.TProxyPort
 	if tproxyPort == 0 {
 		tproxyPort = 1602
@@ -269,7 +324,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		{
 			"type":          "tproxy",
 			"tag":           "tproxy-in",
-			"listen":        "0.0.0.0",
+			"listen":        "::",
 			"listen_port":   tproxyPort,
 			"tcp_fast_open": true,
 			"udp_fragment":  true,
@@ -288,7 +343,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// 5. Правила маршрутизации
+	// 6. Правила маршрутизации
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",
@@ -357,15 +412,24 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 				totalPolicySubnets := append([]string(nil), rp.Subnets...)
 				var policyRuleSets []string
+				hasPolicyTelegram := false
+
 				for _, rs := range rp.RuleSets {
 					cleanRS := strings.ToLower(strings.TrimSpace(rs))
 					if cleanRS == "" {
 						continue
 					}
 					policyRuleSets = append(policyRuleSets, cleanRS)
+					if cleanRS == "telegram" {
+						hasPolicyTelegram = true
+					}
 					if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 						totalPolicySubnets = append(totalPolicySubnets, subnets...)
 					}
+				}
+
+				if hasPolicyTelegram {
+					totalPolicySubnets = append(totalPolicySubnets, getTelegramSubnets()...)
 				}
 
 				if len(totalPolicySubnets) > 0 {
@@ -399,6 +463,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			var defaultRuleSets []string
 			hasDiscord := false
+			hasTelegram := false
 
 			for _, rs := range cfg.RuleSets {
 				cleanRS := strings.ToLower(strings.TrimSpace(rs))
@@ -409,9 +474,16 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				if cleanRS == "discord" {
 					hasDiscord = true
 				}
+				if cleanRS == "telegram" {
+					hasTelegram = true
+				}
 				if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
+			}
+
+			if hasTelegram {
+				totalSubnets = append(totalSubnets, getTelegramSubnets()...)
 			}
 
 			if len(totalSubnets) > 0 {
@@ -461,7 +533,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Маршрутизация стандартных списков правил в PROXY
 			if len(defaultRuleSets) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
@@ -471,7 +542,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Маршрутизация проверенных пользовательских SRS в PROXY
 			if len(customSRSTags) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
@@ -489,23 +559,31 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// 6. Формирование объектов rule_set
+	// 7. Формирование объектов rule_set (только локальные файлы)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
-		// Системные удаленные правила
 		for _, rs := range allRuleSets {
-			srsName := mapToSRSName(rs)
-			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
-				"type":            "remote",
-				"tag":             rs,
-				"format":          "binary",
-				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
-				"download_detour": "direct-out",
-				"update_interval": "1d",
-			})
+			localPath, err := b.rulesetManager.FetchSystemRuleSet(rs)
+			if err == nil && localPath != "" {
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":   "local",
+					"tag":    rs,
+					"format": "binary",
+					"path":   localPath,
+				})
+			} else {
+				srsName := ruleset.MapToSRSName(rs)
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":            "remote",
+					"tag":             rs,
+					"format":          "binary",
+					"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
+					"download_detour": "direct-out",
+					"update_interval": "1d",
+				})
+			}
 		}
 
-		// Пользовательские бинарные локальные правила
 		for _, srs := range customSRSObjects {
 			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
 				"type":   "local",
@@ -618,6 +696,20 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode) (map[string]int
 				"type":         "grpc",
 				"service_name": node.Path,
 			}
+		} else if node.Network == "xhttp" || node.Network == "splithttp" {
+			path := node.Path
+			if path == "" {
+				path = "/"
+			}
+			xhttpMap := map[string]interface{}{
+				"type": "xhttp",
+				"path": path,
+				"mode": "auto",
+			}
+			if node.Host != "" {
+				xhttpMap["host"] = node.Host
+			}
+			out["transport"] = xhttpMap
 		}
 
 	case "hysteria2":

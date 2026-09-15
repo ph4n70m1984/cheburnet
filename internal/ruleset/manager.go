@@ -46,6 +46,38 @@ func NewManager(diag DiagnosticReporter, socksPort int) *Manager {
 	}
 }
 
+// MapToSRSName нормализует системные теги к именам файлов релиза itdoginfo
+func MapToSRSName(name string) string {
+	clean := strings.ToLower(strings.TrimSpace(name))
+	switch clean {
+	case "google-ai", "google_ai":
+		return "google_ai"
+	case "russia-inside", "russia_inside":
+		return "russia_inside"
+	default:
+		return clean
+	}
+}
+
+// FetchSystemRuleSet скачивает выбранные системные категории (telegram, meta и др.) в /tmp/cheburnet/rulesets
+func (m *Manager) FetchSystemRuleSet(ruleSetName string) (string, error) {
+	srsName := MapToSRSName(ruleSetName)
+	if srsName == "" {
+		return "", fmt.Errorf("empty ruleset name")
+	}
+
+	fileName := fmt.Sprintf("%s.srs", srsName)
+	targetPath := filepath.Join(RulesetDir, fileName)
+
+	// Если файл уже скачан и не пустой — отдаем локальный путь без повторного скачивания
+	if stat, err := os.Stat(targetPath); err == nil && stat.Size() > 0 {
+		return targetPath, nil
+	}
+
+	rawURL := fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName)
+	return m.FetchRuleSet(srsName, rawURL, "direct")
+}
+
 func (m *Manager) SyncAll(rules []config.CustomSRSRule) map[string]string {
 	resolvedPaths := make(map[string]string)
 
@@ -84,7 +116,7 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 		displayName = rawURL
 	}
 
-	client := &http.Client{Timeout: 90 * time.Second} // 7 МБ может качаться дольше 35 сек
+	client := &http.Client{Timeout: 90 * time.Second}
 
 	if detour == "proxy" {
 		proxyURL, err := url.Parse(m.socksProxy)
@@ -152,7 +184,6 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 	if err != nil {
 		_ = os.Remove(tempPath)
 
-		// Попытка отката на резервную копию (Rollback)
 		if _, bErr := os.Stat(backupPath); bErr == nil {
 			_ = copyFile(backupPath, targetPath)
 
@@ -169,7 +200,6 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 			return targetPath, nil
 		}
 
-		// Если бэкапа нет — регистрируем ошибку
 		if m.diag != nil {
 			m.diag.ReportProblem(
 				problemID,
@@ -183,7 +213,6 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 		return "", err
 	}
 
-	// Успешная загрузка
 	if m.diag != nil {
 		m.diag.ResolveProblem(problemID)
 	}
