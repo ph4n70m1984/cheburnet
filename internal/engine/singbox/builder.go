@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"cheburnet/internal/config"
 	"cheburnet/internal/network"
@@ -19,12 +17,14 @@ import (
 )
 
 type Builder struct {
-	rulesLoader *network.CompressedRulesetLoader
+	rulesLoader    *network.CompressedRulesetLoader
+	rulesetManager *ruleset.Manager
 }
 
 func NewBuilder() *Builder {
 	return &Builder{
-		rulesLoader: network.NewCompressedRulesetLoader(),
+		rulesLoader:    network.NewCompressedRulesetLoader(),
+		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
 }
 
@@ -484,15 +484,24 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 				totalPolicySubnets := append([]string(nil), rp.Subnets...)
 				var policyRuleSets []string
+				hasPolicyTelegram := false
+
 				for _, rs := range rp.RuleSets {
 					cleanRS := strings.ToLower(strings.TrimSpace(rs))
 					if cleanRS == "" {
 						continue
 					}
 					policyRuleSets = append(policyRuleSets, cleanRS)
+					if cleanRS == "telegram" {
+						hasPolicyTelegram = true
+					}
 					if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
 						totalPolicySubnets = append(totalPolicySubnets, subnets...)
 					}
+				}
+
+				if hasPolicyTelegram {
+					totalPolicySubnets = append(totalPolicySubnets, getTelegramSubnets()...)
 				}
 
 				if len(totalPolicySubnets) > 0 {
@@ -526,6 +535,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
 			var defaultRuleSets []string
 			hasDiscord := false
+			hasTelegram := false
 
 			for _, rs := range cfg.RuleSets {
 				cleanRS := strings.ToLower(strings.TrimSpace(rs))
@@ -536,10 +546,17 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				if cleanRS == "discord" {
 					hasDiscord = true
 				}
+				if cleanRS == "telegram" {
+					hasTelegram = true
+				}
 				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
 				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
+			}
+
+			if hasTelegram {
+				totalSubnets = append(totalSubnets, getTelegramSubnets()...)
 			}
 
 			if len(totalSubnets) > 0 {
@@ -617,19 +634,29 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// Формирование объектов rule_set (системные + локальные пользовательские)
+	// 8. Локальные RuleSets (предзагрузка выбранных категорий в /tmp)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
-			srsName := mapToSRSName(rs)
-			ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
-				"type":            "remote",
-				"tag":             rs,
-				"format":          "binary",
-				"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
-				"download_detour": "direct-out",
-				"update_interval": "1d",
-			})
+			localPath, err := b.rulesetManager.FetchSystemRuleSet(rs)
+			if err == nil && localPath != "" {
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":   "local",
+					"tag":    rs,
+					"format": "binary",
+					"path":   localPath,
+				})
+			} else {
+				srsName := mapToSRSName(rs)
+				ruleSetObjects = append(ruleSetObjects, map[string]interface{}{
+					"type":            "remote",
+					"tag":             rs,
+					"format":          "binary",
+					"url":             fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName),
+					"download_detour": "direct-out",
+					"update_interval": "1d",
+				})
+			}
 		}
 
 		for _, srs := range customSRSObjects {
@@ -665,7 +692,12 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		return err
 	}
 
-	return os.WriteFile(outputPath, data, 0644)
+	// Атомарная запись
+	tmpPath := outputPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, outputPath)
 }
 
 func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
@@ -715,6 +747,20 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 				"type":         "grpc",
 				"service_name": node.Path,
 			}
+		} else if node.Network == "xhttp" || node.Network == "splithttp" {
+			path := node.Path
+			if path == "" {
+				path = "/"
+			}
+			xhttpMap := map[string]interface{}{
+				"type": "xhttp",
+				"path": path,
+				"mode": "auto",
+			}
+			if node.Host != "" {
+				xhttpMap["host"] = node.Host
+			}
+			out["transport"] = xhttpMap
 		}
 
 	case "hysteria2":
@@ -762,50 +808,4 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 	}
 
 	return out, nil
-}
-
-func getRealActiveNode(defaultTag string) string {
-	client := &http.Client{Timeout: 600 * time.Millisecond}
-	urls := []string{
-		"http://127.0.0.1:9090/proxies",
-		"http://192.168.11.1:9090/proxies",
-	}
-
-	var resp *http.Response
-	var err error
-	for _, u := range urls {
-		resp, err = client.Get(u)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			break
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}
-	if resp == nil || err != nil {
-		return defaultTag
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Proxies map[string]struct {
-			Type string `json:"type"`
-			Now  string `json:"now"`
-		} `json:"proxies"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return defaultTag
-	}
-
-	for _, name := range []string{"auto", "auto-out", "PROXY", "proxy"} {
-		if group, ok := result.Proxies[name]; ok && group.Now != "" {
-			if subGroup, exists := result.Proxies[group.Now]; exists && subGroup.Now != "" {
-				return subGroup.Now
-			}
-			return group.Now
-		}
-	}
-
-	return defaultTag
 }

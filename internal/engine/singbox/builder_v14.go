@@ -103,9 +103,188 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
+	// 2. Обработка локальных пользовательских SRS
+	type localSRS struct {
+		tag  string
+		path string
+	}
+	var customSRSObjects []localSRS
+	var customSRSTags []string
+
+	for idx, srs := range cfg.CustomSRSRulesets {
+		if !srs.Enabled || strings.TrimSpace(srs.URL) == "" {
+			continue
+		}
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(srs.URL)))[:12]
+		filePath := filepath.Join(ruleset.RulesetDir, fmt.Sprintf("srs_%s.srs", hash))
+
+		if _, err := os.Stat(filePath); err == nil {
+			tag := fmt.Sprintf("custom-srs-%d", idx+1)
+			customSRSObjects = append(customSRSObjects, localSRS{tag: tag, path: filePath})
+			customSRSTags = append(customSRSTags, tag)
+		}
+	}
+
+	// 3. Списки сервисов и маршрутизация
 	isGlobal := cfg.RoutingMode == "global"
 
-	// 2. Аутбаунды (ноды, urltest auto и селекторы)
+	activeRuleSetsMap := make(map[string]bool)
+	for _, rs := range cfg.RuleSets {
+		norm := strings.ToLower(strings.TrimSpace(rs))
+		if norm != "" {
+			activeRuleSetsMap[norm] = true
+		}
+	}
+	for _, rp := range cfg.RoutePolicies {
+		if rp.Enabled {
+			for _, rs := range rp.RuleSets {
+				norm := strings.ToLower(strings.TrimSpace(rs))
+				if norm != "" {
+					activeRuleSetsMap[norm] = true
+				}
+			}
+		}
+	}
+
+	var allRuleSets []string
+	for rs := range activeRuleSetsMap {
+		allRuleSets = append(allRuleSets, rs)
+	}
+
+	dnsRuleSetList := append([]string(nil), allRuleSets...)
+	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
+
+	// 4. Правила DNS
+	dnsRules := []map[string]interface{}{
+		{
+			"action":     "reject",
+			"query_type": []string{"HTTPS"},
+		},
+		{
+			"action":        "reject",
+			"domain_suffix": []string{"use-application-dns.net"},
+		},
+	}
+
+	if isGlobal {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"server": "fakeip-dns",
+		})
+	} else {
+		var fakeipDomains []string
+		fakeipDomains = append(fakeipDomains, cfg.CustomDomains...)
+		for _, rp := range cfg.RoutePolicies {
+			if rp.Enabled && len(rp.Domains) > 0 {
+				fakeipDomains = append(fakeipDomains, rp.Domains...)
+			}
+		}
+
+		if len(fakeipDomains) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"server":        "fakeip-dns",
+				"domain_suffix": fakeipDomains,
+			})
+		}
+		if len(dnsRuleSetList) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"server":   "fakeip-dns",
+				"rule_set": dnsRuleSetList,
+			})
+		}
+	}
+
+	remoteServerEntry := map[string]interface{}{
+		"tag":         "remote-dns",
+		"type":        remoteDNSType,
+		"server":      remoteDNSServer,
+		"server_port": remoteDNSPort,
+	}
+
+	if net.ParseIP(remoteDNSServer) == nil {
+		remoteServerEntry["domain_resolver"] = "bootstrap-dns"
+	}
+
+	if remoteServerName != "" {
+		remoteServerEntry["server_name"] = remoteServerName
+	}
+
+	dnsConfig := map[string]interface{}{
+		"servers": []map[string]interface{}{
+			{
+				"tag":         "bootstrap-dns",
+				"type":        "udp",
+				"server":      bootstrapServer,
+				"server_port": 53,
+			},
+			{
+				"tag":         "fakeip-dns",
+				"type":        "fakeip",
+				"inet4_range": "198.18.0.0/15",
+			},
+			remoteServerEntry,
+		},
+		"rules":             dnsRules,
+		"final":             "remote-dns",
+		"strategy":          "ipv4_only",
+		"independent_cache": true,
+	}
+
+	// 5. Experimental / Clash API
+	experimentalConfig := map[string]interface{}{
+		"cache_file": map[string]interface{}{
+			"enabled":      true,
+			"path":         "/tmp/sing-box-cache.db",
+			"store_fakeip": true,
+		},
+		"clash_api": map[string]interface{}{
+			"external_controller": clashController,
+			"default_mode":        "rule",
+		},
+	}
+
+	if cfg.EnableYACD {
+		if clashAPI, ok := experimentalConfig["clash_api"].(map[string]interface{}); ok {
+			clashAPI["external_ui"] = "yacd"
+		}
+	}
+
+	tproxyPort := cfg.TProxyPort
+	if tproxyPort == 0 {
+		tproxyPort = 1602
+	}
+
+	sbConfig := map[string]interface{}{
+		"log": map[string]interface{}{
+			"level":     "warn",
+			"timestamp": false,
+		},
+		"dns": dnsConfig,
+		"inbounds": []map[string]interface{}{
+			{
+				"type":          "tproxy",
+				"tag":           "tproxy-in",
+				"listen":        "::",
+				"listen_port":   tproxyPort,
+				"tcp_fast_open": true,
+				"udp_fragment":  true,
+			},
+			{
+				"type":        "direct",
+				"tag":         "dns-in",
+				"listen":      "127.0.0.42",
+				"listen_port": cfg.DNSPort,
+			},
+			{
+				"type":        "mixed",
+				"tag":         "mixed-in",
+				"listen":      "127.0.0.1",
+				"listen_port": cfg.MixedPort,
+			},
+		},
+		"experimental": experimentalConfig,
+	}
+
+	// 6. Outbounds (узлы, группы, селекторы)
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -189,161 +368,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		activeOutboundTag = selectorTag
 	}
 
-	// 3. Локальные пользовательские SRS
-	type localSRS struct {
-		tag  string
-		path string
-	}
-	var customSRSObjects []localSRS
-	var customSRSTags []string
+	sbConfig["outbounds"] = outbounds
 
-	for idx, srs := range cfg.CustomSRSRulesets {
-		if !srs.Enabled || strings.TrimSpace(srs.URL) == "" {
-			continue
-		}
-		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(srs.URL)))[:12]
-		filePath := filepath.Join(ruleset.RulesetDir, fmt.Sprintf("srs_%s.srs", hash))
-
-		if _, err := os.Stat(filePath); err == nil {
-			tag := fmt.Sprintf("custom-srs-%d", idx+1)
-			customSRSObjects = append(customSRSObjects, localSRS{tag: tag, path: filePath})
-			customSRSTags = append(customSRSTags, tag)
-		}
-	}
-
-	// 4. DNS-конфигурация v1.14
-	dnsRules := []map[string]interface{}{
-		{
-			"action":     "reject",
-			"query_type": []string{"HTTPS"},
-		},
-		{
-			"action":        "reject",
-			"domain_suffix": []string{"use-application-dns.net"},
-		},
-	}
-
-	activeRuleSetsMap := make(map[string]bool)
-	for _, rs := range cfg.RuleSets {
-		norm := strings.ToLower(strings.TrimSpace(rs))
-		if norm != "" {
-			activeRuleSetsMap[norm] = true
-		}
-	}
-	for _, rp := range cfg.RoutePolicies {
-		if rp.Enabled {
-			for _, rs := range rp.RuleSets {
-				norm := strings.ToLower(strings.TrimSpace(rs))
-				if norm != "" {
-					activeRuleSetsMap[norm] = true
-				}
-			}
-		}
-	}
-
-	var allRuleSets []string
-	for rs := range activeRuleSetsMap {
-		allRuleSets = append(allRuleSets, rs)
-	}
-
-	dnsRuleSetList := append([]string(nil), allRuleSets...)
-	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
-
-	if isGlobal {
-		dnsRules = append(dnsRules, map[string]interface{}{
-			"server": "fakeip-dns",
-		})
-	} else {
-		var fakeipDomains []string
-		fakeipDomains = append(fakeipDomains, cfg.CustomDomains...)
-		for _, rp := range cfg.RoutePolicies {
-			if rp.Enabled && len(rp.Domains) > 0 {
-				fakeipDomains = append(fakeipDomains, rp.Domains...)
-			}
-		}
-
-		if len(fakeipDomains) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":        "fakeip-dns",
-				"domain_suffix": fakeipDomains,
-			})
-		}
-		if len(dnsRuleSetList) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":   "fakeip-dns",
-				"rule_set": dnsRuleSetList,
-			})
-		}
-	}
-
-	remoteServerEntry := map[string]interface{}{
-		"tag":         "remote-dns",
-		"type":        remoteDNSType,
-		"server":      remoteDNSServer,
-		"server_port": remoteDNSPort,
-	}
-
-	if net.ParseIP(remoteDNSServer) == nil {
-		remoteServerEntry["domain_resolver"] = "bootstrap-dns"
-	}
-
-	if remoteServerName != "" {
-		remoteServerEntry["server_name"] = remoteServerName
-	}
-
-	dnsServers := []map[string]interface{}{
-		{
-			"tag":         "bootstrap-dns",
-			"type":        "udp",
-			"server":      bootstrapServer,
-			"server_port": 53,
-		},
-		{
-			"tag":         "fakeip-dns",
-			"type":        "fakeip",
-			"inet4_range": "198.18.0.0/15",
-		},
-		remoteServerEntry,
-	}
-
-	dnsConfig := map[string]interface{}{
-		"servers":           dnsServers,
-		"rules":             dnsRules,
-		"final":             "remote-dns",
-		"strategy":          "ipv4_only",
-		"independent_cache": true,
-	}
-
-	// 5. Inbounds
-	tproxyPort := cfg.TProxyPort
-	if tproxyPort == 0 {
-		tproxyPort = 1602
-	}
-
-	inbounds := []map[string]interface{}{
-		{
-			"type":          "tproxy",
-			"tag":           "tproxy-in",
-			"listen":        "::",
-			"listen_port":   tproxyPort,
-			"tcp_fast_open": true,
-			"udp_fragment":  true,
-		},
-		{
-			"type":        "direct",
-			"tag":         "dns-in",
-			"listen":      "127.0.0.42",
-			"listen_port": cfg.DNSPort,
-		},
-		{
-			"type":        "mixed",
-			"tag":         "mixed-in",
-			"listen":      "127.0.0.1",
-			"listen_port": cfg.MixedPort,
-		},
-	}
-
-	// 6. Правила маршрутизации
+	// 7. Route Rules (сниффинг выполняется здесь)
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",
@@ -352,10 +379,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		{
 			"action":   "hijack-dns",
 			"protocol": []string{"dns"},
-		},
-		{
-			"action": "hijack-dns",
-			"port":   []uint16{53},
 		},
 	}
 
@@ -477,7 +500,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				if cleanRS == "telegram" {
 					hasTelegram = true
 				}
-				if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
+				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
+				if err == nil && len(subnets) > 0 {
 					totalSubnets = append(totalSubnets, subnets...)
 				}
 			}
@@ -559,7 +583,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// 7. Формирование объектов rule_set (только локальные файлы)
+	// 8. Локальные RuleSets (предзагрузка выбранных категорий в /tmp)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
@@ -599,24 +623,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		finalOutbound = activeOutboundTag
 	}
 
-	clashAPI := map[string]interface{}{
-		"external_controller": clashController,
-		"default_mode":        "rule",
-	}
-	if cfg.EnableYACD {
-		clashAPI["external_ui"] = "yacd"
-	}
-
-	experimentalConfig := map[string]interface{}{
-		"cache_file": map[string]interface{}{
-			"enabled":      true,
-			"path":         "/tmp/sing-box-cache.db",
-			"store_fakeip": true,
-		},
-		"clash_api": clashAPI,
-	}
-
-	routeConfig := map[string]interface{}{
+	sbConfig["route"] = map[string]interface{}{
 		"rules":                   routeRules,
 		"rule_set":                ruleSetObjects,
 		"final":                   finalOutbound,
@@ -625,28 +632,21 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"default_mark":            2097152,
 	}
 
-	sbConfig := map[string]interface{}{
-		"log": map[string]interface{}{
-			"level":     "warn",
-			"timestamp": false,
-		},
-		"dns":          dnsConfig,
-		"inbounds":     inbounds,
-		"outbounds":    outbounds,
-		"experimental": experimentalConfig,
-		"route":        routeConfig,
-	}
-
 	data, err := json.MarshalIndent(sbConfig, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal sing-box config: %w", err)
+		return fmt.Errorf("marshal sing-box 1.13 config: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
 
-	return os.WriteFile(outputPath, data, 0644)
+	// Атомарная запись конфига
+	tmpPath := outputPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, outputPath)
 }
 
 func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
