@@ -3,7 +3,6 @@
 set -e
 
 REPO_CHEBUR="ph4n70m1984/cheburnet"
-API_SB_URL="https://api.github.com/repos/shtorm-7/sing-box-extended/releases?per_page=30"
 DEST_FILE="/usr/bin/sing-box"
 SERVICE_NAME="cheburnet"
 
@@ -69,7 +68,7 @@ api_get() {
     fi
 }
 
-# 3. Определение пакетного менеджера и точной системной архитектуры OpenWrt
+# 3. Определение пакетного менеджера и архитектуры OpenWrt
 PKG_MANAGER=""
 PKG_EXT=""
 if command -v apk >/dev/null 2>&1 && [ "$(command -v apk)" != "/opt/bin/apk" ]; then
@@ -88,7 +87,6 @@ if [ -f "/etc/openwrt_release" ]; then
     DISTRIB_ARCH=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH")
 fi
 
-# Специфика архитектуры OpenWrt APK
 APK_SYSTEM_ARCH=""
 if [ "$PKG_MANAGER" = "apk" ]; then
     if [ -f "/etc/apk/arch" ]; then
@@ -151,120 +149,16 @@ stop_cheburnet_service() {
     fi
 }
 
-install_sb_binary_tar() {
-    local _url="$1"
-    WORK_DIR="/tmp/sb_inst_$$"
-    rm -rf "$WORK_DIR" && mkdir -p "$WORK_DIR"
-    cd "$WORK_DIR" || fail "Не удалось перейти в $WORK_DIR"
-
-    printf "${C}[*] Скачивание архива: %s...${N}\n" "$(basename "$_url")"
-    $DOWNLOAD "sb_dist.tar.gz" "$_url" || fail "Сбой при скачивании sing-box."
-
-    printf "${C}[*] Распаковка...${N}\n"
-    tar -xzf "sb_dist.tar.gz" || fail "Не удалось распаковать архив."
-
-    local _bin
-    _bin=$(find . -type f -name "sing-box" | head -n 1)
-    [ -z "$_bin" ] && fail "Исполняемый файл sing-box не найден в архиве."
-
-    stop_cheburnet_service
-
-    cp -f "$_bin" "$DEST_FILE"
-    chmod +x "$DEST_FILE"
-    cd / && rm -rf "$WORK_DIR"
-    WORK_DIR=""
-
-    NEW_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}')
-    printf "${G}[✓] sing-box успешно установлен/обновлен: %s${N}\n" "$NEW_SB_VER"
-}
-
-# 4. Выбор действия для Sing-Box
+# 4. Выбор действия для Sing-Box (только репозиторий OpenWrt)
 echo "Операции с ядром Sing-Box:"
-echo "  1) Установить / Обновить до 1.14.0-extended-2.7.1 (рекомендуется)"
-echo "  2) Выбрать релиз из репозитория shtorm-7/sing-box-extended"
-echo "  3) Установить / Обновить из официального репозитория OpenWrt ($PKG_MANAGER)"
+echo "  1) Установить / Обновить из официального репозитория OpenWrt ($PKG_MANAGER)"
 echo "  0) Пропустить обновление sing-box"
-printf "${C}[>] Ваш выбор [0-3] (по умолчанию 1): ${N}"
+printf "${C}[>] Ваш выбор [0-1] (по умолчанию 1): ${N}"
 read_input 30
 CHOICE_SB="${READ_VALUE:-1}"
 
 case "$CHOICE_SB" in
     1)
-        TARGET_TAG="v1.14.0-extended-2.7.1"
-        DO_INSTALL="1"
-        if [ "$CURRENT_SB_VER" = "1.14.0-extended-2.7.1" ]; then
-            printf "${Y}[i] sing-box %s уже установлен. Переустановить принудительно? [y/N]: ${N}" "$TARGET_TAG"
-            read_input 15
-            case "$READ_VALUE" in
-                y|Y|д|Д) DO_INSTALL="1" ;;
-                *) DO_INSTALL="0"; printf "${G}[✓] Пропуск обновления sing-box.${N}\n" ;;
-            esac
-        fi
-
-        if [ "$DO_INSTALL" = "1" ]; then
-            printf "${C}[*] Поиск ссылки для %s (%s)...${N}\n" "$TARGET_TAG" "$ARCH_SUFFIX"
-            REL_JSON=$(api_get "https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/${TARGET_TAG}" 2>/dev/null || true)
-            if [ -z "$REL_JSON" ] || ! echo "$REL_JSON" | grep -q "browser_download_url"; then
-                TARGET_TAG="1.14.0-extended-2.7.1"
-                REL_JSON=$(api_get "https://api.github.com/repos/shtorm-7/sing-box-extended/releases/tags/${TARGET_TAG}" 2>/dev/null || true)
-            fi
-
-            SHORT_ARCH="${ARCH_SUFFIX%%-*}"
-            DOWNLOAD_URL=$(echo "$REL_JSON" | tr ',' '\n' | grep -E "browser_download_url.*linux-(${ARCH_SUFFIX}|${SHORT_ARCH}).*compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
-            if [ -z "$DOWNLOAD_URL" ]; then
-                DOWNLOAD_URL=$(echo "$REL_JSON" | tr ',' '\n' | grep -E "browser_download_url.*linux-(${ARCH_SUFFIX}|${SHORT_ARCH}).*\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
-            fi
-
-            [ -z "$DOWNLOAD_URL" ] && fail "Не удалось найти подходящий архив для $ARCH_SUFFIX в релизе $TARGET_TAG."
-            install_sb_binary_tar "$DOWNLOAD_URL"
-        fi
-        ;;
-
-    2)
-        printf "${C}[*] Получение списка релизов sing-box-extended...${N}\n"
-        API_RESP=$(api_get "$API_SB_URL") || true
-        [ -z "$API_RESP" ] && fail "Не удалось получить список релизов с GitHub."
-
-        RELEASES=$(echo "$API_RESP" | tr ',' '\n' | grep '"tag_name"' | awk -F '"' '{print $4}' | grep -v -iE "rc|beta|alpha" | head -n 5)
-        [ -z "$RELEASES" ] && fail "Стабильные релизы не найдены."
-
-        printf "\nДоступные релизы:\n"
-        idx=1
-        for tag in $RELEASES; do
-            printf "  ${Y}%d)${N} %s\n" "$idx" "$tag"
-            idx=$((idx+1))
-        done
-        printf "${C}[>] Выберите релиз (1-$((idx-1))): ${N}"
-        read_input 30
-        tag_choice="$READ_VALUE"
-
-        SELECTED_TAG=""
-        idx=1
-        for tag in $RELEASES; do
-            if [ "$tag_choice" = "$idx" ]; then
-                SELECTED_TAG="$tag"
-                break
-            fi
-            idx=$((idx+1))
-        done
-        [ -z "$SELECTED_TAG" ] && fail "Неверный выбор релиза."
-
-        RAW_ASSETS=$(echo "$API_RESP" | tr ',' '\n' | awk -v tag="\"$SELECTED_TAG\"" '
-            /"tag_name":/ { in_rel = (index($0, tag) > 0) }
-            in_rel && /browser_download_url/ { print }
-        ')
-
-        SHORT_ARCH="${ARCH_SUFFIX%%-*}"
-        URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep -E "linux-(${ARCH_SUFFIX}|${SHORT_ARCH})-compressed\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
-        if [ -z "$URL_TO_FETCH" ]; then
-            URL_TO_FETCH=$(echo "$RAW_ASSETS" | grep -E "linux-(${ARCH_SUFFIX}|${SHORT_ARCH})\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
-        fi
-        [ -z "$URL_TO_FETCH" ] && fail "Архив для архитектуры $ARCH_SUFFIX не найден в $SELECTED_TAG."
-
-        install_sb_binary_tar "$URL_TO_FETCH"
-        ;;
-
-    3)
         stop_cheburnet_service
         printf "${C}[*] Установка/обновление sing-box через %s...${N}\n" "$PKG_MANAGER"
         if [ "$PKG_MANAGER" = "apk" ]; then
@@ -272,8 +166,9 @@ case "$CHOICE_SB" in
         else
             opkg update && opkg install sing-box --force-reinstall
         fi
+        NEW_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
+        printf "${G}[✓] sing-box успешно установлен/обновлен: %s${N}\n" "${NEW_SB_VER:-готово}"
         ;;
-
     0)
         printf "${Y}[*] Пропуск обновления sing-box.${N}\n"
         ;;
@@ -282,13 +177,13 @@ case "$CHOICE_SB" in
         ;;
 esac
 
-# 5. Проверка системных зависимостей
-printf "\n${C}[*] Проверка зависимостей (nftables, ip-full, ca-bundle)...${N}\n"
+# 5. Проверка системных зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle)
+printf "\n${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
-    apk add --no-cache nftables ip-full ca-bundle curl
+    apk add --no-cache nftables kmod-nft-tproxy ip-full ca-bundle curl
 else
     opkg update
-    opkg install nftables ip-full ca-bundle curl
+    opkg install nftables kmod-nft-tproxy ip-full ca-bundle curl
 fi
 
 # 6. Установка / Обновление пакета Chebur.NET
@@ -320,7 +215,6 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 
     if [ "$PKG_MANAGER" = "apk" ]; then
-        # Приоритетный поиск пакета с префиксом _p и точным именем таргета OpenWrt
         MATCH_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
         CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*_p[0-9]+.*${MATCH_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
         if [ -z "$CHEBUR_URL" ]; then
