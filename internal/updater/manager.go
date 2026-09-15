@@ -1,9 +1,7 @@
 package updater
 
 import (
-	"archive/tar"
 	"bufio"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,9 +22,7 @@ import (
 )
 
 const (
-	TargetSingBoxVersion = "1.14.0-extended-2.7.1"
-	SingBoxBinPath       = "/usr/bin/sing-box"
-	SingBoxReleaseBase   = "https://github.com/shtorm-7/sing-box-extended/releases/download"
+	SingBoxBinPath = "/usr/bin/sing-box"
 )
 
 var sha256Regex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
@@ -128,7 +124,6 @@ func detectPackageManager() string {
 
 func detectTargetArch(pkgMgr string) string {
 	if pkgMgr == "apk" {
-		// Приоритетно берем точную архитектуру OpenWrt из /etc/apk/arch
 		if archBytes, err := os.ReadFile("/etc/apk/arch"); err == nil {
 			firstLine := strings.TrimSpace(strings.Split(string(archBytes), "\n")[0])
 			if firstLine != "" {
@@ -140,7 +135,6 @@ func detectTargetArch(pkgMgr string) string {
 		if err == nil {
 			arch := strings.TrimSpace(string(out))
 			if arch != "" {
-				// Маппинг для семейств ARM/MIPS
 				if arch == "aarch64" {
 					return "aarch64_cortex-a53"
 				}
@@ -166,7 +160,6 @@ func detectTargetArch(pkgMgr string) string {
 		}
 	}
 
-	// Fallback по GOARCH
 	switch runtime.GOARCH {
 	case "arm64":
 		return "aarch64_cortex-a53"
@@ -186,7 +179,6 @@ func parseSemVer(v string) []int {
 	if idx := strings.Index(v, "-"); idx != -1 {
 		v = v[:idx]
 	}
-	// Учитываем нормализацию для OpenWrt APK (_p26)
 	v = strings.ReplaceAll(v, "_p", ".")
 	parts := strings.Split(v, ".")
 	res := make([]int, 4)
@@ -216,7 +208,7 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	sbStatus := m.checkPinnedSingBoxStatus()
+	sbStatus := m.checkSingBoxPkgStatus(ctx)
 
 	chStatus := ComponentStatus{
 		Current:   strings.TrimPrefix(m.currentVer, "v"),
@@ -240,59 +232,8 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	return report, nil
 }
 
-func parseExtendedSemVer(v string) (base []int, ext []int) {
-	parts := strings.Split(v, "-extended-")
-	baseParts := strings.Split(parts[0], ".")
-	for _, p := range baseParts {
-		val, _ := strconv.Atoi(p)
-		base = append(base, val)
-	}
-	for len(base) < 3 {
-		base = append(base, 0)
-	}
-
-	if len(parts) > 1 {
-		extParts := strings.Split(parts[1], ".")
-		for _, p := range extParts {
-			val, _ := strconv.Atoi(p)
-			ext = append(ext, val)
-		}
-	}
-	for len(ext) < 3 {
-		ext = append(ext, 0)
-	}
-	return
-}
-
-func isVersionGreaterOrEqual(a, b string) bool {
-	aBase, aExt := parseExtendedSemVer(a)
-	bBase, bExt := parseExtendedSemVer(b)
-
-	for i := 0; i < 3; i++ {
-		if aBase[i] > bBase[i] {
-			return true
-		}
-		if aBase[i] < bBase[i] {
-			return false
-		}
-	}
-
-	for i := 0; i < 3; i++ {
-		if aExt[i] > bExt[i] {
-			return true
-		}
-		if aExt[i] < bExt[i] {
-			return false
-		}
-	}
-
-	return true
-}
-
-func (m *Manager) checkPinnedSingBoxStatus() ComponentStatus {
-	st := ComponentStatus{
-		Latest: TargetSingBoxVersion,
-	}
+func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
+	st := ComponentStatus{}
 
 	binPath := SingBoxBinPath
 	if _, err := os.Stat(binPath); os.IsNotExist(err) {
@@ -306,159 +247,85 @@ func (m *Manager) checkPinnedSingBoxStatus() ComponentStatus {
 	}
 
 	st.Installed = true
-	out, err := exec.Command(binPath, "version").CombinedOutput()
-	if err != nil && len(out) == 0 {
-		st.Current = "unknown"
-		st.HasUpdate = true
-		return st
-	}
 
-	re := regexp.MustCompile(`version\s+([^\s\n]+)`)
-	matches := re.FindStringSubmatch(string(out))
-	if len(matches) >= 2 {
-		curVer := strings.TrimPrefix(matches[1], "v")
-		st.Current = curVer
-
-		if isVersionGreaterOrEqual(curVer, TargetSingBoxVersion) {
-			st.HasUpdate = false
+	// Проверяем текущую версию через сам бинарник
+	out, err := exec.CommandContext(ctx, binPath, "version").CombinedOutput()
+	if err == nil && len(out) > 0 {
+		re := regexp.MustCompile(`version\s+([^\s\n]+)`)
+		matches := re.FindStringSubmatch(string(out))
+		if len(matches) >= 2 {
+			st.Current = strings.TrimPrefix(matches[1], "v")
 		} else {
-			st.HasUpdate = true
+			st.Current = "installed"
 		}
 	} else {
 		st.Current = "unknown"
-		st.HasUpdate = true
+	}
+
+	// Проверка наличия более новой версии в репозитории через пакетный менеджер
+	if m.pkgManager == "apk" {
+		cmd := exec.CommandContext(ctx, "apk", "version", "sing-box")
+		vOut, vErr := cmd.CombinedOutput()
+		if vErr == nil {
+			lines := strings.Split(strings.TrimSpace(string(vOut)), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "sing-box") {
+					if strings.Contains(line, "<") {
+						st.HasUpdate = true
+					}
+					fields := strings.Fields(line)
+					if len(fields) >= 3 {
+						st.Latest = fields[2]
+					}
+					break
+				}
+			}
+		}
+	} else {
+		// Для OPKG
+		cmd := exec.CommandContext(ctx, "opkg", "list-upgradable")
+		uOut, uErr := cmd.CombinedOutput()
+		if uErr == nil && strings.Contains(string(uOut), "sing-box") {
+			st.HasUpdate = true
+			lines := strings.Split(strings.TrimSpace(string(uOut)), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "sing-box -") {
+					parts := strings.Split(line, " - ")
+					if len(parts) >= 3 {
+						st.Latest = parts[2]
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if st.Latest == "" {
+		st.Latest = st.Current
 	}
 
 	return st
 }
 
-func (m *Manager) resolveSingBoxAsset() (string, error) {
-	arch := strings.ToLower(m.targetArch)
-
-	switch runtime.GOARCH {
-	case "arm64":
-		return fmt.Sprintf("sing-box-%s-linux-arm64.tar.gz", TargetSingBoxVersion), nil
-	case "amd64":
-		return fmt.Sprintf("sing-box-%s-linux-amd64.tar.gz", TargetSingBoxVersion), nil
-	case "386":
-		return fmt.Sprintf("sing-box-%s-linux-386.tar.gz", TargetSingBoxVersion), nil
-	case "arm":
-		if strings.Contains(arch, "v5") {
-			return fmt.Sprintf("sing-box-%s-linux-armv5.tar.gz", TargetSingBoxVersion), nil
-		}
-		return fmt.Sprintf("sing-box-%s-linux-armv7.tar.gz", TargetSingBoxVersion), nil
-	case "mipsle":
-		return fmt.Sprintf("sing-box-%s-linux-mipsle-softfloat.tar.gz", TargetSingBoxVersion), nil
-	case "mips":
-		return fmt.Sprintf("sing-box-%s-linux-mips-softfloat.tar.gz", TargetSingBoxVersion), nil
-	case "mips64le":
-		return fmt.Sprintf("sing-box-%s-linux-mips64le-softfloat.tar.gz", TargetSingBoxVersion), nil
-	case "mips64":
-		return fmt.Sprintf("sing-box-%s-linux-mips64-softfloat.tar.gz", TargetSingBoxVersion), nil
-	default:
-		return "", fmt.Errorf("неподдерживаемая архитектура ядра sing-box: GOARCH=%s, targetArch=%s", runtime.GOARCH, m.targetArch)
-	}
-}
-
 func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
-	status := m.checkPinnedSingBoxStatus()
-	if !status.HasUpdate && status.Installed {
-		log.Printf("[INFO] sing-box уже имеет версию %s. Обновление не требуется.", status.Current)
-		return nil
+	log.Printf("[INFO] Обновление sing-box с помощью пакетного менеджера %s...", m.pkgManager)
+
+	var cmd *exec.Cmd
+	if m.pkgManager == "apk" {
+		_ = exec.CommandContext(ctx, "apk", "update").Run()
+		cmd = exec.CommandContext(ctx, "apk", "add", "--upgrade", "sing-box")
+	} else {
+		_ = exec.CommandContext(ctx, "opkg", "update").Run()
+		cmd = exec.CommandContext(ctx, "opkg", "install", "--force-reinstall", "sing-box")
 	}
 
-	const minTmpSpace = 40 * 1024 * 1024
-	const minDestSpace = 25 * 1024 * 1024
-
-	if err := ensureSpace("/tmp", minTmpSpace, "временного каталога /tmp"); err != nil {
-		return err
-	}
-
-	targetPath := SingBoxBinPath
-	if lp, err := exec.LookPath("sing-box"); err == nil {
-		targetPath = lp
-	}
-
-	if err := ensureSpace(filepath.Dir(targetPath), minDestSpace, "установки в системный раздел"); err != nil {
-		return err
-	}
-
-	assetName, err := m.resolveSingBoxAsset()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("определение целевого архива: %w", err)
+		return fmt.Errorf("ошибка обновления sing-box через %s: %w (вывод: %s)", m.pkgManager, err, strings.TrimSpace(string(out)))
 	}
 
-	tag := "v" + strings.TrimPrefix(TargetSingBoxVersion, "v")
-	tarURL := fmt.Sprintf("%s/%s/%s", SingBoxReleaseBase, tag, assetName)
-
-	log.Printf("[INFO] Загрузка sing-box-extended %s в /tmp...", tag)
-
-	tmpDir, err := os.MkdirTemp("/tmp", "sb_install_*")
-	if err != nil {
-		return fmt.Errorf("не удалось создать временную директорию в /tmp: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	archivePath := filepath.Join(tmpDir, assetName)
-	if err := m.downloadFile(ctx, tarURL, archivePath); err != nil {
-		return fmt.Errorf("сбой загрузки sing-box архива: %w", err)
-	}
-
-	newBinPath := filepath.Join(tmpDir, "sing-box")
-	if err := extractFileFromTarGz(archivePath, "sing-box", newBinPath); err != nil {
-		return fmt.Errorf("ошибка распаковки sing-box: %w", err)
-	}
-
-	_ = os.Chmod(newBinPath, 0755)
-
-	testCmd := exec.CommandContext(ctx, newBinPath, "version")
-	if out, err := testCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("бинарник sing-box не прошел самопроверку: %w (вывод: %s)", err, strings.TrimSpace(string(out)))
-	}
-
-	if err := replaceFileCrossDevice(newBinPath, targetPath); err != nil {
-		return fmt.Errorf("не удалось заменить бинарник sing-box: %w", err)
-	}
-
-	log.Printf("[INFO] sing-box успешно обновлен до %s (%s)", TargetSingBoxVersion, targetPath)
+	log.Printf("[INFO] sing-box успешно обновлен через %s", m.pkgManager)
 	return nil
-}
-
-func extractFileFromTarGz(tarGzPath, targetFileName, outPath string) error {
-	f, err := os.Open(tarGzPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		if filepath.Base(header.Name) == targetFileName && (header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA) {
-			outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				return err
-			}
-			defer outFile.Close()
-
-			_, err = io.Copy(outFile, tr)
-			return err
-		}
-	}
-	return fmt.Errorf("файл %s отсутствует внутри архива tar.gz", targetFileName)
 }
 
 func replaceFileCrossDevice(src, dst string) error {
@@ -520,11 +387,7 @@ func replaceFileCrossDevice(src, dst string) error {
 }
 
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
-	sbStatus := m.checkPinnedSingBoxStatus()
-	if sbStatus.HasUpdate || !sbStatus.Installed {
-		return m.UpgradeSingBoxCore(ctx)
-	}
-	return nil
+	return m.UpgradeSingBoxCore(ctx)
 }
 
 func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, binAsset releaseAsset, checksumsURL string, err error) {
@@ -566,7 +429,6 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 
 	targetArchLower := strings.ToLower(m.targetArch)
 
-	// Поиск пакета с учетом приоритетов
 	var bestPkgAsset releaseAsset
 	var fallbackPkgAsset releaseAsset
 
@@ -578,7 +440,6 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 
 		if strings.HasSuffix(name, targetExt) {
 			if m.pkgManager == "apk" {
-				// Для OpenWrt 25 APK: отдаем приоритет пакетам с _p и точным именем таргета
 				if strings.Contains(name, "_p") && strings.Contains(name, targetArchLower) {
 					bestPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
 				} else if strings.Contains(name, targetArchLower) && bestPkgAsset.URL == "" {
@@ -587,7 +448,6 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 					fallbackPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
 				}
 			} else {
-				// Для OPKG (.ipk)
 				if strings.Contains(name, targetArchLower) {
 					bestPkgAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
 				} else if strings.Contains(name, runtime.GOARCH) && fallbackPkgAsset.URL == "" {
