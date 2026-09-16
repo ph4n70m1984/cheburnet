@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -223,7 +222,7 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 		Installed: true,
 	}
 
-	latestTag, _, _, _, err := m.fetchLatestGitHubRelease(ctx)
+	latestTag, _, _, err := m.fetchLatestGitHubRelease(ctx)
 	if err == nil {
 		cleanLatest := strings.TrimPrefix(latestTag, "v")
 		chStatus.Latest = cleanLatest
@@ -335,86 +334,28 @@ func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
 	return nil
 }
 
-func replaceFileCrossDevice(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-
-	dstDir := filepath.Dir(dst)
-	tmpDst, err := os.CreateTemp(dstDir, ".bin_replace_*")
-	if err != nil {
-		_ = os.Remove(dst)
-		out, errCreate := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if errCreate != nil {
-			return fmt.Errorf("open target: %w", errCreate)
-		}
-		defer out.Close()
-
-		in, errOpen := os.Open(src)
-		if errOpen != nil {
-			return errOpen
-		}
-		defer in.Close()
-
-		if _, err := io.Copy(out, in); err != nil {
-			return err
-		}
-		_ = os.Remove(src)
-		return nil
-	}
-	tmpDstPath := tmpDst.Name()
-	defer os.Remove(tmpDstPath)
-
-	in, err := os.Open(src)
-	if err != nil {
-		tmpDst.Close()
-		return err
-	}
-	defer in.Close()
-
-	if _, err := io.Copy(tmpDst, in); err != nil {
-		tmpDst.Close()
-		return err
-	}
-	tmpDst.Close()
-
-	if err := os.Chmod(tmpDstPath, 0755); err != nil {
-		return err
-	}
-
-	// Атомарное перемещение с объединением ошибок
-	if err := os.Rename(tmpDstPath, dst); err != nil {
-		rmErr := os.Remove(dst)
-		if errRetry := os.Rename(tmpDstPath, dst); errRetry != nil {
-			return fmt.Errorf("rename to target: %w", errors.Join(err, rmErr, errRetry))
-		}
-	}
-
-	_ = os.Remove(src)
-	return nil
-}
-
 func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return m.UpgradeSingBoxCore(ctx)
 }
 
-func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, binAsset releaseAsset, checksumsURL string, err error) {
+// fetchLatestGitHubRelease ищет только официальные системные пакеты (.ipk или .apk)
+func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("create release request: %w", err)
+		return "", releaseAsset{}, "", fmt.Errorf("create release request: %w", err)
 	}
 	req.Header.Set("User-Agent", "CheburNet-Updater")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api request failed: %w", err)
+		return "", releaseAsset{}, "", fmt.Errorf("github api request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("github api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+		return "", releaseAsset{}, "", fmt.Errorf("github api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 
 	var rel struct {
@@ -425,7 +366,7 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", releaseAsset{}, releaseAsset{}, "", fmt.Errorf("decode github release response: %w", err)
+		return "", releaseAsset{}, "", fmt.Errorf("decode github release response: %w", err)
 	}
 
 	tag = strings.TrimPrefix(rel.TagName, "v")
@@ -463,10 +404,6 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 				}
 			}
 		}
-
-		if strings.Contains(name, fmt.Sprintf("cheburnetd_linux_%s", runtime.GOARCH)) {
-			binAsset = releaseAsset{Name: a.Name, URL: a.BrowserDownloadURL}
-		}
 	}
 
 	if bestPkgAsset.URL != "" {
@@ -475,7 +412,7 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		pkgAsset = fallbackPkgAsset
 	}
 
-	return tag, pkgAsset, binAsset, checksumsURL, nil
+	return tag, pkgAsset, checksumsURL, nil
 }
 
 func (m *Manager) fetchExpectedSHA256(ctx context.Context, checksumsURL, filename string) (string, error) {
@@ -547,6 +484,7 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 	return nil
 }
 
+// UpgradePackage обновляет пакет демона строго через системный пакетный менеджер (apk / opkg)
 func (m *Manager) UpgradePackage(ctx context.Context) error {
 	const minPkgTmpSpace = 15 * 1024 * 1024
 	const minOverlaySpace = 10 * 1024 * 1024
@@ -563,9 +501,13 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		return err
 	}
 
-	tag, pkgAsset, binAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
+	tag, pkgAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
 	if err != nil {
 		return fmt.Errorf("сбой поиска релиза: %w", err)
+	}
+
+	if pkgAsset.URL == "" {
+		return fmt.Errorf("в релизе %s не найден установочный пакет (.ipk/.apk) для архитектуры %s", tag, m.targetArch)
 	}
 
 	const uciCfgPath = "/etc/config/cheburnet"
@@ -594,90 +536,39 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		}
 	}
 
-	if pkgAsset.URL != "" {
-		log.Printf("[INFO] Загрузка %s пакета: %s", m.pkgManager, pkgAsset.URL)
-		tmpFile := filepath.Join("/tmp", pkgAsset.Name)
-		defer os.Remove(tmpFile)
+	log.Printf("[INFO] Загрузка %s пакета: %s", m.pkgManager, pkgAsset.URL)
+	tmpFile := filepath.Join("/tmp", pkgAsset.Name)
+	defer os.Remove(tmpFile)
 
-		if err := m.downloadFile(ctx, pkgAsset.URL, tmpFile); err != nil {
-			return fmt.Errorf("ошибка скачивания пакета: %w", err)
-		}
-
-		expectedHash, err := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
-		if err != nil {
-			return fmt.Errorf("проверка целостности заблокирована: %w", err)
-		}
-		if err := m.verifyFileSHA256(tmpFile, expectedHash); err != nil {
-			return fmt.Errorf("ошибка проверки безопасности: %w", err)
-		}
-
-		var cmd *exec.Cmd
-		if m.pkgManager == "apk" {
-			cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", "--force-overwrite", tmpFile)
-		} else {
-			cmd = exec.CommandContext(ctx, "opkg", "--tmp-dir", "/tmp", "install", "--force-reinstall", tmpFile)
-		}
-
-		out, err := cmd.CombinedOutput()
-		restoreConfigIfNeeded()
-
-		if err != nil {
-			return fmt.Errorf("установка через %s завершилась сбоем: %s", m.pkgManager, string(out))
-		}
-
-		log.Printf("[INFO] Пакет %s успешно обновлен", m.pkgManager)
-		m.currentVer = tag
-		return nil
+	if err := m.downloadFile(ctx, pkgAsset.URL, tmpFile); err != nil {
+		return fmt.Errorf("ошибка скачивания пакета: %w", err)
 	}
 
-	if binAsset.URL != "" {
-		log.Printf("[INFO] Пакет не найден. Fallback к бинарному файлу: %s", binAsset.URL)
-		tmpBin := filepath.Join("/tmp", binAsset.Name)
-		defer os.Remove(tmpBin)
-
-		if err := m.downloadFile(ctx, binAsset.URL, tmpBin); err != nil {
-			return err
-		}
-
-		expectedHash, err := m.fetchExpectedSHA256(ctx, checksumsURL, binAsset.Name)
-		if err != nil {
-			return fmt.Errorf("проверка целостности бинарника заблокирована: %w", err)
-		}
-		if err := m.verifyFileSHA256(tmpBin, expectedHash); err != nil {
-			return fmt.Errorf("ошибка проверки безопасности: %w", err)
-		}
-
-		_ = os.Chmod(tmpBin, 0755)
-
-		destinations := []string{"/usr/bin/cheburnetd", "/bin/cheburnetd"}
-		if currPath, err := os.Executable(); err == nil {
-			if resolved, err := filepath.EvalSymlinks(currPath); err == nil {
-				destinations = append(destinations, resolved)
-			}
-		}
-
-		replacedAny := false
-		for _, dest := range destinations {
-			if _, statErr := os.Stat(dest); statErr == nil {
-				if err := replaceFileCrossDevice(tmpBin, dest); err == nil {
-					replacedAny = true
-					log.Printf("[INFO] Бинарник заменен в %s", dest)
-				}
-			}
-		}
-
-		if !replacedAny {
-			if err := replaceFileCrossDevice(tmpBin, "/usr/bin/cheburnetd"); err != nil {
-				return fmt.Errorf("не удалось перезаписать исполняемый файл: %w", err)
-			}
-		}
-
-		restoreConfigIfNeeded()
-		m.currentVer = tag
-		return nil
+	expectedHash, err := m.fetchExpectedSHA256(ctx, checksumsURL, pkgAsset.Name)
+	if err != nil {
+		return fmt.Errorf("проверка целостности заблокирована: %w", err)
+	}
+	if err := m.verifyFileSHA256(tmpFile, expectedHash); err != nil {
+		return fmt.Errorf("ошибка проверки безопасности: %w", err)
 	}
 
-	return fmt.Errorf("не найден подходящий релизный файл для архитектуры %s", m.targetArch)
+	var cmd *exec.Cmd
+	if m.pkgManager == "apk" {
+		cmd = exec.CommandContext(ctx, "apk", "add", "--allow-untrusted", "--force-overwrite", tmpFile)
+	} else {
+		cmd = exec.CommandContext(ctx, "opkg", "--tmp-dir", "/tmp", "install", "--force-reinstall", tmpFile)
+	}
+
+	out, err := cmd.CombinedOutput()
+	restoreConfigIfNeeded()
+
+	if err != nil {
+		return fmt.Errorf("установка через %s завершилась сбоем: %s", m.pkgManager, string(out))
+	}
+
+	log.Printf("[INFO] Пакет Chebur.NET успешно обновлен через %s", m.pkgManager)
+	m.currentVer = tag
+	return nil
 }
 
 func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) error {
@@ -707,7 +598,6 @@ func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) erro
 	}
 	defer out.Close()
 
-	// Защита от исчерпания RAM /tmp через io.LimitReader
 	limitedReader := io.LimitReader(resp.Body, maxDownloadBytes+1)
 	written, err := io.Copy(out, limitedReader)
 	if err != nil {
