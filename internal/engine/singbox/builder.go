@@ -141,8 +141,8 @@ func mapToSRSName(rs string) string {
 }
 
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
-	routerIP := getRouterLANIP()
-	clashController := fmt.Sprintf("%s:9090", routerIP)
+	// Привязка контроллера ко всем интерфейсам (доступен как для 127.0.0.1, так и для LAN)
+	clashController := "0.0.0.0:9090"
 
 	remoteDNSType := "udp"
 	remoteDNSServer := cfg.DNSServer
@@ -373,7 +373,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 			targetURL := grp.TargetURL
 			if targetURL == "" {
-				targetURL = "https://www.gstatic.com/generate_204"
+				targetURL = "http://cp.cloudflare.com/generate_204"
 			}
 
 			outbounds = append(outbounds, map[string]interface{}{
@@ -407,7 +407,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"type":                        "urltest",
 			"tag":                         urltestTag,
 			"outbounds":                   allNodeTags,
-			"url":                         "https://www.gstatic.com/generate_204",
+			"url":                         "http://cp.cloudflare.com/generate_204",
 			"interval":                    "3m",
 			"tolerance":                   50,
 			"idle_timeout":                "30m",
@@ -479,6 +479,14 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if activeOutboundTag != "direct-out" {
+		// Обязательный маршрут: весь FakeIP-пул перенаправляем в прокси
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":   "route",
+			"inbound":  []string{"tproxy-in"},
+			"ip_cidr":  []string{"198.18.0.0/15"},
+			"outbound": activeOutboundTag,
+		})
+
 		if isGlobal {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
