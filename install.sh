@@ -25,7 +25,7 @@ cleanup() {
     exit 1
 }
 
-trap cleanup INT TERM
+trap cleanup INT
 
 fail() {
     stty echo 2>/dev/null || true
