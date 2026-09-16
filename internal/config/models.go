@@ -93,6 +93,9 @@ type CheburConfig struct {
 	BootstrapDNS          string               `json:"bootstrap_dns"`
 	DNSTTL                int                  `json:"dns_ttl"`
 	EnableYACD            bool                 `json:"enable_yacd"`
+	URLTestInterval       string               `json:"urltest_interval"`  // Интервал тестирования задержки (например, "3m")
+	URLTestTolerance      int                  `json:"urltest_tolerance"` // Допуск задержки в миллисекундах (например, 50)
+	URLTestURL            string               `json:"urltest_url"`       // URL проверки доступности (generate_204)
 	Nodes                 []*GenericNode       `json:"nodes"`
 	Groups                []*BalancingGroup    `json:"groups"`
 	Subscriptions         []SubscriptionConfig `json:"subscriptions"`
@@ -112,7 +115,7 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		return nil
 	}
 
-	// 1. Поверхностное копирование скаляров (string, int, bool)
+	// 1. Поверхностное копирование скаляров (string, int, bool, включая URLTest*)
 	cp := *c
 
 	// 2. Срезы строк

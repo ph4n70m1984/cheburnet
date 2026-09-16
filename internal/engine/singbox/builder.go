@@ -360,20 +360,39 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	activeOutboundTag := "direct-out"
 
+	// Значения параметров urltest по умолчанию из секции config.main
+	globalURLTestInterval := strings.TrimSpace(cfg.URLTestInterval)
+	if globalURLTestInterval == "" {
+		globalURLTestInterval = "3m"
+	}
+
+	globalURLTestTolerance := cfg.URLTestTolerance
+	if globalURLTestTolerance <= 0 {
+		globalURLTestTolerance = 50
+	}
+
+	globalURLTestURL := strings.TrimSpace(cfg.URLTestURL)
+	if globalURLTestURL == "" {
+		globalURLTestURL = "https://www.gstatic.com/generate_204"
+	}
+
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
 			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
+
 			interval := grp.Interval
 			if interval == "" {
-				interval = "3m"
+				interval = globalURLTestInterval
 			}
+
 			tolerance := grp.Tolerance
 			if tolerance == 0 {
-				tolerance = 50
+				tolerance = globalURLTestTolerance
 			}
+
 			targetURL := grp.TargetURL
 			if targetURL == "" {
-				targetURL = "http://cp.cloudflare.com/generate_204"
+				targetURL = globalURLTestURL
 			}
 
 			outbounds = append(outbounds, map[string]interface{}{
@@ -407,9 +426,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"type":                        "urltest",
 			"tag":                         urltestTag,
 			"outbounds":                   allNodeTags,
-			"url":                         "http://cp.cloudflare.com/generate_204",
-			"interval":                    "3m",
-			"tolerance":                   50,
+			"url":                         globalURLTestURL,
+			"interval":                    globalURLTestInterval,
+			"tolerance":                   globalURLTestTolerance,
 			"idle_timeout":                "30m",
 			"interrupt_exist_connections": false,
 		})

@@ -28,8 +28,8 @@ func NewBuilderV14() *BuilderV14 {
 }
 
 func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
-	routerIP := getRouterLANIP()
-	clashController := fmt.Sprintf("%s:9090", routerIP)
+	// Привязка контроллера ко всем интерфейсам (доступен локально демону и из LAN)
+	clashController := "0.0.0.0:9090"
 
 	bootstrapServer := cfg.BootstrapDNS
 	if bootstrapServer == "" {
@@ -297,20 +297,39 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	activeOutboundTag := "direct-out"
 
+	// Параметры urltest по умолчанию из UCI (cheburnet.main)
+	globalURLTestInterval := strings.TrimSpace(cfg.URLTestInterval)
+	if globalURLTestInterval == "" {
+		globalURLTestInterval = "3m"
+	}
+
+	globalURLTestTolerance := cfg.URLTestTolerance
+	if globalURLTestTolerance <= 0 {
+		globalURLTestTolerance = 50
+	}
+
+	globalURLTestURL := strings.TrimSpace(cfg.URLTestURL)
+	if globalURLTestURL == "" {
+		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
+	}
+
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
 			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
+
 			interval := grp.Interval
 			if interval == "" {
-				interval = "3m"
+				interval = globalURLTestInterval
 			}
+
 			tolerance := grp.Tolerance
 			if tolerance == 0 {
-				tolerance = 50
+				tolerance = globalURLTestTolerance
 			}
+
 			targetURL := grp.TargetURL
 			if targetURL == "" {
-				targetURL = "https://www.gstatic.com/generate_204"
+				targetURL = globalURLTestURL
 			}
 
 			outbounds = append(outbounds, map[string]interface{}{
@@ -344,9 +363,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"type":                        "urltest",
 			"tag":                         urltestTag,
 			"outbounds":                   allNodeTags,
-			"url":                         "https://www.gstatic.com/generate_204",
-			"interval":                    "3m",
-			"tolerance":                   50,
+			"url":                         globalURLTestURL,
+			"interval":                    globalURLTestInterval,
+			"tolerance":                   globalURLTestTolerance,
 			"idle_timeout":                "30m",
 			"interrupt_exist_connections": false,
 		})
@@ -416,6 +435,14 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if activeOutboundTag != "direct-out" {
+		// Обязательный маршрут: весь FakeIP-пул перенаправляем в прокси
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":   "route",
+			"inbound":  []string{"tproxy-in"},
+			"ip_cidr":  []string{"198.18.0.0/15"},
+			"outbound": activeOutboundTag,
+		})
+
 		if isGlobal {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
@@ -626,7 +653,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"default_mark":            2097152,
 	}
 
-	// Экономия памяти и CPU роутера
 	data, err := json.Marshal(sbConfig)
 	if err != nil {
 		return fmt.Errorf("marshal sing-box 1.14 config: %w", err)
