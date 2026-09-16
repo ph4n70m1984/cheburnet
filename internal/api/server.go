@@ -16,9 +16,13 @@ import (
 	"cheburnet/internal/telemetry"
 	"cheburnet/internal/updater"
 
+	"github.com/ansrivas/fiberprometheus/v2"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type ActionCallback func(action string) error
@@ -84,6 +88,17 @@ func NewServer(
 }
 
 func (s *Server) setupRoutes() {
+	// 1. Регистрируем сборщик процессора, памяти и сети в глобальном реестре
+	sysCollector := NewSystemCollector()
+	_ = prometheus.DefaultRegisterer.Register(sysCollector)
+
+	// 2. Инициализируем метрики HTTP для Fiber
+	prometheusExporter := fiberprometheus.New("cheburnetd")
+	s.app.Use(prometheusExporter.Middleware)
+
+	// 3. Отдаем объединенный реестр (Go runtime + Fiber + SystemCollector) через promhttp
+	s.app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+
 	api := s.app.Group("/api/v1")
 
 	api.Get("/status", s.handleStatus)
