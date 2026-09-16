@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -37,7 +38,6 @@ var (
 	PIDFile                  = "/var/run/cheburnetd.pid"
 )
 
-// diagReporterAdapter связывает diagnostics.DiagnosticsEngine с ruleset.DiagnosticReporter
 type diagReporterAdapter struct {
 	diag *diagnostics.DiagnosticsEngine
 }
@@ -240,6 +240,8 @@ func loadSubnetsFromCompressedStorage(loader *network.CompressedRulesetLoader, r
 
 func extractFullProxyIPs(policies []config.ClientPolicy) []string {
 	var ips []string
+	leasesMap := loadDHCPLeasesMap()
+
 	for _, p := range policies {
 		if !p.Enabled || p.Mode != config.ClientModeFullProxy || p.Target == "" {
 			continue
@@ -247,17 +249,8 @@ func extractFullProxyIPs(policies []config.ClientPolicy) []string {
 		target := strings.TrimSpace(p.Target)
 
 		if strings.Contains(target, ":") && !strings.Contains(target, ".") {
-			file, err := os.Open("/tmp/dhcp.leases")
-			if err == nil {
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
-					fields := strings.Fields(scanner.Text())
-					if len(fields) >= 3 && strings.EqualFold(fields[1], target) {
-						target = fields[2]
-						break
-					}
-				}
-				file.Close()
+			if ip, exists := leasesMap[strings.ToLower(target)]; exists {
+				target = ip
 			}
 		}
 
@@ -267,6 +260,26 @@ func extractFullProxyIPs(policies []config.ClientPolicy) []string {
 		}
 	}
 	return ips
+}
+
+func loadDHCPLeasesMap() map[string]string {
+	leases := make(map[string]string)
+	file, err := os.Open("/tmp/dhcp.leases")
+	if err != nil {
+		return leases
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 3 {
+			mac := strings.ToLower(fields[1])
+			ip := fields[2]
+			leases[mac] = ip
+		}
+	}
+	return leases
 }
 
 func getRealActiveNode(defaultTag string) string {
@@ -362,7 +375,6 @@ func runDaemon() {
 	_ = os.WriteFile(PIDFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 	defer os.Remove(PIDFile)
 
-	// 1. Детекция и гарантированное отключение IPv6
 	ipv6Mgr := network.NewIPv6Manager()
 	if err := ipv6Mgr.EnsureIPv6Disabled(); err != nil {
 		log.Printf("[WARN] Failed to configure IPv6 state: %v", err)
@@ -440,17 +452,13 @@ func runDaemon() {
 	hub.SetDiagnosticsEngine(diagEngine)
 
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
-
-	// Инициализация менеджера SRS правил
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
-	// 2. Синхронизируем кастомные SRS
 	if len(initialConfig.CustomSRSRulesets) > 0 {
 		log.Printf("[INFO] Syncing %d custom SRS rulesets...", len(initialConfig.CustomSRSRulesets))
 		rulesMgr.SyncAll(initialConfig.CustomSRSRulesets)
 	}
 
-	// 3. Предзагрузка системных SRS в /tmp/cheburnet/rulesets до запуска sing-box
 	if len(allRuleSets) > 0 {
 		log.Printf("[INFO] Pre-caching %d system SRS files to /tmp/cheburnet/rulesets...", len(allRuleSets))
 		for _, rs := range allRuleSets {
@@ -628,7 +636,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	// Синхронизируем SRS файлы перед перезагрузкой конфигурации
 	if a.rulesMgr != nil && len(cfg.CustomSRSRulesets) > 0 {
 		log.Printf("[INFO] Reload: Syncing %d custom SRS rulesets...", len(cfg.CustomSRSRulesets))
 		a.rulesMgr.SyncAll(cfg.CustomSRSRulesets)
@@ -637,7 +644,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 	targetPath := RuntimeConfigPathSingBox
 	allRuleSets := collectAllRuleSets(&cfg)
 
-	// Предзагрузка системных SRS перед перезагрузкой ядра
 	if a.rulesMgr != nil && len(allRuleSets) > 0 {
 		for _, rs := range allRuleSets {
 			_, _ = a.rulesMgr.FetchSystemRuleSet(rs)
@@ -1088,12 +1094,36 @@ func cliCheckDNS() {
 }
 
 func cliShowEngineConfig() {
-	if _, err := os.Stat(RuntimeConfigPathSingBox); err == nil {
-		data, _ := os.ReadFile(RuntimeConfigPathSingBox)
-		fmt.Printf("--- Active sing-box config (%s) ---\n%s\n", RuntimeConfigPathSingBox, string(data))
+	targetPaths := []string{
+		RuntimeConfigPathSingBox,
+		"/var/etc/cheburnet/sing-box.json",
+	}
+
+	var raw []byte
+	var resolvedPath string
+	var err error
+
+	for _, p := range targetPaths {
+		if _, statErr := os.Stat(p); statErr == nil {
+			raw, err = os.ReadFile(p)
+			if err == nil && len(raw) > 0 {
+				resolvedPath = p
+				break
+			}
+		}
+	}
+
+	if len(raw) == 0 {
+		fmt.Println("No generated runtime config found in /tmp/run/cheburnet/ or /var/etc/cheburnet/")
 		return
 	}
-	fmt.Println("No generated runtime config found in /tmp/run/cheburnet/")
+
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, raw, "", "  "); err == nil {
+		fmt.Printf("--- Active sing-box config (%s) ---\n%s\n", resolvedPath, prettyJSON.String())
+	} else {
+		fmt.Printf("--- Active sing-box config (%s) ---\n%s\n", resolvedPath, string(raw))
+	}
 }
 
 func cliGetSystemInfo() {

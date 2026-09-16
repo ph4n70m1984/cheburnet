@@ -28,6 +28,26 @@ func NewBuilder() *Builder {
 	}
 }
 
+func loadDHCPLeasesMap() map[string]string {
+	leases := make(map[string]string)
+	file, err := os.Open("/tmp/dhcp.leases")
+	if err != nil {
+		return leases
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 3 {
+			mac := strings.ToLower(fields[1])
+			ip := fields[2]
+			leases[mac] = ip
+		}
+	}
+	return leases
+}
+
 func parsePortsAndRanges(rawPorts []string) ([]uint16, []string) {
 	var singlePorts []uint16
 	var portRanges []string
@@ -59,26 +79,15 @@ func parsePortsAndRanges(rawPorts []string) ([]uint16, []string) {
 	return singlePorts, portRanges
 }
 
-func resolveTargetToCIDR(target string) string {
+func resolveTargetToCIDRWithLeases(target string, leases map[string]string) string {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return ""
 	}
 
 	if strings.Contains(target, ":") && !strings.Contains(target, ".") {
-		file, err := os.Open("/tmp/dhcp.leases")
-		if err == nil {
-			defer file.Close()
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				fields := strings.Fields(scanner.Text())
-				if len(fields) >= 3 {
-					if strings.EqualFold(fields[1], target) {
-						target = fields[2]
-						break
-					}
-				}
-			}
+		if ip, exists := leases[strings.ToLower(target)]; exists {
+			target = ip
 		}
 	}
 
@@ -162,7 +171,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		bootstrapServer = "77.88.8.8"
 	}
 
-	// 1. Поиск и валидация локальных пользовательских SRS правил
 	type localSRS struct {
 		tag  string
 		path string
@@ -220,7 +228,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		allRuleSets = append(allRuleSets, rs)
 	}
 
-	// Объединяем системные и пользовательские SRS для FakeIP DNS
 	dnsRuleSetList := append([]string(nil), allRuleSets...)
 	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
 
@@ -431,6 +438,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
+	leasesMap := loadDHCPLeasesMap()
+
 	var directClients []string
 	var fullProxyClients []string
 
@@ -438,7 +447,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		if !cp.Enabled || cp.Target == "" {
 			continue
 		}
-		cidr := resolveTargetToCIDR(cp.Target)
+		cidr := resolveTargetToCIDRWithLeases(cp.Target, leasesMap)
 		if cidr == "" {
 			continue
 		}
@@ -606,7 +615,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Системные списки
 			if len(defaultRuleSets) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
@@ -616,7 +624,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				})
 			}
 
-			// Пользовательские SRS
 			if len(customSRSTags) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":   "route",
@@ -634,7 +641,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// 8. Локальные RuleSets (предзагрузка выбранных категорий в /tmp)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
@@ -683,7 +689,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"default_mark":            2097152,
 	}
 
-	data, err := json.MarshalIndent(sbConfig, "", "  ")
+	// Экономия памяти и CPU роутера
+	data, err := json.Marshal(sbConfig)
 	if err != nil {
 		return fmt.Errorf("marshal sing-box config: %w", err)
 	}
@@ -692,7 +699,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		return err
 	}
 
-	// Атомарная запись
 	tmpPath := outputPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err

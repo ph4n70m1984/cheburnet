@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,7 +23,8 @@ import (
 )
 
 const (
-	SingBoxBinPath = "/usr/bin/sing-box"
+	SingBoxBinPath   = "/usr/bin/sing-box"
+	maxDownloadBytes = 50 * 1024 * 1024 // 50 МБ жесткий лимит для защиты RAM /tmp
 )
 
 var sha256Regex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
@@ -69,9 +71,12 @@ func NewManager(repo, currentVer string) *Manager {
 	}
 }
 
-// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df
+// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df с жестким таймаутом
 func checkFreeSpaceBytes(path string) (uint64, error) {
-	out, err := exec.Command("df", "-k", path).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "df", "-k", path).Output()
 	if err != nil {
 		if runtime.GOOS != "linux" {
 			return 1024 * 1024 * 1024, nil
@@ -123,6 +128,9 @@ func detectPackageManager() string {
 }
 
 func detectTargetArch(pkgMgr string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	if pkgMgr == "apk" {
 		if archBytes, err := os.ReadFile("/etc/apk/arch"); err == nil {
 			firstLine := strings.TrimSpace(strings.Split(string(archBytes), "\n")[0])
@@ -131,7 +139,7 @@ func detectTargetArch(pkgMgr string) string {
 			}
 		}
 
-		out, err := exec.Command("apk", "--print-arch").Output()
+		out, err := exec.CommandContext(ctx, "apk", "--print-arch").Output()
 		if err == nil {
 			arch := strings.TrimSpace(string(out))
 			if arch != "" {
@@ -142,7 +150,7 @@ func detectTargetArch(pkgMgr string) string {
 			}
 		}
 	} else {
-		out, err := exec.Command("opkg", "print-architecture").Output()
+		out, err := exec.CommandContext(ctx, "opkg", "print-architecture").Output()
 		if err == nil {
 			var chosenArch string
 			lines := strings.Split(string(out), "\n")
@@ -282,7 +290,6 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 			}
 		}
 	} else {
-		// Для OPKG
 		cmd := exec.CommandContext(ctx, "opkg", "list-upgradable")
 		uOut, uErr := cmd.CombinedOutput()
 		if uErr == nil && strings.Contains(string(uOut), "sing-box") {
@@ -375,10 +382,11 @@ func replaceFileCrossDevice(src, dst string) error {
 		return err
 	}
 
+	// Атомарное перемещение с объединением ошибок
 	if err := os.Rename(tmpDstPath, dst); err != nil {
-		_ = os.Remove(dst)
+		rmErr := os.Remove(dst)
 		if errRetry := os.Rename(tmpDstPath, dst); errRetry != nil {
-			return fmt.Errorf("rename to target: %w", errRetry)
+			return fmt.Errorf("rename to target: %w", errors.Join(err, rmErr, errRetry))
 		}
 	}
 
@@ -699,9 +707,17 @@ func (m *Manager) downloadFile(ctx context.Context, url, targetPath string) erro
 	}
 	defer out.Close()
 
-	if _, err = io.Copy(out, resp.Body); err != nil {
+	// Защита от исчерпания RAM /tmp через io.LimitReader
+	limitedReader := io.LimitReader(resp.Body, maxDownloadBytes+1)
+	written, err := io.Copy(out, limitedReader)
+	if err != nil {
 		return fmt.Errorf("write payload to %s: %w", targetPath, err)
 	}
+	if written > maxDownloadBytes {
+		_ = os.Remove(targetPath)
+		return fmt.Errorf("размер файла превысил лимит %d МБ", maxDownloadBytes/(1024*1024))
+	}
+
 	return nil
 }
 

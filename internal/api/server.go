@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"log"
+	"net/http"
+	"net/url"
 	"os/exec"
 	"time"
 
@@ -22,15 +24,16 @@ import (
 type ActionCallback func(action string) error
 
 type Server struct {
-	app        *fiber.App
-	state      *config.StateManager
-	hub        *telemetry.Hub
-	subWorker  *subscription.Worker
-	updater    *updater.Manager
-	getEngine  func() engine.Engine
-	rulesCron  *network.RulesetCron
-	diagEngine *diagnostics.DiagnosticsEngine
-	onAction   ActionCallback
+	app         *fiber.App
+	state       *config.StateManager
+	hub         *telemetry.Hub
+	subWorker   *subscription.Worker
+	updater     *updater.Manager
+	getEngine   func() engine.Engine
+	rulesCron   *network.RulesetCron
+	diagEngine  *diagnostics.DiagnosticsEngine
+	onAction    ActionCallback
+	ipifyClient *http.Client
 }
 
 func NewServer(
@@ -54,6 +57,8 @@ func NewServer(
 		AllowHeaders: "Origin, Content-Type, Accept",
 	}))
 
+	proxyURL, _ := url.Parse("http://127.0.0.1:4534")
+
 	s := &Server{
 		app:        app,
 		state:      state,
@@ -64,6 +69,14 @@ func NewServer(
 		rulesCron:  rulesCron,
 		diagEngine: diagEngine,
 		onAction:   onAction,
+		ipifyClient: &http.Client{
+			Transport: &http.Transport{
+				Proxy:             http.ProxyURL(proxyURL),
+				DisableKeepAlives: true,
+				ForceAttemptHTTP2: false,
+			},
+			Timeout: 2 * time.Second,
+		},
 	}
 
 	s.setupRoutes()
@@ -103,7 +116,9 @@ func (s *Server) setupRoutes() {
 			}
 		} else {
 			if action == "reload_firewall" {
-				_ = exec.Command("fw4", "reload").Run()
+				fwCtx, fwCancel := context.WithTimeout(c.Context(), 10*time.Second)
+				defer fwCancel()
+				_ = exec.CommandContext(fwCtx, "fw4", "reload").Run()
 			}
 		}
 		return c.JSON(fiber.Map{"status": "ok"})
@@ -179,7 +194,9 @@ func (s *Server) setupRoutes() {
 
 					if tgt == "cheburnet" || tgt == "all" {
 						time.Sleep(1 * time.Second)
-						_ = exec.Command("/etc/init.d/cheburnet", "restart").Run()
+						restartCtx, restartCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						defer restartCancel()
+						_ = exec.CommandContext(restartCtx, "/etc/init.d/cheburnet", "restart").Run()
 					}
 				}(target)
 			}

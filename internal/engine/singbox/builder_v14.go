@@ -36,7 +36,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		bootstrapServer = "77.88.8.8"
 	}
 
-	// 1. Формирование параметров DNS серверов для Sing-Box 1.12 - 1.14+
 	var remoteDNSType string
 	var remoteDNSServer string
 	var remoteDNSPort uint16 = 53
@@ -103,7 +102,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 2. Обработка локальных пользовательских SRS
 	type localSRS struct {
 		tag  string
 		path string
@@ -125,7 +123,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 3. Списки сервисов и маршрутизация
 	isGlobal := cfg.RoutingMode == "global"
 
 	activeRuleSetsMap := make(map[string]bool)
@@ -154,7 +151,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	dnsRuleSetList := append([]string(nil), allRuleSets...)
 	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
 
-	// 4. Правила DNS
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -229,7 +225,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"independent_cache": true,
 	}
 
-	// 5. Experimental / Clash API
 	experimentalConfig := map[string]interface{}{
 		"cache_file": map[string]interface{}{
 			"enabled":      true,
@@ -284,7 +279,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"experimental": experimentalConfig,
 	}
 
-	// 6. Outbounds (узлы, группы, селекторы)
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -370,7 +364,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	sbConfig["outbounds"] = outbounds
 
-	// 7. Route Rules (сниффинг выполняется здесь)
 	routeRules := []map[string]interface{}{
 		{
 			"action":  "sniff",
@@ -382,6 +375,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
+	leasesMap := loadDHCPLeasesMap()
+
 	var directClients []string
 	var fullProxyClients []string
 
@@ -389,7 +384,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		if !cp.Enabled || cp.Target == "" {
 			continue
 		}
-		cidr := resolveTargetToCIDR(cp.Target)
+		cidr := resolveTargetToCIDRWithLeases(cp.Target, leasesMap)
 		if cidr == "" {
 			continue
 		}
@@ -583,7 +578,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"outbound": activeOutboundTag,
 	})
 
-	// 8. Локальные RuleSets (предзагрузка выбранных категорий в /tmp)
 	var ruleSetObjects []map[string]interface{}
 	if !isGlobal {
 		for _, rs := range allRuleSets {
@@ -632,16 +626,16 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"default_mark":            2097152,
 	}
 
-	data, err := json.MarshalIndent(sbConfig, "", "  ")
+	// Экономия памяти и CPU роутера
+	data, err := json.Marshal(sbConfig)
 	if err != nil {
-		return fmt.Errorf("marshal sing-box 1.13 config: %w", err)
+		return fmt.Errorf("marshal sing-box 1.14 config: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
 
-	// Атомарная запись конфига
 	tmpPath := outputPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err

@@ -22,6 +22,12 @@ import (
 
 const TargetConfigPath = "/tmp/run/cheburnet/sing-box.json"
 
+type DelayResult struct {
+	Delay   *int   `json:"delay"`
+	Status  string `json:"status,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
 // getRealActiveNode опрашивает sing-box Clash API для определения текущего активного аутбаунда
 func getRealActiveNode(defaultTag string) string {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
@@ -49,16 +55,18 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
 
 	outboundIP := "Офлайн"
-	proxyURL, _ := url.Parse("http://127.0.0.1:4534")
-	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
-		Timeout:   2 * time.Second,
-	}
-	if resp, err := client.Get("https://api.ipify.org"); err == nil {
-		if b, err := io.ReadAll(resp.Body); err == nil {
-			outboundIP = strings.TrimSpace(string(b))
+
+	reqCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://api.ipify.org", nil)
+	if err == nil {
+		if resp, err := s.ipifyClient.Do(req); err == nil {
+			if b, err := io.ReadAll(io.LimitReader(resp.Body, 64)); err == nil {
+				outboundIP = strings.TrimSpace(string(b))
+			}
+			_ = resp.Body.Close()
 		}
-		_ = resp.Body.Close()
 	}
 
 	activeNode := "auto"
@@ -91,7 +99,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 		Status   string `json:"status"`
 	}
 
-	// 1. Опрашиваем Clash API sing-box для получения последних замеров задержек
 	latencies := make(map[string]int)
 	bestLatency := 0
 
@@ -112,7 +119,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 				}
 			}
 
-			// Если группа auto уже выбрала сервер, берем его задержку
 			if autoGroup, ok := clashData.Proxies["auto"]; ok && autoGroup.Now != "" {
 				bestLatency = latencies[autoGroup.Now]
 			}
@@ -120,7 +126,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 		_ = resp.Body.Close()
 	}
 
-	// 2. Если auto еще опрашивается, выбираем минимальный положительный пинг среди узлов
 	if bestLatency == 0 {
 		minDelay := 999999
 		for _, d := range latencies {
@@ -135,7 +140,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 
 	var res []nodeView
 
-	// 3. Виртуальный пункт авто-выбора первым в списке
 	if len(cfg.Nodes) > 0 {
 		autoStatus := "● Доступен"
 		if bestLatency == 0 {
@@ -151,7 +155,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 		})
 	}
 
-	// 4. Физические серверы
 	for _, n := range cfg.Nodes {
 		d := latencies[n.Tag]
 		status := "● Доступен"
@@ -373,9 +376,14 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 	})
 }
 
-// handleReloadConfig считывает актуальный UCI-файл и обновляет ноды
+// handleReloadConfig считывает актуальный UCI-файл и обновляет ноды с таймаутом выполнения
 func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
-	_ = exec.Command("uci", "commit", "cheburnet").Run()
+	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := exec.CommandContext(ctx, "uci", "commit", "cheburnet").Run(); err != nil {
+		log.Printf("[WARN] uci commit returned error: %v", err)
+	}
 
 	uciStorage := config.NewUCIStorage()
 	newCfg, err := uciStorage.Load()
@@ -462,7 +470,9 @@ func (s *Server) handlePerformUpdate(c *fiber.Ctx) error {
 		if body.Target == "cheburnet" || body.Target == "all" {
 			log.Println("[INFO] Package upgrade completed. Restarting service via init script...")
 			time.Sleep(1 * time.Second)
-			_ = exec.Command("/etc/init.d/cheburnet", "restart").Run()
+			restartCtx, restartCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer restartCancel()
+			_ = exec.CommandContext(restartCtx, "/etc/init.d/cheburnet", "restart").Run()
 		}
 	}()
 
@@ -479,11 +489,9 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 	testURL := c.Query("url", "https://www.gstatic.com/generate_204")
 	timeout := c.Query("timeout", "3000")
 
-	// Если запрошен замер для группы авто-выбора
 	if strings.EqualFold(name, "auto") {
 		client := &http.Client{Timeout: 1 * time.Second}
 
-		// 1. Узнаем, какую ноду urltest сейчас считает лучшей
 		resp, err := client.Get("http://127.0.0.1:9090/proxies/auto")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var groupData struct {
@@ -492,13 +500,12 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 			if err := json.NewDecoder(resp.Body).Decode(&groupData); err == nil && groupData.Now != "" {
 				_ = resp.Body.Close()
 
-				// 2. Делаем замер именно для этой ноды
 				escapedTarget := url.PathEscape(groupData.Now)
 				targetDelayURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeout)
 
 				if dResp, dErr := client.Get(targetDelayURL); dErr == nil {
 					defer dResp.Body.Close()
-					var res map[string]interface{}
+					var res DelayResult
 					if err := json.NewDecoder(dResp.Body).Decode(&res); err == nil {
 						return c.JSON(res)
 					}
@@ -508,22 +515,27 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 			}
 		}
 
-		// Fallback: если sing-box еще опрашивает сеть, возвращаем средний доступный пинг
-		return c.JSON(fiber.Map{"delay": 145})
+		return c.JSON(DelayResult{
+			Delay:  nil,
+			Status: "unknown",
+		})
 	}
 
-	// Для всех остальных нод проксируем вызов напрямую в sing-box Clash API
 	escapedName := url.PathEscape(name)
 	targetURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeout)
 
 	client := &http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Get(targetURL)
 	if err != nil {
-		return c.Status(fiber.StatusGatewayTimeout).JSON(fiber.Map{"message": "timeout"})
+		return c.Status(fiber.StatusGatewayTimeout).JSON(DelayResult{
+			Delay:   nil,
+			Status:  "timeout",
+			Message: "timeout",
+		})
 	}
 	defer resp.Body.Close()
 
-	var result map[string]interface{}
+	var result DelayResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return c.Status(resp.StatusCode).SendString("error reading response")
 	}

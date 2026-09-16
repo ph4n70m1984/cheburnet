@@ -4,6 +4,7 @@
 'require uci';
 'require ui';
 'require network';
+'require fs';
 'require tools.widgets as widgets';
 
 'require view.cheburnet.modules.constants as constants';
@@ -23,14 +24,13 @@ return view.extend({
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
-        // Внедрение универсальной дизайн-системы
+        // Внедрение универсальной дизайн-системы и стилей кнопок управления
         var styleId = 'cheburnet-theme-vars';
         if (!document.getElementById(styleId)) {
             var css = document.createElement('style');
             css.id = styleId;
             css.textContent = `
                 :root {
-                    /* Светлая тема (базовая палитра для светлого LuCI) */
                     --cb-bg-card: #ffffff;
                     --cb-bg-surface: #f8fafc;
                     --cb-border: #cbd5e1;
@@ -59,7 +59,6 @@ return view.extend({
                     --cb-table-hover: rgba(0, 0, 0, 0.04);
                 }
 
-                /* Тёмная тема активируется ТОЛЬКО если у html/body реально включён тёмный класс темы LuCI */
                 html[data-darkmode="true"],
                 html[data-theme="dark"],
                 html[data-bs-theme="dark"],
@@ -94,7 +93,68 @@ return view.extend({
                     --cb-table-hover: rgba(255, 255, 255, 0.05) !important;
                 }
 
-                /* Стили раскрывающихся панелей (details / summary) */
+                .cb-control-panel {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    margin: 15px 0;
+                    padding: 12px 16px;
+                    border: 1px solid var(--cb-border);
+                    border-radius: 8px;
+                    background: var(--cb-bg-card);
+                    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+                    flex-wrap: wrap;
+                }
+                .cb-control-title {
+                    font-weight: bold;
+                    margin-right: auto;
+                    color: var(--cb-text-main);
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                .cb-btn {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    padding: 6px 14px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                    border: 1px solid transparent;
+                    text-decoration: none;
+                }
+                .cb-btn-start {
+                    background: var(--cb-ok-bg);
+                    color: var(--cb-ok-text);
+                    border-color: var(--cb-ok-border);
+                }
+                .cb-btn-start:hover {
+                    background: #dcfce7;
+                    transform: translateY(-1px);
+                }
+                .cb-btn-stop {
+                    background: var(--cb-err-bg);
+                    color: var(--cb-err-text);
+                    border-color: var(--cb-err-border);
+                }
+                .cb-btn-stop:hover {
+                    background: #fee2e2;
+                    transform: translateY(-1px);
+                }
+                .cb-btn-restart {
+                    background: var(--cb-badge-bg);
+                    color: var(--cb-text-accent);
+                    border-color: var(--cb-badge-border);
+                }
+                .cb-btn-restart:hover {
+                    background: var(--cb-card-active-bg);
+                    border-color: var(--cb-card-active-border);
+                    transform: translateY(-1px);
+                }
+
                 .cb-details {
                     border: 1px solid var(--cb-border) !important;
                     border-radius: 8px !important;
@@ -108,8 +168,6 @@ return view.extend({
                     cursor: pointer;
                     user-select: none;
                 }
-
-                /* Исправление вкладок табов внутри аккордеона */
                 .cb-details .cbi-tabmenu {
                     border-bottom: 1px solid var(--cb-border) !important;
                     margin-bottom: 15px !important;
@@ -122,8 +180,6 @@ return view.extend({
                     font-weight: bold !important;
                     border-bottom: 2px solid var(--cb-text-accent) !important;
                 }
-
-                /* Исправление фонов и текста для контролов ввода в светлой теме */
                 .cb-details input[type="text"],
                 .cb-details input[type="password"],
                 .cb-details select,
@@ -134,14 +190,11 @@ return view.extend({
                     color: var(--cb-text-main) !important;
                     border-radius: 4px !important;
                 }
-
                 .cb-details .cbi-dynlist > .item {
                     background: var(--cb-badge-bg) !important;
                     border: 1px solid var(--cb-badge-border) !important;
                     color: var(--cb-text-main) !important;
                 }
-
-                /* Таблица списка серверов */
                 #chebur-nodes-table {
                     background: var(--cb-bg-card) !important;
                     color: var(--cb-text-main) !important;
@@ -168,6 +221,28 @@ return view.extend({
             `;
             document.head.appendChild(css);
         }
+
+        window.cheburManageService = function(action) {
+            var labels = {
+                'start': _('Запуск службы...'),
+                'stop': _('Остановка службы...'),
+                'restart': _('Перезапуск службы...')
+            };
+
+            ui.showIndicator('chebur-service-mgr', labels[action] || _('Выполнение...'));
+
+            fs.exec('/etc/init.d/cheburnet', [action])
+                .then(function(res) {
+                    setTimeout(function() {
+                        ui.hideIndicator('chebur-service-mgr');
+                        window.location.reload();
+                    }, 1200);
+                })
+                .catch(function(err) {
+                    ui.hideIndicator('chebur-service-mgr');
+                    ui.addNotification(null, E('p', {}, _('Ошибка управления службой: ') + err.message), 'error');
+                });
+        };
 
         window.cheburCheckUpdates = function(e) {
             e.preventDefault();
@@ -235,10 +310,34 @@ return view.extend({
             });
         };
 
+        // --- СЕКЦИЯ СОСТОЯНИЯ И КНОПКИ УПРАВЛЕНИЯ ДЕМОНОМ ---
         var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
         statusSec.render = function() {
-            return telemetryModule.createTelemetrySection(nodesModule);
+            var controlPanel = E('div', { 'class': 'cb-control-panel' }, [
+                E('div', { 'class': 'cb-control-title' }, [
+                    E('span', { 'style': 'font-size: 16px;' }, '⚙'),
+                    E('span', {}, _('Управление демоном Chebur.NET:'))
+                ]),
+                E('button', {
+                    'class': 'cb-btn cb-btn-start',
+                    'type': 'button',
+                    'click': function() { window.cheburManageService('start'); }
+                }, [ E('span', {}, '▶'), _('Запустить') ]),
+                E('button', {
+                    'class': 'cb-btn cb-btn-stop',
+                    'type': 'button',
+                    'click': function() { window.cheburManageService('stop'); }
+                }, [ E('span', {}, '■'), _('Остановить') ]),
+                E('button', {
+                    'class': 'cb-btn cb-btn-restart',
+                    'type': 'button',
+                    'click': function() { window.cheburManageService('restart'); }
+                }, [ E('span', {}, '⟳'), _('Перезапустить') ])
+            ]);
+
+            var telemetryNode = telemetryModule.createTelemetrySection(nodesModule);
+            return E('div', {}, [ controlPanel, telemetryNode ]);
         };
 
         var s = m.section(form.NamedSection, 'main', 'cheburnet');
@@ -338,7 +437,6 @@ return view.extend({
         o.value('168h', _('1 неделя'));
         o.default = '72h';
 
-        // Пользовательские SRS списки правил
         o = s.taboption('routing_rules', form.DynamicList, 'custom_srs_rulesets', _('Пользовательские SRS списки (Sing-box)'));
         o.description = _('Формат ввода: <code>Имя|URL|[direct|proxy]</code> (например: <code>antizapret|https://example.com/rule.srs|direct</code>). Загружаются демоном с валидацией и резервированием.');
         o.placeholder = 'my_list|https://example.com/rule.srs|direct';
@@ -416,8 +514,16 @@ return view.extend({
         o = subSec.option(form.DynamicList, 'exclude_regex', _('Регулярные выражения (RegExp)'));
         o.modalonly = true;
 
-        o = subSec.option(form.Value, 'user_agent', _('User-Agent'));
-        o.default = 'Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)';
+        // Выпадающий список User-Agent
+        o = subSec.option(form.ListValue, 'user_agent', _('User-Agent'));
+        o.value('Happ/4.2.0 (iPhone; iOS 18.0; Scale/3.00)', 'Happ 4.2.0 (iOS)');
+        o.value('Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)', 'Happ 4.1.3 (iOS)');
+        o.value('v2rayNG/1.8.12', 'v2rayNG (Android)');
+        o.value('ClashforWindows/0.20.39', 'Clash / Mihomo');
+        o.value('sing-box', 'Sing-Box');
+        o.value('Shadowrocket/2.2.35', 'Shadowrocket');
+        o.value('curl/8.19.0', 'curl / Generic');
+        o.default = 'Happ/4.2.0 (iPhone; iOS 18.0; Scale/3.00)';
         o.modalonly = true;
 
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
