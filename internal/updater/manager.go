@@ -292,13 +292,13 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 		cmd := exec.CommandContext(ctx, "opkg", "list-upgradable")
 		uOut, uErr := cmd.CombinedOutput()
 		if uErr == nil && strings.Contains(string(uOut), "sing-box") {
-			st.HasUpdate = true
 			lines := strings.Split(strings.TrimSpace(string(uOut)), "\n")
 			for _, line := range lines {
 				if strings.HasPrefix(line, "sing-box -") {
 					parts := strings.Split(line, " - ")
 					if len(parts) >= 3 {
 						st.Latest = parts[2]
+						st.HasUpdate = isNewerVersion(st.Latest, st.Current)
 					}
 					break
 				}
@@ -314,6 +314,16 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 }
 
 func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
+	// Предварительная проверка свободного места перед вызовом пакетного менеджера (нужно ~42-45 МБ)
+	const minRequiredOverlayBytes = 45 * 1024 * 1024
+	destCheck := "/overlay"
+	if _, err := os.Stat(destCheck); err != nil {
+		destCheck = "/"
+	}
+	if err := ensureSpace(destCheck, minRequiredOverlayBytes, "установки sing-box в системный раздел"); err != nil {
+		return fmt.Errorf("отмена обновления sing-box: %w", err)
+	}
+
 	log.Printf("[INFO] Обновление sing-box с помощью пакетного менеджера %s...", m.pkgManager)
 
 	var cmd *exec.Cmd
@@ -338,7 +348,6 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return m.UpgradeSingBoxCore(ctx)
 }
 
-// fetchLatestGitHubRelease ищет только официальные системные пакеты (.ipk или .apk)
 func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -484,7 +493,6 @@ func (m *Manager) verifyFileSHA256(filePath, expectedHash string) error {
 	return nil
 }
 
-// UpgradePackage обновляет пакет демона строго через системный пакетный менеджер (apk / opkg)
 func (m *Manager) UpgradePackage(ctx context.Context) error {
 	const minPkgTmpSpace = 15 * 1024 * 1024
 	const minOverlaySpace = 10 * 1024 * 1024
@@ -632,12 +640,30 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	case "cheburnet":
 		return m.UpgradePackage(ctx)
 	case "all":
-		if err := m.UpgradeSingBoxCore(ctx); err != nil {
-			return fmt.Errorf("ошибка обновления ядра sing-box: %w", err)
+		// Проверяем реальный статус каждого компонента перед запуском
+		report, err := m.CheckUpdates(ctx, false)
+		if err != nil {
+			return fmt.Errorf("ошибка проверки статуса перед обновлением: %w", err)
 		}
-		if err := m.UpgradePackage(ctx); err != nil {
-			return fmt.Errorf("ошибка обновления cheburnet: %w", err)
+
+		// Обновляем sing-box ТОЛЬКО если для него реально есть апдейт
+		if report.SingBox.HasUpdate {
+			if err := m.UpgradeSingBoxCore(ctx); err != nil {
+				return fmt.Errorf("ошибка обновления ядра sing-box: %w", err)
+			}
+		} else {
+			log.Printf("[INFO] sing-box уже актуален (%s), пропускаем обновление", report.SingBox.Current)
 		}
+
+		// Обновляем пакет Chebur.NET ТОЛЬКО если для него реально есть апдейт
+		if report.CheburNet.HasUpdate {
+			if err := m.UpgradePackage(ctx); err != nil {
+				return fmt.Errorf("ошибка обновления cheburnet: %w", err)
+			}
+		} else {
+			log.Printf("[INFO] Chebur.NET уже актуален (%s), пропускаем обновление", report.CheburNet.Current)
+		}
+
 		return nil
 	default:
 		return fmt.Errorf("неизвестная цель обновления: %s", target)
