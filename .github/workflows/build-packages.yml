@@ -69,15 +69,26 @@ jobs:
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx
 
-      - name: Extract Version
+      - name: Extract Version and Build Flags
         id: vars
         run: |
+          BUILD_TAGS=""
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
+            if echo "$VERSION" | grep -Eiq 'beta|rc|alpha|dev'; then
+              BUILD_TAGS="-tags metrics"
+              echo "[+] Pre-release tag detected ($VERSION): enabling '-tags metrics'"
+            else
+              echo "[+] Stable release tag detected ($VERSION): standard build (no metrics)"
+            fi
           else
             VERSION="0.0.1-$(git rev-parse --short HEAD)"
+            BUILD_TAGS="-tags metrics"
+            echo "[+] Non-tag build ($VERSION): enabling '-tags metrics'"
           fi
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "go_tags=${BUILD_TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Compile cheburnetd
         env:
@@ -87,7 +98,8 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
         run: |
-          go build -ldflags="-s -w -X main.CheburVersion=${{ steps.vars.outputs.version }}" \
+          go build ${{ steps.vars.outputs.go_tags }} \
+                   -ldflags="-s -w -X main.CheburVersion=${{ steps.vars.outputs.version }}" \
                    -trimpath \
                    -o bin/cheburnetd ./cmd/cheburnetd
 
@@ -294,7 +306,6 @@ jobs:
 
           APK_FILE="luci-app-cheburnet-${CLEAN_VER}.${{ matrix.apk_arch }}.apk"
 
-          # Сборка пакета без директивы provides (устраняет ошибку self-conflict)
           apk --root "$APK_ROOT_DIR" mkpkg \
               --info "name:luci-app-cheburnet" \
               --info "version:${CLEAN_VER}" \
@@ -341,7 +352,7 @@ jobs:
         id: prerelease_check
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-          if echo "$TAG_NAME" | grep -Ei 'beta|rc|dev|alpha'; then
+          if echo "$TAG_NAME" | grep -Eiq 'beta|rc|dev|alpha'; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
             echo "[+] Tag $TAG_NAME identified as Pre-Release"
           else
