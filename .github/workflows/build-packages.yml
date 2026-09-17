@@ -337,8 +337,21 @@ jobs:
           rm -f sha256sums.txt
           sha256sum * > sha256sums.txt
 
+      - name: Check if Tag is Beta/Prerelease
+        id: prerelease_check
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          if echo "$TAG_NAME" | grep -Ei 'beta|rc|dev|alpha'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "[+] Tag $TAG_NAME identified as Pre-Release"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "[+] Tag $TAG_NAME identified as Stable Release"
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
+          prerelease: ${{ steps.prerelease_check.outputs.is_prerelease == 'true' }}
           generate_release_notes: true

@@ -89,6 +89,7 @@ type App struct {
 	healthTracker *engine.HealthTracker
 	diagEngine    *diagnostics.DiagnosticsEngine
 	rulesMgr      *ruleset.Manager
+	updManager    *updater.Manager
 	mu            sync.RWMutex
 	engineOpMu    sync.Mutex
 }
@@ -390,6 +391,9 @@ func runDaemon() {
 	if initialConfig.RulesetUpdateInterval == "" {
 		initialConfig.RulesetUpdateInterval = "72h"
 	}
+	if initialConfig.UpdateChannel == "" {
+		initialConfig.UpdateChannel = "release"
+	}
 
 	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID)
 
@@ -451,7 +455,8 @@ func runDaemon() {
 	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
 	hub.SetDiagnosticsEngine(diagEngine)
 
-	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion)
+	// Инициализируем менеджер обновлений с передачей канала (release / beta)
+	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel)
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
 	if len(initialConfig.CustomSRSRulesets) > 0 {
@@ -480,6 +485,7 @@ func runDaemon() {
 		healthTracker: healthTracker,
 		diagEngine:    diagEngine,
 		rulesMgr:      rulesMgr,
+		updManager:    updManager,
 	}
 
 	sourceIface := initialConfig.SourceIface
@@ -634,6 +640,11 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	if eng == nil {
 		return fmt.Errorf("no active engine")
+	}
+
+	// Динамически синхронизируем канал обновлений при перезагрузке конфига
+	if a.updManager != nil && cfg.UpdateChannel != "" {
+		a.updManager.SetUpdateChannel(cfg.UpdateChannel)
 	}
 
 	if a.rulesMgr != nil && len(cfg.CustomSRSRulesets) > 0 {

@@ -484,8 +484,14 @@ return view.extend({
                 '</div>' +
             '</div>';
 
+        o = s.taboption('updates', form.ListValue, 'update_channel', _('Канал обновлений'));
+        o.value('release', _('Стабильный (Release)'));
+        o.value('beta', _('Бета-версии (Beta / Pre-release)'));
+        o.default = 'release';
+        o.description = _('На стабильном канале приходят только проверенные версии. В бета-канале доступны самые свежие функции.');
+
         o = s.taboption('updates', form.Flag, 'auto_update', _('Автоматическое обновление'));
-        o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg.');
+        o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg/apk.');
         o.default = '0';
 
         // --- ВНЕШНИЕ АККОРДЕОНЫ ---

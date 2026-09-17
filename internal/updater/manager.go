@@ -23,7 +23,7 @@ import (
 
 const (
 	SingBoxBinPath   = "/usr/bin/sing-box"
-	maxDownloadBytes = 50 * 1024 * 1024 // 50 МБ жесткий лимит для защиты RAM /tmp
+	maxDownloadBytes = 50 * 1024 * 1024 // 50 МБ лимит для защиты RAM /tmp
 )
 
 var sha256Regex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
@@ -36,10 +36,11 @@ type ComponentStatus struct {
 }
 
 type UpdateReport struct {
-	CheburNet  ComponentStatus `json:"cheburnet"`
-	SingBox    ComponentStatus `json:"sing_box"`
-	AutoUpdate bool            `json:"auto_update"`
-	PkgManager string          `json:"pkg_manager"`
+	CheburNet     ComponentStatus `json:"cheburnet"`
+	SingBox       ComponentStatus `json:"sing_box"`
+	AutoUpdate    bool            `json:"auto_update"`
+	UpdateChannel string          `json:"update_channel"`
+	PkgManager    string          `json:"pkg_manager"`
 }
 
 type releaseAsset struct {
@@ -47,30 +48,59 @@ type releaseAsset struct {
 	URL  string
 }
 
-type Manager struct {
-	mu          sync.Mutex
-	githubRepo  string
-	currentVer  string
-	httpClient  *http.Client
-	isUpgrading bool
-	pkgManager  string
-	targetArch  string
+type githubReleaseItem struct {
+	TagName    string `json:"tag_name"`
+	Prerelease bool   `json:"prerelease"`
+	Assets     []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
 }
 
-func NewManager(repo, currentVer string) *Manager {
+type Manager struct {
+	mu            sync.Mutex
+	githubRepo    string
+	currentVer    string
+	updateChannel string // "release" или "beta"
+	httpClient    *http.Client
+	isUpgrading   bool
+	pkgManager    string
+	targetArch    string
+}
+
+func NewManager(repo, currentVer, channel string) *Manager {
+	if channel == "" {
+		channel = "release"
+	}
 	pkgMgr := detectPackageManager()
 	arch := detectTargetArch(pkgMgr)
 
 	return &Manager{
-		githubRepo: repo,
-		currentVer: currentVer,
-		httpClient: &http.Client{Timeout: 120 * time.Second},
-		pkgManager: pkgMgr,
-		targetArch: arch,
+		githubRepo:    repo,
+		currentVer:    currentVer,
+		updateChannel: strings.ToLower(channel),
+		httpClient:    &http.Client{Timeout: 120 * time.Second},
+		pkgManager:    pkgMgr,
+		targetArch:    arch,
 	}
 }
 
-// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df с жестким таймаутом
+func (m *Manager) SetUpdateChannel(channel string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if channel == "" {
+		channel = "release"
+	}
+	m.updateChannel = strings.ToLower(channel)
+}
+
+func (m *Manager) GetUpdateChannel() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updateChannel
+}
+
+// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df с таймаутом
 func checkFreeSpaceBytes(path string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -181,33 +211,82 @@ func detectTargetArch(pkgMgr string) string {
 	}
 }
 
-func parseSemVer(v string) []int {
+// semVerParts хранит числовые компоненты и пре-релизный ранг (0 = релиз, -1 = pre/beta)
+type semVerParts struct {
+	major      int
+	minor      int
+	patch      int
+	build      int
+	isPre      bool
+	preRelease int
+}
+
+func parseSemVerExtended(v string) semVerParts {
 	v = strings.TrimPrefix(v, "v")
+	res := semVerParts{}
+
+	var preStr string
 	if idx := strings.Index(v, "-"); idx != -1 {
+		preStr = strings.ToLower(v[idx+1:])
 		v = v[:idx]
+		res.isPre = true
+	} else if strings.Contains(strings.ToLower(v), "_p") {
+		// Обозначение патча в apk (1.2.3_p4)
+		v = strings.ReplaceAll(v, "_p", ".")
 	}
-	v = strings.ReplaceAll(v, "_p", ".")
+
 	parts := strings.Split(v, ".")
-	res := make([]int, 4)
-	for i := 0; i < len(parts) && i < 4; i++ {
-		val, _ := strconv.Atoi(parts[i])
-		res[i] = val
+	if len(parts) > 0 {
+		res.major, _ = strconv.Atoi(parts[0])
 	}
+	if len(parts) > 1 {
+		res.minor, _ = strconv.Atoi(parts[1])
+	}
+	if len(parts) > 2 {
+		res.patch, _ = strconv.Atoi(parts[2])
+	}
+	if len(parts) > 3 {
+		res.build, _ = strconv.Atoi(parts[3])
+	}
+
+	if res.isPre && preStr != "" {
+		re := regexp.MustCompile(`\d+`)
+		if num := re.FindString(preStr); num != "" {
+			res.preRelease, _ = strconv.Atoi(num)
+		}
+	}
+
 	return res
 }
 
 func isNewerVersion(remote, current string) bool {
-	r := parseSemVer(remote)
-	c := parseSemVer(current)
+	r := parseSemVerExtended(remote)
+	c := parseSemVerExtended(current)
 
-	for i := 0; i < len(r); i++ {
-		if r[i] > c[i] {
-			return true
-		}
-		if r[i] < c[i] {
-			return false
-		}
+	if r.major != c.major {
+		return r.major > c.major
 	}
+	if r.minor != c.minor {
+		return r.minor > c.minor
+	}
+	if r.patch != c.patch {
+		return r.patch > c.patch
+	}
+	if r.build != c.build {
+		return r.build > c.build
+	}
+
+	// Если основные числа равны: релиз (isPre=false) новее, чем бета (isPre=true)
+	if !r.isPre && c.isPre {
+		return true // 0.0.10 новее 0.0.10-beta
+	}
+	if r.isPre && !c.isPre {
+		return false // 0.0.10-beta старее стабильного 0.0.10
+	}
+	if r.isPre && c.isPre {
+		return r.preRelease > c.preRelease // beta.2 новее beta.1
+	}
+
 	return false
 }
 
@@ -222,7 +301,7 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 		Installed: true,
 	}
 
-	latestTag, _, _, err := m.fetchLatestGitHubRelease(ctx)
+	latestTag, _, _, err := m.fetchGitHubReleaseByChannel(ctx)
 	if err == nil {
 		cleanLatest := strings.TrimPrefix(latestTag, "v")
 		chStatus.Latest = cleanLatest
@@ -230,10 +309,11 @@ func (m *Manager) CheckUpdates(ctx context.Context, autoUpdate bool) (*UpdateRep
 	}
 
 	report := &UpdateReport{
-		CheburNet:  chStatus,
-		SingBox:    sbStatus,
-		AutoUpdate: autoUpdate,
-		PkgManager: m.pkgManager,
+		CheburNet:     chStatus,
+		SingBox:       sbStatus,
+		AutoUpdate:    autoUpdate,
+		UpdateChannel: m.updateChannel,
+		PkgManager:    m.pkgManager,
 	}
 
 	return report, nil
@@ -255,7 +335,6 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 
 	st.Installed = true
 
-	// Проверяем текущую версию через сам бинарник
 	out, err := exec.CommandContext(ctx, binPath, "version").CombinedOutput()
 	if err == nil && len(out) > 0 {
 		re := regexp.MustCompile(`version\s+([^\s\n]+)`)
@@ -269,7 +348,6 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 		st.Current = "unknown"
 	}
 
-	// Проверка наличия более новой версии в репозитории через пакетный менеджер
 	if m.pkgManager == "apk" {
 		cmd := exec.CommandContext(ctx, "apk", "version", "sing-box")
 		vOut, vErr := cmd.CombinedOutput()
@@ -314,7 +392,6 @@ func (m *Manager) checkSingBoxPkgStatus(ctx context.Context) ComponentStatus {
 }
 
 func (m *Manager) UpgradeSingBoxCore(ctx context.Context) error {
-	// Предварительная проверка свободного места перед вызовом пакетного менеджера (нужно ~42-45 МБ)
 	const minRequiredOverlayBytes = 45 * 1024 * 1024
 	destCheck := "/overlay"
 	if _, err := os.Stat(destCheck); err != nil {
@@ -348,8 +425,9 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return m.UpgradeSingBoxCore(ctx)
 }
 
-func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", m.githubRepo)
+// fetchGitHubReleaseByChannel ищет релиз с учетом текущего канала (release или beta)
+func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", releaseAsset{}, "", fmt.Errorf("create release request: %w", err)
@@ -367,18 +445,41 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 		return "", releaseAsset{}, "", fmt.Errorf("github api returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 
-	var rel struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name               string `json:"name"`
-			BrowserDownloadURL string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", releaseAsset{}, "", fmt.Errorf("decode github release response: %w", err)
+	var releases []githubReleaseItem
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+		return "", releaseAsset{}, "", fmt.Errorf("decode github releases: %w", err)
 	}
 
-	tag = strings.TrimPrefix(rel.TagName, "v")
+	if len(releases) == 0 {
+		return "", releaseAsset{}, "", fmt.Errorf("в репозитории нет доступных релизов")
+	}
+
+	var targetRelease *githubReleaseItem
+
+	for i := range releases {
+		rel := &releases[i]
+		tagNameLower := strings.ToLower(rel.TagName)
+
+		if m.updateChannel == "release" {
+			// На стабильном канале отсекаем prerelease и теги с beta/rc/dev
+			if rel.Prerelease || strings.Contains(tagNameLower, "beta") ||
+				strings.Contains(tagNameLower, "rc") || strings.Contains(tagNameLower, "dev") {
+				continue
+			}
+			targetRelease = rel
+			break
+		} else {
+			// На канале beta берем первый же (самый свежий) релиз в хронологии
+			targetRelease = rel
+			break
+		}
+	}
+
+	if targetRelease == nil {
+		return "", releaseAsset{}, "", fmt.Errorf("подходящих релизов для канала %s не найдено", m.updateChannel)
+	}
+
+	tag = strings.TrimPrefix(targetRelease.TagName, "v")
 
 	targetExt := ".ipk"
 	if m.pkgManager == "apk" {
@@ -386,11 +487,10 @@ func (m *Manager) fetchLatestGitHubRelease(ctx context.Context) (tag string, pkg
 	}
 
 	targetArchLower := strings.ToLower(m.targetArch)
-
 	var bestPkgAsset releaseAsset
 	var fallbackPkgAsset releaseAsset
 
-	for _, a := range rel.Assets {
+	for _, a := range targetRelease.Assets {
 		name := strings.ToLower(a.Name)
 		if strings.Contains(name, "sha256") || strings.Contains(name, "checksum") {
 			checksumsURL = a.BrowserDownloadURL
@@ -509,7 +609,7 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		return err
 	}
 
-	tag, pkgAsset, checksumsURL, err := m.fetchLatestGitHubRelease(ctx)
+	tag, pkgAsset, checksumsURL, err := m.fetchGitHubReleaseByChannel(ctx)
 	if err != nil {
 		return fmt.Errorf("сбой поиска релиза: %w", err)
 	}
@@ -544,7 +644,7 @@ func (m *Manager) UpgradePackage(ctx context.Context) error {
 		}
 	}
 
-	log.Printf("[INFO] Загрузка %s пакета: %s", m.pkgManager, pkgAsset.URL)
+	log.Printf("[INFO] Загрузка %s пакета: %s (канал: %s)", m.pkgManager, pkgAsset.URL, m.updateChannel)
 	tmpFile := filepath.Join("/tmp", pkgAsset.Name)
 	defer os.Remove(tmpFile)
 
@@ -640,28 +740,25 @@ func (m *Manager) PerformUpgrade(ctx context.Context, target string) error {
 	case "cheburnet":
 		return m.UpgradePackage(ctx)
 	case "all":
-		// Проверяем реальный статус каждого компонента перед запуском
 		report, err := m.CheckUpdates(ctx, false)
 		if err != nil {
 			return fmt.Errorf("ошибка проверки статуса перед обновлением: %w", err)
 		}
 
-		// Обновляем sing-box ТОЛЬКО если для него реально есть апдейт
 		if report.SingBox.HasUpdate {
 			if err := m.UpgradeSingBoxCore(ctx); err != nil {
 				return fmt.Errorf("ошибка обновления ядра sing-box: %w", err)
 			}
 		} else {
-			log.Printf("[INFO] sing-box уже актуален (%s), пропускаем обновление", report.SingBox.Current)
+			log.Printf("[INFO] sing-box уже актуален (%s), пропускаем", report.SingBox.Current)
 		}
 
-		// Обновляем пакет Chebur.NET ТОЛЬКО если для него реально есть апдейт
 		if report.CheburNet.HasUpdate {
 			if err := m.UpgradePackage(ctx); err != nil {
 				return fmt.Errorf("ошибка обновления cheburnet: %w", err)
 			}
 		} else {
-			log.Printf("[INFO] Chebur.NET уже актуален (%s), пропускаем обновление", report.CheburNet.Current)
+			log.Printf("[INFO] Chebur.NET уже актуален (%s) в канале %s, пропускаем", report.CheburNet.Current, m.updateChannel)
 		}
 
 		return nil
@@ -703,8 +800,8 @@ func (m *Manager) StartAutoUpdateLoop(ctx context.Context, isAutoUpdateEnabled f
 				return
 			}
 
-			log.Printf("[updater] Инициализация автообновления: CheburNet=%v, SingBox=%v",
-				report.CheburNet.HasUpdate, report.SingBox.HasUpdate)
+			log.Printf("[updater] Найдено обновление (Канал: %s): CheburNet=%v, SingBox=%v",
+				m.updateChannel, report.CheburNet.HasUpdate, report.SingBox.HasUpdate)
 
 			upgCtx, upgCancel := context.WithTimeout(ctx, 5*time.Minute)
 			defer upgCancel()

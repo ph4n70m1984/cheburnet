@@ -3,6 +3,17 @@
 'require ui';
 
 return baseclass.extend({
+    getChannelBadge: function(channel) {
+        var ch = (channel || 'release').toLowerCase();
+        var isBeta = (ch === 'beta' || ch === 'prerelease');
+        var label = isBeta ? _('Бета (Beta)') : _('Релиз (Release)');
+        var style = isBeta
+            ? 'background:var(--cb-warn-bg); color:var(--cb-warn-text); border:1px solid var(--cb-warn-border);'
+            : 'background:var(--cb-ok-bg); color:var(--cb-ok-text); border:1px solid var(--cb-ok-border);';
+
+        return '<span style="display:inline-block; padding:1px 7px; border-radius:4px; font-weight:600; font-size:11px; ' + style + '">' + label + '</span>';
+    },
+
     formatComponentStatus: function(name, comp) {
         if (!comp || !comp.installed) {
             return '<li>' + name + ': <span style="color:var(--cb-text-muted);">' + _('Не установлен') + '</span></li>';
@@ -19,6 +30,13 @@ return baseclass.extend({
     renderUpdateReport: function(r) {
         var statusDiv = document.getElementById('ws-update-status');
         var btnUpgrade = document.getElementById('ws-btn-upgrade');
+
+        if (r && r.update_channel) {
+            var chBadge = document.getElementById('update-channel-badge');
+            if (chBadge) {
+                chBadge.innerHTML = this.getChannelBadge(r.update_channel);
+            }
+        }
 
         if (!statusDiv) return;
 
@@ -284,8 +302,13 @@ return baseclass.extend({
                         statusEl.textContent = '● ' + _('Онлайн');
                         statusEl.style.color = 'var(--cb-ok-text)';
                     }
+                    var chBadge = document.getElementById('update-channel-badge');
+                    if (chBadge && data.update_channel) {
+                        chBadge.innerHTML = self.getChannelBadge(data.update_channel);
+                    }
                     var countEl = document.getElementById('total-nodes');
-                    if (countEl && data.nodes_count !== undefined) countEl.textContent = data.nodes_count;
+                    if (countEl && data.total_nodes !== undefined) countEl.textContent = data.total_nodes;
+                    else if (countEl && data.nodes_count !== undefined) countEl.textContent = data.nodes_count;
                     var ipEl = document.getElementById('outbound-ip');
                     if (ipEl && data.outbound_ip) ipEl.textContent = data.outbound_ip;
 
@@ -438,7 +461,7 @@ return baseclass.extend({
             E('div', { 'style': 'margin-top: 10px; overflow-x: auto;' }, [table])
         ]);
 
-        var badgeStyle = 'background: var(--cb-badge-bg); border: 1px solid var(--cb-badge-border); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px;';
+        var badgeStyle = 'background: var(--cb-badge-bg); border: 1px solid var(--cb-badge-border); border-radius: 6px; padding: 8px 16px; min-width: 170px; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex: 1;';
 
         var viewContainer = E('div', { 'class': 'cbi-section' }, [
             diagBanner,
@@ -448,6 +471,10 @@ return baseclass.extend({
                 E('div', { 'style': badgeStyle }, [
                     E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Сервис демона:')),
                     E('span', { 'id': 'daemon-status', 'style': 'color: var(--cb-text-muted); font-weight: bold; font-size: 13px;' }, '● ' + _('Проверка...'))
+                ]),
+                E('div', { 'style': badgeStyle }, [
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Канал обновления:')),
+                    E('span', { 'id': 'update-channel-badge' }, this.getChannelBadge('release'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
                     E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Внешний IP:')),

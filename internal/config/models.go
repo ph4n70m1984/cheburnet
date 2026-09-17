@@ -83,6 +83,7 @@ type CheburConfig struct {
 	AutoHWID              bool                 `json:"auto_hwid"`
 	CustomHWID            string               `json:"custom_hwid"`
 	AutoUpdate            bool                 `json:"auto_update"`
+	UpdateChannel         string               `json:"update_channel"`          // "release" или "beta"
 	RulesetUpdateInterval string               `json:"ruleset_update_interval"` // "24h", "72h", "168h"
 	TProxyPort            int                  `json:"tproxy_port"`
 	DNSPort               int                  `json:"dns_port"`
@@ -115,7 +116,7 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		return nil
 	}
 
-	// 1. Поверхностное копирование скаляров (string, int, bool, включая URLTest*)
+	// 1. Поверхностное копирование скаляров (string, int, bool, включая UpdateChannel)
 	cp := *c
 
 	// 2. Срезы строк
