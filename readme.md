@@ -2,11 +2,13 @@
 
 **Chebur.NET** — модульный сервис прозрачного проксирования и интеллектуальной маршрутизации трафика для роутеров под управлением **OpenWrt**.
 
-Проект представляет собой лёгкий скомпилированный демон на **Go**, который берёт на себя управление подписками, парсинг прокси-нод, генерацию конфигурации, маршрутизацию, health-checks, диагностику и управление `sing-box`.
+Проект представляет собой лёгкий скомпилированный демон на **Go**, который берёт на себя управление конфигурацией, подписками, парсинг прокси-нод, маршрутизацию, health-checks, диагностику, телеметрию и управление **sing-box**.
 
 Веб-интерфейс LuCI взаимодействует с `cheburnetd` через **REST API и WebSocket**.
 
-Главная идея проекта — не превращать обычный OpenWrt-роутер в сервер с десятками тяжёлых компонентов, а вынести сложную логику в один компактный управляющий демон и использовать **sing-box** как единственный proxy engine.
+Главная идея проекта — не превращать обычный OpenWrt-роутер в сервер с десятками тяжёлых компонентов, а вынести сложную логику в один компактный управляющий демон и использовать **sing-box как единственный proxy engine**.
+
+> **Текущая версия: v0.0.8.41**
 
 ---
 
@@ -17,8 +19,6 @@
 Chebur.NET использует **sing-box** как основной и единственный proxy-core.
 
 Поддержка Xray-core удалена из основной архитектуры: это уменьшает количество кода, конфигурационных веток и потенциальных расхождений между движками.
-
-Архитектура теперь выглядит проще:
 
 ```text
                   Chebur.NET
@@ -39,7 +39,7 @@ Chebur.NET использует **sing-box** как основной и един
 
 ## 🔌 Поддерживаемые протоколы
 
-Через sing-box поддерживаются современные proxy-протоколы, используемые в подписках:
+Через sing-box поддерживаются:
 
 - **VLESS**
 - **VLESS + Reality**
@@ -53,7 +53,7 @@ Chebur.NET использует **sing-box** как основной и един
 
 ---
 
-## 📦 Подписки и автоматический парсинг
+# 📦 Подписки и автоматический парсинг
 
 Chebur.NET умеет получать и разбирать подписки непосредственно на роутере.
 
@@ -62,36 +62,70 @@ Chebur.NET умеет получать и разбирать подписки н
 - Base64 subscription;
 - Clash YAML;
 - JSON;
-- URI-форматы;
+- URI-профили;
 - VLESS;
 - Hysteria2;
 - Trojan;
 - Shadowsocks;
 - SOCKS5;
-- подписки современных VPN-панелей.
+- несколько источников подписок одновременно.
 
-Поддерживается несколько источников подписок одновременно.
+Для каждого источника могут использоваться собственные параметры:
 
-Для каждого источника могут использоваться собственные параметры, включая `User-Agent` и HWID.
+- URL;
+- User-Agent;
+- HWID;
+- фильтрация нод;
+- регулярные выражения исключения.
 
-### User-Agent
+### Фильтрация
 
-Для совместимости с различными панелями подписок можно использовать разные User-Agent:
+Поддерживается `exclude_regex`, позволяющий исключать ноды по регулярным выражениям.
+
+---
+
+## 🆔 HWID
+
+Chebur.NET поддерживает автоматический HWID.
+
+При включённом:
 
 ```text
-Happ
-ClashMeta
-sing-box
-Xray
+auto_hwid = 1
+```
+
+идентификатор может использоваться при работе с HWID-зависимыми подписками.
+
+Для отдельных subscription sources также поддерживается собственный HWID.
+
+---
+
+## 🏷️ Уникальные теги нод
+
+Ноды, полученные из разных подписок, получают префикс источника:
+
+```text
+[Subscription-A] Node-01
+[Subscription-B] Node-01
+```
+
+Это предотвращает коллизии тегов при объединении нескольких подписок.
+
+При необходимости одинаковые имена внутри одного источника дополнительно получают суффиксы:
+
+```text
+[Subscription-A] Node
+[Subscription-A] Node (2)
+[Subscription-A] Node (3)
 ```
 
 ---
 
-## 🛡️ Safety Fallback
+# 🛡️ Safe Fallback / SafeReload
 
-Обновление подписки не должно приводить к потере рабочего подключения.
+Обновление подписки или конфигурации не должно приводить к потере рабочего подключения.
 
-При обновлении:
+Основной pipeline:
 
 ```text
 Subscription
@@ -113,27 +147,37 @@ sing-box check
 FAIL      OK
  │        │
  ▼        ▼
-Rollback  SafeReload
+Keep     SafeReload
+old      │
+config   ▼
+       Health
+          │
+       ┌──┴──┐
+       │     │
+      OK    FAIL
+       │     │
+       ▼     ▼
+    active rollback
 ```
 
-Если загрузка подписки, парсинг или проверка нового конфигурационного файла завершается ошибкой, существующая рабочая конфигурация сохраняется.
+Перед применением нового конфига выполняется проверка `sing-box`.
+
+Если генерация, загрузка, валидация или применение нового состояния завершаются ошибкой, существующая рабочая конфигурация сохраняется либо выполняется rollback.
 
 ---
 
-## 🔍 Проверка sing-box
+# 🔍 Проверка sing-box
 
-Перед запуском или применением новой конфигурации Chebur.NET проверяет установленный бинарник `sing-box`.
+Перед использованием engine Chebur.NET проверяет установленный бинарник `sing-box`.
 
 Проверяется:
 
 - наличие бинарника;
-- права на выполнение;
 - возможность запуска;
 - версия;
 - корректность вывода `sing-box version`;
-- совместимость версии с текущим генератором конфигурации.
-
-Также определяется, используется ли расширенная сборка sing-box.
+- совместимость версии с текущим генератором конфигурации;
+- наличие расширенной сборки sing-box.
 
 Информация о binary engine представляется структурированно:
 
@@ -146,78 +190,44 @@ Patch
 IsExtended
 ```
 
-Это позволяет не полагаться на предположение, что пользователь установил правильную версию ядра.
-
 ---
 
-## ✅ Проверка конфигурации перед reload
-
-Перед применением нового конфига Chebur.NET использует встроенную проверку:
-
-```bash
-sing-box check -c /tmp/run/cheburnet/sing-box.json
-```
-
-Только после успешной проверки конфигурация применяется к работающему engine.
-
-Это особенно важно для автоматического обновления подписок:
-
-```text
-Новая подписка
-      │
-      ▼
-Генерация config
-      │
-      ▼
-sing-box check
-      │
- ┌────┴─────┐
- │          │
- FAIL       OK
- │          │
- ▼          ▼
-Rollback   SafeReload
-```
-
----
-
-# 🧠 Маршрутизация
+# 🧠 Интеллектуальная маршрутизация
 
 Chebur.NET формирует маршрутизацию на основании:
 
 - domain rules;
-- IP/CIDR rules;
+- IP/CIDR;
 - готовых rulesets;
 - пользовательских доменов;
 - пользовательских подсетей;
-- политики клиента;
-- портов;
-- типа протокола.
+- клиентских политик;
+- портов и диапазонов портов;
+- protocol-specific правил;
+- route policies.
 
-Поддерживается выборочная маршрутизация:
+Поддерживаются режимы:
 
 ```text
 LAN
  │
- ├── Direct
+ ├── DIRECT
  │
- └── Proxy
+ └── PROXY
         │
         ▼
-    sing-box
+     sing-box
 ```
 
 ---
 
-## 👤 Client Policy
+# 👤 Client Policy
 
 Для отдельных устройств локальной сети можно назначать собственные политики.
 
-Примеры:
-
 ### `rules`
 
-Обычная выборочная маршрутизация:
+Выборочная маршрутизация согласно правилам:
 
 ```text
 локальные / разрешённые ресурсы → DIRECT
@@ -226,55 +236,72 @@ LAN
 
 ### `full_proxy`
 
-Весь трафик устройства отправляется через прокси.
+Весь трафик устройства отправляется через proxy.
 
-Подходит, например, для:
+Подходит для:
 
 - Smart TV;
 - игровых приставок;
-- отдельных телефонов;
+- телефонов;
 - устройств без собственного VPN-клиента.
 
 ### `direct`
 
-Устройство работает напрямую и не использует прокси-маршрутизацию.
+Устройство работает напрямую, минуя proxy routing.
 
-Например:
-
-- рабочий компьютер;
-- отдельный IoT;
-- локальный сервер.
-
-Клиенты могут определяться по IP/MAC через DHCP lease database OpenWrt.
+Клиенты могут определяться по IP или MAC.
 
 ---
 
-## 🔢 Port Routing
+# 🛣️ Route Policy
 
-Chebur.NET позволяет задавать маршрутизацию для отдельных портов и диапазонов.
+Route Policy позволяет создавать отдельные логические политики маршрутизации для сервисов.
 
-Например:
+Политика может объединять:
+
+- rulesets;
+- домены;
+- подсети;
+- outbound.
+
+Пример:
+
+```text
+Route Policy: AI
+ ├── google_ai.srs
+ ├── custom domains
+ └── PROXY
+```
+
+или:
+
+```text
+Route Policy: YouTube
+ ├── domains
+ ├── subnets
+ └── AUTO
+```
+
+---
+
+# 🔢 Port Routing
+
+Можно задавать маршрутизацию для отдельных портов и диапазонов:
 
 ```text
 UDP 500-1000 → PROXY
 UDP 5222     → PROXY
 ```
 
-или наоборот:
-
-```text
-P2P / отдельные сервисы → DIRECT
-```
-
-Поддерживается TCP/UDP в зависимости от используемой политики и конфигурации engine.
+Поддерживается TCP/UDP в зависимости от правила и конфигурации engine.
 
 ---
 
 # 🌐 DNS и FakeIP
 
-Chebur.NET может использовать DNS-инфраструктуру sing-box для корректной маршрутизации доменных запросов.
+Chebur.NET использует DNS-инфраструктуру sing-box для маршрутизации доменного трафика.
 
-Используется отдельный DNS inbound, например:
+DNS работает через отдельный inbound, например:
 
 ```text
 127.0.0.42:1053
@@ -282,21 +309,69 @@ Chebur.NET может использовать DNS-инфраструктуру 
 
 что позволяет избежать конфликта с системным `dnsmasq`.
 
-Для FakeIP используется диапазон:
+## FakeIP
+
+Для FakeIP используется:
 
 ```text
 198.18.0.0/15
 ```
 
-Это позволяет сохранить доменную информацию для последующей маршрутизации трафика.
+В конфигурации создаётся отдельный DNS server:
+
+```text
+fakeip-dns
+```
+
+с типом:
+
+```text
+fakeip
+```
+
+FakeIP применяется к выбранным доменам/rulesets и интегрирован непосредственно в routing pipeline.
+
+```text
+                 DNS request
+                      │
+              ┌───────┴───────┐
+              │               │
+        proxy domains     direct domains
+              │               │
+              ▼               ▼
+           FakeIP          normal DNS
+        198.18.0.0/15
+              │
+              ▼
+            TProxy
+              │
+              ▼
+          sing-box
+              │
+              ▼
+            Route
+```
+
+Также используется сохранение FakeIP-состояния в cache:
+
+```text
+experimental.cache_file
+    store_fakeip = true
+```
 
 ---
 
-# ⚖️ Балансировка и Health
+# ⚖️ Балансировка и URLTest
 
-Chebur.NET может формировать группы proxy-нод и передавать их sing-box для выбора рабочего outbound.
+Chebur.NET может формировать группы proxy-нод и передавать их sing-box для автоматического выбора outbound.
 
-В конфигурации могут использоваться стратегии выбора ноды на основании задержки и состояния соединения.
+Группа может использовать:
+
+- список нод;
+- URL для проверки;
+- интервал проверки;
+- tolerance;
+- стратегию выбора.
 
 Пример:
 
@@ -315,7 +390,22 @@ Chebur.NET может формировать группы proxy-нод и пер
               Traffic
 ```
 
-Health-механизм отделён от UI: внутренние проверки могут выполняться постоянно, а пользовательский интерфейс получает только значимые события и проблемы.
+---
+
+# ❤️ Health Monitoring
+
+Состояние engine и proxy-ноды отслеживается отдельным health-слоем.
+
+Health используется для:
+
+- определения состояния `sing-box`;
+- проверки доступности порта;
+- получения latency нод;
+- обнаружения сбоев;
+- передачи состояния Supervisor;
+- принятия решений о восстановлении.
+
+Это позволяет отделить **контроль состояния** от пользовательского интерфейса.
 
 ---
 
@@ -323,39 +413,40 @@ Health-механизм отделён от UI: внутренние прове�
 
 Chebur.NET содержит отдельный диагностический слой.
 
-Вместо постоянного отображения десятков технических проверок интерфейс может показывать только реальные проблемы.
+Внутренние проверки выполняются постоянно, но UI не обязан отображать все технические проверки.
 
-Концепция:
+Пользователю передаются только актуальные проблемы.
 
 ```text
 Diagnostics
      │
  ┌───┼───────────────┐
  │   │               │
-OK  WARNING        ERROR
+ OK WARNING         ERROR
  │
- └─────── не показывается пользователю
+ └─────── не отображается как проблема
 ```
 
-Для проблем используются:
+Используются:
 
 - `problem_id`;
 - severity;
 - состояние;
 - hysteresis;
+- occurrences;
 - timestamps;
-- восстановление проблемы;
-- связь с Health/Supervisor.
+- symptoms;
+- recoverability;
+- action;
+- WebSocket events.
 
-WebSocket позволяет передавать события в интерфейс в реальном времени.
-
-Пример события:
+Пример:
 
 ```json
 {
   "type": "diagnostic",
-  "problem_id": "engine.unhealthy",
-  "severity": "error",
+  "problem_id": "engine.process_down",
+  "severity": "critical",
   "state": "active"
 }
 ```
@@ -365,73 +456,145 @@ WebSocket позволяет передавать события в интерф
 ```json
 {
   "type": "diagnostic",
-  "problem_id": "engine.unhealthy",
-  "severity": "error",
+  "problem_id": "engine.process_down",
+  "severity": "critical",
   "state": "resolved"
 }
 ```
 
-Таким образом, LuCI не превращается в постоянный мониторинг внутренних технических деталей.
+Diagnostics работает совместно с Health/Supervisor и не превращает LuCI в постоянно открытый список внутренних проверок.
 
 ---
 
-# 🔄 SafeReload
+# 🔄 Supervisor и восстановление
 
-Обновление конфигурации выполняется через безопасный pipeline.
+Supervisor отвечает за lifecycle engine и автоматическое восстановление.
 
-```text
-Config
-  │
-  ▼
-Generate
-  │
-  ▼
-Validate
-  │
-  ▼
-sing-box check
-  │
-  ▼
-Apply
-  │
-  ▼
-Health
-  │
-  ├── OK
-  │
-  └── FAIL → rollback
-```
+В случае проблем возможны действия:
 
-Для текущего sing-box используется единый путь конфигурации:
+- restart engine;
+- восстановление routing;
+- reload firewall;
+- rollback конфигурации.
 
-```text
-/tmp/run/cheburnet/sing-box.json
-```
-
-Отдельные ветки конфигурации для Xray больше не существуют.
+Диагностический слой определяет проблему, а механизм управления engine выполняет соответствующее действие.
 
 ---
 
-# ⚡ Быстрое управление engine
+# ⚡ Управление engine
 
-Chebur.NET не использует несколько proxy-core одновременно.
-
-`sing-box` является выделенным engine проекта.
+В текущей архитектуре используется только `sing-box`.
 
 Это позволяет:
 
-- убрать runtime-переключение между разными core;
-- исключить дублирование конфигураторов;
+- не поддерживать два разных proxy-core;
 - уменьшить размер кодовой базы;
-- уменьшить количество потенциальных ошибок;
+- исключить дублирование конфигураторов;
 - сосредоточить тестирование на одном engine;
-- использовать возможности sing-box непосредственно.
+- использовать актуальные возможности sing-box;
+- упростить диагностику и lifecycle management.
+
+Перезапуск самого proxy-core выполняется через системный lifecycle управления процессом.
+
+---
+
+# 📊 Метрики и телеметрия
+
+Chebur.NET имеет отдельную телеметрию для LuCI и опциональный Prometheus endpoint.
+
+### Обычная сборка
+
+Без build tag endpoint `/metrics` сообщает, что Prometheus metrics отключены.
+
+### Сборка с метриками
+
+Для включения Prometheus metrics:
+
+```bash
+CGO_ENABLED=0 go build -tags metrics -ldflags="-s -w" -o cheburnetd ./cmd/cheburnetd
+```
+
+После такой сборки доступен:
+
+```text
+/metrics
+```
+
+Сборщик предоставляет, в частности:
+
+- Go runtime / GC metrics;
+- goroutines;
+- heap и allocation metrics;
+- process CPU time;
+- process RSS;
+- process network RX/TX;
+- open file descriptors;
+- системную загрузку CPU;
+- системную память;
+- network RX/TX bytes;
+- network RX/TX packets.
+
+Пример основных системных метрик:
+
+```text
+node_cpu_utilization_ratio
+
+node_memory_total_bytes
+node_memory_available_bytes
+node_memory_free_bytes
+node_memory_used_bytes
+
+node_network_receive_bytes_total
+node_network_transmit_bytes_total
+node_network_receive_packets_total
+node_network_transmit_packets_total
+```
+
+Это позволяет наблюдать реальное потребление ресурсов OpenWrt без изменения основной логики daemon.
+
+---
+
+# 📈 Runtime footprint
+
+Chebur.NET проектируется для обычных OpenWrt-роутеров и не требует тяжёлого пользовательского пространства.
+
+В реальном runtime-тестировании `cheburnetd`:
+
+```text
+RSS: ~24 MB
+Go heap: ~2.35 MB
+Goroutines: 22
+Open FDs: 13
+```
+
+В одном из измерений:
+
+```text
+cheburnetd ≈ 16 MB RSS
+sing-box   ≈ 31 MB RSS
+```
+
+то есть суммарный footprint двух основных процессов составлял около:
+
+```text
+~47 MB RSS
+```
+
+Фактическое потребление зависит от:
+
+- архитектуры CPU;
+- версии sing-box;
+- количества нод;
+- размера rulesets;
+- количества активных соединений;
+- DNS/FakeIP;
+- текущего сетевого трафика.
 
 ---
 
 # 🖥️ LuCI
 
-Веб-интерфейс работает через:
+Веб-интерфейс:
 
 ```text
 LuCI
@@ -444,34 +607,182 @@ LuCI
     cheburnetd
 ```
 
-Интерфейс может отображать:
+Может отображать:
 
 - состояние engine;
-- количество нод;
-- активную ноду;
-- состояние подписок;
+- ноды;
 - latency;
-- проблемы диагностики;
-- события health;
-- состояние маршрутизации.
+- подписки;
+- активные проблемы;
+- health state;
+- события;
+- состояние маршрутизации;
+- телеметрию.
 
 WebSocket используется для реактивного обновления состояния без постоянного polling.
 
 ---
 
-# 🆔 HWID
+# 📦 Установка
 
-Chebur.NET поддерживает автоматическое формирование HWID.
+## Быстрая установка / обновление
 
-При включённом:
+На OpenWrt с установленным `curl`:
 
-```text
-auto_hwid = 1
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/ph4n70m1984/cheburnet/main/install.sh)"
 ```
 
-идентификатор может генерироваться на основе аппаратного идентификатора сетевого устройства.
+Скрипт автоматически:
 
-Это позволяет использовать HWID-зависимые VLESS-конфигурации без ручного ввода идентификатора.
+- определяет архитектуру устройства;
+- определяет пакетный менеджер `apk` или `opkg`;
+- показывает установленную версию Chebur.NET;
+- показывает установленную версию sing-box;
+- предлагает установить/обновить sing-box;
+- проверяет необходимые зависимости;
+- получает актуальный релиз Chebur.NET;
+- выбирает пакет под архитектуру устройства;
+- устанавливает/обновляет Chebur.NET;
+- сохраняет существующую конфигурацию;
+- управляет остановкой и запуском службы во время обновления.
+
+Скрипт поддерживает как **OpenWrt 24.x+ / apk**, так и системы с **opkg**.
+
+> Перед использованием установочного скрипта убедитесь, что устройство имеет доступ к GitHub и достаточно свободного места для пакетов.
+
+---
+
+# 📦 Ручная установка пакета
+
+Для OpenWrt с `opkg`:
+
+```bash
+opkg update
+opkg install ip-full nftables ca-bundle curl
+opkg install sing-box
+opkg install luci-app-cheburnet.ipk
+```
+
+Для OpenWrt с `apk`:
+
+```bash
+apk update
+apk add --upgrade sing-box
+apk add --allow-untrusted luci-app-cheburnet.apk
+```
+
+Версия и архитектура пакета должны соответствовать конкретному релизу и платформе OpenWrt.
+
+---
+
+# 🔨 Сборка
+
+## Обычная сборка
+
+```bash
+CGO_ENABLED=0 \
+GOOS=linux \
+GOARCH=arm64 \
+go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o bin/cheburnetd \
+    ./cmd/cheburnetd
+```
+
+Для MIPS:
+
+```bash
+CGO_ENABLED=0 \
+GOOS=linux \
+GOARCH=mipsle \
+GOMIPS=softfloat \
+go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o bin/cheburnetd \
+    ./cmd/cheburnetd
+```
+
+## Сборка с Prometheus metrics
+
+Для получения endpoint `/metrics`:
+
+```bash
+CGO_ENABLED=0 go build -tags metrics -ldflags="-s -w" -o cheburnetd ./cmd/cheburnetd
+```
+
+Build tag `metrics` включает:
+
+```text
+internal/api/metrics_enabled.go
+internal/api/system_collector.go
+```
+
+Без `-tags metrics` используется облегчённая реализация без Prometheus metrics.
+
+---
+
+# 🔧 Управление службой
+
+```bash
+/etc/init.d/cheburnet start
+/etc/init.d/cheburnet stop
+/etc/init.d/cheburnet restart
+/etc/init.d/cheburnet reload
+```
+
+Логи:
+
+```bash
+logread -e cheburnetd
+logread -e sing-box
+```
+
+Проверка конфигурации:
+
+```bash
+sing-box check -c /tmp/run/cheburnet/sing-box.json
+```
+
+---
+
+# 📁 Структура проекта
+
+```text
+.
+├── cmd/
+│   └── cheburnetd/
+│       └── main.go
+│
+├── internal/
+│   ├── api/
+│   ├── config/
+│   ├── diagnostics/
+│   ├── engine/
+│   │   └── singbox/
+│   ├── network/
+│   ├── rules/
+│   ├── ruleset/
+│   ├── subscription/
+│   ├── telemetry/
+│   └── updater/
+│
+├── pkg/
+│   ├── happ/
+│   ├── hwid/
+│   └── uri/
+│
+├── openwrt/
+│   ├── Makefile
+│   └── files/
+│
+├── install.sh
+├── Makefile
+├── go.mod
+└── readme.md
+```
 
 ---
 
@@ -499,22 +810,27 @@ auto_hwid = 1
 │                           │ Config Builder  │           │
 │                           └────────┬────────┘           │
 │                                    │                    │
-│                     ┌──────────────┴──────────────┐     │
-│                     │                             │     │
-│                 Health                     Diagnostics  │
-│                     │                             │     │
-│                     └──────────────┬──────────────┘     │
+│                     ┌──────────────┼──────────────┐     │
+│                     │              │              │     │
+│                  Routing         Health       Diagnostics│
+│                     │              │              │     │
+│                     └──────────────┼──────────────┘     │
 │                                    │                    │
-│                              Supervisor                │
+│                               Supervisor               │
+│                                    │                    │
+│                               Updater                  │
 │                                    │                    │
 └────────────────────────────────────┼────────────────────┘
                                      │
                                      ▼
                               ┌─────────────┐
                               │  sing-box   │
+                              │   FakeIP    │
+                              │    DNS      │
+                              │   Proxy     │
                               └──────┬──────┘
                                      │
-                              TProxy / Proxy
+                                TProxy / Proxy
                                      │
                                      ▼
                               ┌─────────────┐
@@ -527,104 +843,29 @@ auto_hwid = 1
 
 ---
 
-# 📁 Структура проекта
-
-```text
-.
-├── cmd/
-│   └── cheburnetd/
-│       └── main.go
-│
-├── internal/
-│   ├── api/
-│   │   ├── handlers.go
-│   │   └── server.go
-│   │
-│   ├── config/
-│   │   └── models.go
-│   │
-│   ├── diagnostics/
-│   │   └── ...
-│   │
-│   ├── engine/
-│   │   ├── detector.go
-│   │   ├── engine.go
-│   │   ├── health.go
-│   │   ├── reload.go
-│   │   ├── singbox.go
-│   │   └── singbox/
-│   │       ├── builder_v14.go
-│   │       └── version.go
-│   │
-│   ├── network/
-│   │   ├── ruleset_cron.go
-│   │   └── ruleset_loader.go
-│   │
-│   ├── subscription/
-│   │   └── worker.go
-│   │
-│   └── updater/
-│       └── manager.go
-│
-├── pkg/
-│   ├── happ/
-│   │   └── crypt4.go
-│   │
-│   ├── hwid/
-│   │   └── ...
-│   │
-│   └── uri/
-│       └── parser.go
-│
-├── openwrt/
-│   └── files/
-│       ├── etc/
-│       │   ├── config/
-│       │   │   └── cheburnet
-│       │   └── init.d/
-│       │       └── cheburnet
-│       │
-│       ├── usr/share/luci/
-│       │   └── menu.d/
-│       │
-│       └── www/luci-static/
-│           └── resources/view/cheburnet/
-│               └── dashboard.js
-│
-├── .github/
-│   └── workflows/
-│       └── build-packages.yml
-│
-└── README.md
-```
-
----
-
-# ⚙️ Конфигурация UCI
-
-Пример базовой конфигурации:
+# ⚙️ Пример UCI-конфигурации
 
 ```text
 config cheburnet 'main'
     option enabled '1'
     option engine 'sing-box'
-    option config_type 'urltest'
-    option source_interface 'br-lan'
+    option routing_mode 'rules'
+    option source_iface 'br-lan'
 
     option tproxy_port '1602'
+    option dns_port '1053'
     option mixed_port '4534'
 
     option auto_hwid '1'
+    option auto_update '1'
 
     option sub_user_agent 'Happ/1.0.0'
 
-    list rulesets 'russia_inside'
-    list rulesets 'youtube'
-
-    list subscription 'https://sub.example.com/api/v1/client/subscribe?token=xxx'
+    list rule_sets 'russia_inside'
+    list rule_sets 'youtube'
 ```
 
-### Политика клиента
+### Клиентская политика
 
 ```text
 config client_rule
@@ -634,150 +875,16 @@ config client_rule
     option mode 'full_proxy'
 ```
 
+### Пример Route Policy
+
 ```text
-config client_rule
+config route_policy
     option enabled '1'
-    option name 'Рабочий ПК'
-    option target '192.168.1.55'
-    option mode 'direct'
-```
+    option name 'AI'
+    option outbound 'AUTO'
 
-### Правила портов
-
-```text
-config port_rule
-    option enabled '1'
-    option name 'Telegram Voice'
-    option protocol 'udp'
-    option outbound 'proxy'
-
-    list ports '500-1000'
-    list ports '5222'
-```
-
----
-
-# 📊 Производительность
-
-Chebur.NET проектируется прежде всего для обычных OpenWrt-роутеров.
-
-Сам демон `cheburnetd` не является proxy-data-plane. Его задача — управление и оркестрация.
-
-В реальном тестировании на роутере:
-
-```text
-cheburnetd
-RSS: ~16 MB
-CPU: ~0%
-```
-
-Пример с sing-box:
-
-```text
-cheburnetd
-RSS: ~16 MB
-
-sing-box
-RSS: ~31 MB
-```
-
-Таким образом, суммарное потребление двух основных процессов в состоянии простоя составляло около:
-
-```text
-~47 MB RSS
-```
-
-Фактическое потребление зависит от версии sing-box, количества нод, rulesets, DNS, активных соединений и нагрузки.
-
----
-
-# 📦 Установка
-
-Для OpenWrt ≤ 23.05 используется `opkg`.
-
-Для OpenWrt 24.x+ используется `apk`.
-
-Пример:
-
-```bash
-opkg update
-
-opkg install ip-full nftables ca-bundle curl
-
-opkg install sing-box
-
-opkg install luci-app-cheburnet.ipk
-```
-
-Для APK:
-
-```bash
-apk update
-
-apk add --allow-untrusted luci-app-cheburnet.apk
-```
-
-> Версия и архитектура пакета должны соответствовать конкретному релизу и платформе OpenWrt.
-
----
-
-# 🔨 Ручная сборка
-
-Go daemon:
-
-```bash
-CGO_ENABLED=0 \
-GOOS=linux \
-GOARCH=arm64 \
-go build \
-    -ldflags="-s -w" \
-    -trimpath \
-    -o bin/cheburnetd \
-    ./cmd/cheburnetd
-```
-
-Для MediaTek MT7621:
-
-```bash
-CGO_ENABLED=0 \
-GOOS=linux \
-GOARCH=mipsle \
-GOMIPS=softfloat \
-go build \
-    -ldflags="-s -w" \
-    -trimpath \
-    -o bin/cheburnetd \
-    ./cmd/cheburnetd
-```
-
-Опциональное сжатие:
-
-```bash
-upx --best --lzma bin/cheburnetd
-```
-
----
-
-# 🔧 Управление
-
-```bash
-/etc/init.d/cheburnet start
-/etc/init.d/cheburnet stop
-/etc/init.d/cheburnet restart
-/etc/init.d/cheburnet reload
-```
-
-Логи:
-
-```bash
-logread -e cheburnetd
-logread -e sing-box
-```
-
-Проверка конфигурации sing-box:
-
-```bash
-sing-box check -c /tmp/run/cheburnet/sing-box.json
+    list rule_sets 'google_ai'
+    list domains 'example.ai'
 ```
 
 ---
@@ -802,10 +909,12 @@ OpenWrt
           │
           ├── subscriptions
           ├── nodes
+          ├── HWID
           ├── policies
           ├── routing
           ├── health
           ├── diagnostics
+          ├── telemetry
           └── configuration
                     │
                     ▼
@@ -813,29 +922,38 @@ OpenWrt
 ```
 
 **Chebur.NET управляет системой.  
-sing-box передаёт проксируемый трафик.  
+sing-box обрабатывает проксируемый трафик.  
 OpenWrt предоставляет сетевую инфраструктуру.**
 
-Такое разделение позволяет сохранять сам daemon небольшим и не дублировать функциональность proxy-core.
+Такое разделение позволяет сохранять daemon небольшим и не дублировать функциональность proxy-core.
 
 ---
 
 # 🧪 Текущее состояние
 
-Проект активно развивается.
+**v0.0.8.41**
 
-Основные направления:
+Текущая ветка ориентирована на:
 
-- стабильная работа sing-box;
+- sing-box как единственный engine;
 - автоматическое управление подписками;
-- безопасное обновление конфигурации;
-- health monitoring;
-- минималистичная диагностика;
-- WebSocket events;
+- HWID;
+- FakeIP;
+- DNS routing;
 - client policies;
+- route policies;
 - rulesets;
-- оптимизация потребления ресурсов;
-- улучшение совместимости с различными версиями sing-box.
+- балансировку и URLTest;
+- health monitoring;
+- Supervisor;
+- безопасное применение конфигурации;
+- rollback;
+- минималистичную диагностику;
+- WebSocket events;
+- REST API;
+- опциональный Prometheus metrics endpoint;
+- автоматические обновления;
+- низкое потребление ресурсов на OpenWrt.
 
 ---
 

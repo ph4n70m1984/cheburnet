@@ -36,7 +36,7 @@ return view.extend({
                     --cb-border: #cbd5e1;
                     --cb-text-main: #0f172a;
                     --cb-text-muted: #475569;
-                    --cb-text-accent: #0284c7;
+                    --cb-text-accent: #5c5c5c;
 
                     --cb-badge-bg: #f1f5f9;
                     --cb-badge-border: #cbd5e1;
@@ -65,12 +65,12 @@ return view.extend({
                 body.dark,
                 body.dark-mode,
                 body[class*="dark"] {
-                    --cb-bg-card: #1e293b !important;
-                    --cb-bg-surface: #0f172a !important;
+                    --cb-bg-card: #222222 !important;
+                    --cb-bg-surface: #323232 !important;
                     --cb-border: rgba(255, 255, 255, 0.12) !important;
                     --cb-text-main: #f8fafc !important;
                     --cb-text-muted: #94a3b8 !important;
-                    --cb-text-accent: #38bdf8 !important;
+                    --cb-text-accent: #a6aaaf !important;
 
                     --cb-badge-bg: rgba(255, 255, 255, 0.06) !important;
                     --cb-badge-border: rgba(255, 255, 255, 0.15) !important;
