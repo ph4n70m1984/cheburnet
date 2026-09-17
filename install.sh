@@ -159,7 +159,36 @@ stop_cheburnet_service() {
     fi
 }
 
-# 4. Выбор действия для Sing-Box (только репозиторий OpenWrt)
+# 4. Выбор канала обновлений для Chebur.NET
+CURRENT_UCI_CHANNEL=""
+if command -v uci >/dev/null 2>&1 && [ -f "/etc/config/cheburnet" ]; then
+    CURRENT_UCI_CHANNEL=$(uci -q get cheburnet.main.update_channel || true)
+fi
+
+echo "Выбор канала установки Chebur.NET:"
+echo "  1) Стабильный канал (Release)"
+echo "  2) Бета-канал (Beta / Pre-release с поддержкой свежих функций)"
+if [ "$CURRENT_UCI_CHANNEL" = "beta" ]; then
+    DEF_CHAN_CHOICE="2"
+else
+    DEF_CHAN_CHOICE="1"
+fi
+printf "${C}[>] Выберите канал [1-2] (по умолчанию %s): ${N}" "$DEF_CHAN_CHOICE"
+read_input 30
+CHOICE_CHAN="${READ_VALUE:-$DEF_CHAN_CHOICE}"
+
+case "$CHOICE_CHAN" in
+    2)
+        SELECTED_CHANNEL="beta"
+        printf "${Y}[*] Выбран канал: Бета-версии (Beta)${N}\n\n"
+        ;;
+    *)
+        SELECTED_CHANNEL="release"
+        printf "${G}[*] Выбран канал: Стабильный (Release)${N}\n\n"
+        ;;
+esac
+
+# 5. Выбор действия для Sing-Box
 echo "Операции с ядром Sing-Box:"
 echo "  1) Установить / Обновить из официального репозитория OpenWrt ($PKG_MANAGER)"
 echo "  0) Пропустить обновление sing-box"
@@ -187,7 +216,7 @@ case "$CHOICE_SB" in
         ;;
 esac
 
-# 5. Проверка системных зависимостей и переустановка curl / libcurl
+# 6. Проверка системных зависимостей и переустановка curl / libcurl
 printf "\n${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle, libcurl, curl)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
     apk update
@@ -198,19 +227,54 @@ else
     opkg install nftables kmod-nft-tproxy ip-full ca-bundle
 fi
 
-# 6. Установка / Обновление пакета Chebur.NET
-printf "\n${C}[*] Проверка обновлений Chebur.NET на GitHub...${N}\n"
-CHEBUR_RELEASE_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases/latest")
-[ -z "$CHEBUR_RELEASE_JSON" ] && fail "Не удалось получить метаданные релиза Chebur.NET."
+# 7. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала
+printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
+RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=20")
+[ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
+
+CHEBUR_RELEASE_JSON=""
+
+if [ "$SELECTED_CHANNEL" = "release" ]; then
+    # Пробуем получить через /releases/latest
+    CHEBUR_RELEASE_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases/latest")
+fi
+
+# Если не удалось или выбран бета-канал — парсим первый подходящий блок релиза
+if [ -z "$CHEBUR_RELEASE_JSON" ] || echo "$CHEBUR_RELEASE_JSON" | grep -q "Not Found"; then
+    CHEBUR_RELEASE_JSON=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" '
+        BEGIN { RS="\"id\":"; FS="\n"; found=0 }
+        NR > 1 {
+            block = "\"id\":" $0
+            is_pre = (block ~ /"prerelease": *true/)
+            is_draft = (block ~ /"draft": *true/)
+            if (is_draft) next;
+
+            if (chan == "release") {
+                if (!is_pre && block ~ /"tag_name":/) {
+                    print block
+                    exit
+                }
+            } else {
+                # Для beta берем самый свежий релиз
+                if (block ~ /"tag_name":/) {
+                    print block
+                    exit
+                }
+            }
+        }
+    ')
+fi
+
+[ -z "$CHEBUR_RELEASE_JSON" ] && fail "Не удалось найти подходящий релиз для канала $SELECTED_CHANNEL."
 
 CHEBUR_LATEST_TAG=$(echo "$CHEBUR_RELEASE_JSON" | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4)
 CHEBUR_CLEAN_VER=$(echo "$CHEBUR_LATEST_TAG" | sed 's/^v//')
 
-printf "  Последняя версия Chebur.NET: ${Y}%s${N}\n" "$CHEBUR_LATEST_TAG"
+printf "  Целевой релиз Chebur.NET (%s): ${Y}%s${N}\n" "$SELECTED_CHANNEL" "$CHEBUR_LATEST_TAG"
 
 NEED_UPDATE_CHEBUR="1"
 if [ -n "$CURRENT_CHEBUR_VER" ] && [ "$CURRENT_CHEBUR_VER" = "$CHEBUR_CLEAN_VER" ]; then
-    printf "${G}[✓] Chebur.NET уже обновлен до актуальной версии (%s).${N}\n" "$CHEBUR_CLEAN_VER"
+    printf "${G}[✓] Chebur.NET уже установлен с версией %s.${N}\n" "$CHEBUR_CLEAN_VER"
     printf "${C}[>] Переустановить пакет заново? [y/N]: ${N}"
     read_input 15
     case "$READ_VALUE" in
@@ -267,7 +331,13 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 fi
 
-# 7. Финализация прав, каталогов и запуск службы
+# 8. Фиксация выбранного канала в UCI
+if command -v uci >/dev/null 2>&1 && [ -f "/etc/config/cheburnet" ]; then
+    uci -q set cheburnet.main.update_channel="$SELECTED_CHANNEL" || true
+    uci -q commit cheburnet || true
+fi
+
+# 9. Финализация прав, каталогов и запуск службы
 mkdir -p /var/etc/cheburnet /var/run/cheburnet
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
@@ -280,6 +350,7 @@ SERVICE_STOPPED="0"
 
 printf "\n${G}====================================================${N}\n"
 printf "${G}  Chebur.NET и Sing-Box успешно настроены!          ${N}\n"
-printf "  Служба:         ${Y}cheburnet (active/running)${N}\n"
-printf "  Веб-интерфейс:  ${Y}LuCI -> Службы -> Chebur.NET${N}\n"
+printf "  Канал обновлений:  ${Y}%s${N}\n" "$SELECTED_CHANNEL"
+printf "  Служба:            ${Y}cheburnet (active/running)${N}\n"
+printf "  Веб-интерфейс:     ${Y}LuCI -> Службы -> Chebur.NET${N}\n"
 printf "${G}====================================================${N}\n"

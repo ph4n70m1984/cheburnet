@@ -323,12 +323,10 @@ return view.extend({
         statusSec.anonymous = true;
         statusSec.render = function() {
             var controlPanel = E('div', { 'class': 'cb-control-panel' }, [
-                // 1. Заголовок на всю ширину сверху
                 E('div', { 'class': 'cb-control-title' }, [
                     E('span', { 'style': 'font-size: 16px;' }, '⚙'),
                     E('span', {}, _('Управление демоном Chebur.NET:'))
                 ]),
-                // 2. Блок кнопок строго под текстом заголовка
                 E('div', { 'class': 'cb-control-buttons' }, [
                     E('button', {
                         'class': 'cb-btn cb-btn-start',
@@ -518,6 +516,15 @@ return view.extend({
         o.editable = true;
 
         o = subSec.option(form.Value, 'name', _('Наименование провайдера'));
+        o.editable = true;
+
+        o = subSec.option(form.ListValue, 'update_interval', _('Интервал автообновления'));
+        o.value('1h', _('Каждый час (1 ч)'));
+        o.value('3h', _('Каждые 3 часа (3 ч)'));
+        o.value('6h', _('Каждые 6 часов (6 ч)'));
+        o.value('12h', _('Каждые 12 часов (12 ч)'));
+        o.value('24h', _('Раз в сутки (24 ч)'));
+        o.default = '24h';
         o.editable = true;
 
         o = subSec.option(form.Value, 'url', _('URL подписки'));

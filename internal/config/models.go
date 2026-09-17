@@ -60,13 +60,14 @@ type BalancingGroup struct {
 }
 
 type SubscriptionConfig struct {
-	Name         string   `json:"name"`
-	URL          string   `json:"url"`
-	UserAgent    string   `json:"user_agent"`
-	HWID         string   `json:"hwid,omitempty"`
-	Enabled      bool     `json:"enabled"`
-	FilterMode   string   `json:"filter_mode,omitempty"`   // "exclude" (Blacklist) или "include" (Whitelist)
-	ExcludeRegex []string `json:"exclude_regex,omitempty"` // Регулярные выражения фильтра
+	Name           string   `json:"name"`
+	URL            string   `json:"url"`
+	UserAgent      string   `json:"user_agent"`
+	HWID           string   `json:"hwid,omitempty"`
+	Enabled        bool     `json:"enabled"`
+	FilterMode     string   `json:"filter_mode,omitempty"`     // "exclude" (Blacklist) или "include" (Whitelist)
+	ExcludeRegex   []string `json:"exclude_regex,omitempty"`   // Регулярные выражения фильтра
+	UpdateInterval string   `json:"update_interval,omitempty"` // "1h", "3h", "6h", "12h", "24h"
 }
 
 type CustomSRSRule struct {

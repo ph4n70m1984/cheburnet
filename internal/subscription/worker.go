@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"cheburnet/internal/config"
@@ -26,12 +28,74 @@ import (
 type Worker struct {
 	autoHWID   bool
 	customHWID string
+	mu         sync.Mutex
+	cancelMap  map[string]context.CancelFunc
 }
 
 func NewWorker(autoHWID bool, customHWID string) *Worker {
 	return &Worker{
 		autoHWID:   autoHWID,
 		customHWID: customHWID,
+		cancelMap:  make(map[string]context.CancelFunc),
+	}
+}
+
+func parseDurationSafe(intervalStr string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(intervalStr)) {
+	case "1h", "1":
+		return 1 * time.Hour
+	case "3h", "3":
+		return 3 * time.Hour
+	case "6h", "6":
+		return 6 * time.Hour
+	case "12h", "12":
+		return 12 * time.Hour
+	case "24h", "24":
+		return 24 * time.Hour
+	default:
+		d, err := time.ParseDuration(intervalStr)
+		if err == nil && d >= time.Hour {
+			return d
+		}
+		return 24 * time.Hour
+	}
+}
+
+// StartSubscriptionLoops запускает индивидуальные таймеры автообновления для каждой подписки
+func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.SubscriptionConfig, onUpdate func(sub config.SubscriptionConfig)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Останавливаем предыдущие фоновые горутины
+	for _, cancel := range w.cancelMap {
+		cancel()
+	}
+	w.cancelMap = make(map[string]context.CancelFunc)
+
+	for _, sub := range subs {
+		if !sub.Enabled || sub.URL == "" {
+			continue
+		}
+
+		s := sub
+		interval := parseDurationSafe(s.UpdateInterval)
+		subCtx, subCancel := context.WithCancel(ctx)
+		w.cancelMap[s.URL] = subCancel
+
+		go func(targetSub config.SubscriptionConfig, d time.Duration) {
+			ticker := time.NewTicker(d)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-subCtx.Done():
+					return
+				case <-ticker.C:
+					log.Printf("[INFO] Auto-updating subscription: %s (%s, interval: %v)", targetSub.Name, targetSub.URL, d)
+					onUpdate(targetSub)
+				}
+			}
+		}(s, interval)
 	}
 }
 
@@ -119,12 +183,10 @@ func filterNodesByRegex(nodes []*config.GenericNode, patterns []string, filterMo
 		}
 
 		if isIncludeMode {
-			// Whitelist: оставляем только совпавшие
 			if matched {
 				filtered = append(filtered, node)
 			}
 		} else {
-			// Blacklist: исключаем совпавшие
 			if !matched {
 				filtered = append(filtered, node)
 			}
@@ -254,11 +316,11 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)[cite: 5]
+	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)[cite: 11]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML[cite: 5]
+		// 2. Попытка распарсить как Clash YAML[cite: 11]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -295,7 +357,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Base64[cite: 5]
+			// 3. Base64[cite: 11]
 			content := string(body)
 			trimmed := strings.TrimSpace(content)
 
@@ -309,7 +371,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				}
 			}
 
-			// 4. Plaintext построчно[cite: 5]
+			// 4. Plaintext построчно[cite: 11]
 			scanner := bufio.NewScanner(strings.NewReader(content))
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
