@@ -95,23 +95,31 @@ return view.extend({
 
                 .cb-control-panel {
                     display: flex;
-                    align-items: center;
-                    gap: 10px;
+                    flex-direction: column;
+                    align-items: stretch;
+                    gap: 12px;
                     margin: 15px 0;
-                    padding: 12px 16px;
+                    padding: 14px 16px;
                     border: 1px solid var(--cb-border);
                     border-radius: 8px;
                     background: var(--cb-bg-card);
                     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
-                    flex-wrap: wrap;
                 }
                 .cb-control-title {
                     font-weight: bold;
-                    margin-right: auto;
+                    width: 100%;
                     color: var(--cb-text-main);
                     display: flex;
                     align-items: center;
                     gap: 8px;
+                    font-size: 14px;
+                }
+                .cb-control-buttons {
+                    display: flex;
+                    align-items: center;
+                    flex-wrap: wrap;
+                    gap: 8px;
+                    width: 100%;
                 }
                 .cb-btn {
                     display: inline-flex;
@@ -315,25 +323,29 @@ return view.extend({
         statusSec.anonymous = true;
         statusSec.render = function() {
             var controlPanel = E('div', { 'class': 'cb-control-panel' }, [
+                // 1. Заголовок на всю ширину сверху
                 E('div', { 'class': 'cb-control-title' }, [
                     E('span', { 'style': 'font-size: 16px;' }, '⚙'),
                     E('span', {}, _('Управление демоном Chebur.NET:'))
                 ]),
-                E('button', {
-                    'class': 'cb-btn cb-btn-start',
-                    'type': 'button',
-                    'click': function() { window.cheburManageService('start'); }
-                }, [ E('span', {}, '▶'), _('Запустить') ]),
-                E('button', {
-                    'class': 'cb-btn cb-btn-stop',
-                    'type': 'button',
-                    'click': function() { window.cheburManageService('stop'); }
-                }, [ E('span', {}, '■'), _('Остановить') ]),
-                E('button', {
-                    'class': 'cb-btn cb-btn-restart',
-                    'type': 'button',
-                    'click': function() { window.cheburManageService('restart'); }
-                }, [ E('span', {}, '⟳'), _('Перезапустить') ])
+                // 2. Блок кнопок строго под текстом заголовка
+                E('div', { 'class': 'cb-control-buttons' }, [
+                    E('button', {
+                        'class': 'cb-btn cb-btn-start',
+                        'type': 'button',
+                        'click': function() { window.cheburManageService('start'); }
+                    }, [ E('span', {}, '▶'), _('Запустить') ]),
+                    E('button', {
+                        'class': 'cb-btn cb-btn-stop',
+                        'type': 'button',
+                        'click': function() { window.cheburManageService('stop'); }
+                    }, [ E('span', {}, '■'), _('Остановить') ]),
+                    E('button', {
+                        'class': 'cb-btn cb-btn-restart',
+                        'type': 'button',
+                        'click': function() { window.cheburManageService('restart'); }
+                    }, [ E('span', {}, '⟳'), _('Перезапустить') ])
+                ])
             ]);
 
             var telemetryNode = telemetryModule.createTelemetrySection(nodesModule);

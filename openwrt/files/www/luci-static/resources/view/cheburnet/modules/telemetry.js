@@ -469,19 +469,19 @@ return baseclass.extend({
             updateBanner,
             E('div', { 'style': 'display: flex; gap: 12px; margin-bottom: 15px; flex-wrap: wrap;' }, [
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Сервис демона:')),
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Демон:')),
                     E('span', { 'id': 'daemon-status', 'style': 'color: var(--cb-text-muted); font-weight: bold; font-size: 13px;' }, '● ' + _('Проверка...'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Канал обновления:')),
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Канал:')),
                     E('span', { 'id': 'update-channel-badge' }, this.getChannelBadge('release'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Внешний IP:')),
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('IP:')),
                     E('span', { 'id': 'outbound-ip', 'style': 'color: var(--cb-text-accent); font-weight: bold; font-family: monospace; font-size: 13px;' }, _('Определение...'))
                 ]),
                 E('div', { 'style': badgeStyle }, [
-                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Всего серверов:')),
+                    E('span', { 'style': 'color: var(--cb-text-muted); font-size: 13px;' }, _('Серверов:')),
                     E('span', { 'id': 'total-nodes', 'style': 'color: var(--cb-text-main); font-weight: bold; font-size: 14px;' }, '0')
                 ])
             ]),
