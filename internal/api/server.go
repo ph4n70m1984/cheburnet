@@ -84,7 +84,6 @@ func NewServer(
 }
 
 func (s *Server) setupRoutes() {
-	// Подключение эндпоинтов метрик (зависит от флага сборки -tags metrics)
 	setupMetrics(s.app)
 
 	api := s.app.Group("/api/v1")
@@ -168,6 +167,10 @@ func (s *Server) setupRoutes() {
 			case "check_updates":
 				go func(conn *websocket.Conn) {
 					cfg := s.state.Get()
+					if s.updater != nil && cfg.UpdateChannel != "" {
+						s.updater.SetUpdateChannel(cfg.UpdateChannel)
+					}
+
 					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 					defer cancel()
 

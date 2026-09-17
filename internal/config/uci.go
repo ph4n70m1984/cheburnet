@@ -90,6 +90,7 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		DNSTTL:                u.getInt("cheburnet.main.dns_ttl", 60),
 		EnableYACD:            u.get("cheburnet.main.enable_yacd", "1") == "1",
 		AutoUpdate:            u.get("cheburnet.main.auto_update", "0") == "1",
+		UpdateChannel:         u.get("cheburnet.main.update_channel", "release"),
 	}
 
 	// 1. Чтение секций 'subscription'
@@ -148,7 +149,6 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.custom_srs_rulesets").Output(); err == nil {
 		trimmed := strings.TrimSpace(string(out))
 		if len(trimmed) > 0 {
-			// UCI может возвращать несколько записей списком через перенос строки или пробел
 			rawLines := strings.Split(trimmed, "\n")
 			for _, rl := range rawLines {
 				rl = strings.TrimSpace(rl)

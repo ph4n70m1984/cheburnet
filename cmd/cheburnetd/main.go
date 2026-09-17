@@ -455,7 +455,6 @@ func runDaemon() {
 	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
 	hub.SetDiagnosticsEngine(diagEngine)
 
-	// Инициализируем менеджер обновлений с передачей канала (release / beta)
 	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel)
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
@@ -642,7 +641,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	// Динамически синхронизируем канал обновлений при перезагрузке конфига
 	if a.updManager != nil && cfg.UpdateChannel != "" {
 		a.updManager.SetUpdateChannel(cfg.UpdateChannel)
 	}

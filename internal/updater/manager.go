@@ -50,6 +50,7 @@ type releaseAsset struct {
 
 type githubReleaseItem struct {
 	TagName    string `json:"tag_name"`
+	Draft      bool   `json:"draft"`
 	Prerelease bool   `json:"prerelease"`
 	Assets     []struct {
 		Name               string `json:"name"`
@@ -222,7 +223,7 @@ type semVerParts struct {
 }
 
 func parseSemVerExtended(v string) semVerParts {
-	v = strings.TrimPrefix(v, "v")
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
 	res := semVerParts{}
 
 	var preStr string
@@ -278,10 +279,10 @@ func isNewerVersion(remote, current string) bool {
 
 	// Если основные числа равны: релиз (isPre=false) новее, чем бета (isPre=true)
 	if !r.isPre && c.isPre {
-		return true // 0.0.10 новее 0.0.10-beta
+		return true // 0.0.8.45 новее 0.0.8.45-beta.1
 	}
 	if r.isPre && !c.isPre {
-		return false // 0.0.10-beta старее стабильного 0.0.10
+		return false // 0.0.8.45-beta.1 старее стабильного 0.0.8.45
 	}
 	if r.isPre && c.isPre {
 		return r.preRelease > c.preRelease // beta.2 новее beta.1
@@ -425,7 +426,7 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return m.UpgradeSingBoxCore(ctx)
 }
 
-// fetchGitHubReleaseByChannel ищет релиз с учетом текущего канала (release или beta)
+// fetchGitHubReleaseByChannel выполняет выборку и находит наивысшую доступную версию для заданного канала
 func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -456,22 +457,28 @@ func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, 
 
 	var targetRelease *githubReleaseItem
 
+	// Перебираем релизы и находим наибольшую версию среди подходящих по каналу
 	for i := range releases {
 		rel := &releases[i]
+		if rel.Draft {
+			continue
+		}
+
 		tagNameLower := strings.ToLower(rel.TagName)
 
 		if m.updateChannel == "release" {
-			// На стабильном канале отсекаем prerelease и теги с beta/rc/dev
+			// В стабильном канале исключаем pre-release и теги с бетой/rc
 			if rel.Prerelease || strings.Contains(tagNameLower, "beta") ||
 				strings.Contains(tagNameLower, "rc") || strings.Contains(tagNameLower, "dev") {
 				continue
 			}
+		}
+
+		// Выбираем релиз с наибольшей версией
+		if targetRelease == nil {
 			targetRelease = rel
-			break
-		} else {
-			// На канале beta берем первый же (самый свежий) релиз в хронологии
+		} else if isNewerVersion(rel.TagName, targetRelease.TagName) {
 			targetRelease = rel
-			break
 		}
 	}
 
