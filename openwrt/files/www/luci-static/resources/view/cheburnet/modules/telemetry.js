@@ -116,7 +116,7 @@ return baseclass.extend({
                 banner.style.background = 'var(--cb-badge-bg)';
                 banner.style.border = '1px solid var(--cb-badge-border)';
                 banner.style.color = 'var(--cb-text-muted)';
-                content.textContent = _('● Инициализация системы диагностики...');
+                content.textContent = '● ' + _('Инициализация системы диагностики...');
                 return;
             }
 
@@ -217,6 +217,24 @@ return baseclass.extend({
             });
         }
 
+        function renderDiagnosticSnapshot(snap) {
+            if (!snap) return;
+            window.cheburLastDiagSnapshot = snap;
+
+            var newProbMap = {};
+            if (Array.isArray(snap.problems)) {
+                snap.problems.forEach(function(prob) {
+                    if (prob && prob.id) {
+                        newProbMap[prob.id] = prob;
+                    }
+                });
+            }
+            window.cheburProblems = newProbMap;
+
+            renderProblemsCards();
+            updateBannerContent();
+        }
+
         function fetchDiagnosticsOnce() {
             var host = window.location.hostname;
             var controller = new AbortController();
@@ -227,8 +245,14 @@ return baseclass.extend({
                     clearTimeout(timeoutId);
                     return r.ok ? r.json() : null;
                 })
-                .then(function(snap) { if (snap) renderDiagnosticSnapshot(snap); })
-                .catch(function() { clearTimeout(timeoutId); });
+                .then(function(snap) {
+                    if (snap) {
+                        renderDiagnosticSnapshot(snap);
+                    }
+                })
+                .catch(function() {
+                    clearTimeout(timeoutId);
+                });
         }
 
         function checkUpdatesOnce() {
