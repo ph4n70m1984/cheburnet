@@ -222,7 +222,6 @@ return baseclass.extend({
             var controller = new AbortController();
             var timeoutId = setTimeout(function() { controller.abort(); }, 3500);
 
-            // /diagnostics является открытым read-only эндпоинтом
             fetch('http://' + host + ':8088/api/v1/diagnostics', { signal: controller.signal })
                 .then(function(r) {
                     clearTimeout(timeoutId);
@@ -301,7 +300,6 @@ return baseclass.extend({
         }
 
         function syncRealtimeStatus() {
-            // /status является открытым read-only эндпоинтом
             fetch('http://' + window.location.hostname + ':8088/api/v1/status')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {

@@ -13,16 +13,18 @@
 
 return view.extend({
     load: function() {
-        var host = window.location.hostname;
-        var statusPromise = fetch('http://' + host + ':8088/api/v1/status')
-            .then(function(r) { return r.ok ? r.json() : {}; })
-            .catch(function() { return {}; });
-
         return Promise.all([
             network.getHostHints(),
-            uci.load('cheburnet'),
-            statusPromise
-        ]);
+            uci.load('cheburnet')
+        ]).then(function(results) {
+            var host = window.location.hostname;
+            return fetch('http://' + host + ':8088/api/v1/status')
+                .then(function(r) { return r.ok ? r.json() : {}; })
+                .catch(function() { return {}; })
+                .then(function(statusData) {
+                    return [results[0], results[1], statusData];
+                });
+        });
     },
 
     render: function(data) {
@@ -33,7 +35,6 @@ return view.extend({
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
-        // Внедрение универсальной дизайн-системы и стилей кнопок управления
         var styleId = 'cheburnet-theme-vars';
         if (!document.getElementById(styleId)) {
             var css = document.createElement('style');
@@ -172,46 +173,51 @@ return view.extend({
                     transform: translateY(-1px);
                 }
 
-                .cb-details {
+                .cb-accordion {
                     border: 1px solid var(--cb-border) !important;
                     border-radius: 8px !important;
                     background: var(--cb-bg-card) !important;
-                    padding: 12px !important;
+                    padding: 8px 12px !important;
                     margin-top: 15px !important;
                     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05) !important;
                 }
-                .cb-details summary {
+                .cb-accordion summary {
                     color: var(--cb-text-accent) !important;
-                    cursor: pointer;
-                    user-select: none;
+                    cursor: pointer !important;
+                    user-select: none !important;
+                    font-size: 14px !important;
+                    font-weight: bold !important;
+                    padding: 6px 4px !important;
+                    outline: none !important;
                 }
-                .cb-details .cbi-tabmenu {
+                .cb-accordion .cbi-tabmenu {
                     border-bottom: 1px solid var(--cb-border) !important;
                     margin-bottom: 15px !important;
                 }
-                .cb-details .cbi-tabmenu > li > a {
+                .cb-accordion .cbi-tabmenu > li > a {
                     color: var(--cb-text-muted) !important;
                 }
-                .cb-details .cbi-tabmenu > li.cbi-tab > a {
+                .cb-accordion .cbi-tabmenu > li.cbi-tab > a {
                     color: var(--cb-text-accent) !important;
                     font-weight: bold !important;
                     border-bottom: 2px solid var(--cb-text-accent) !important;
                 }
-                .cb-details input[type="text"],
-                .cb-details input[type="password"],
-                .cb-details select,
-                .cb-details textarea,
-                .cb-details .cbi-dynlist {
+                .cb-accordion input[type="text"],
+                .cb-accordion input[type="password"],
+                .cb-accordion select,
+                .cb-accordion textarea,
+                .cb-accordion .cbi-dynlist {
                     background-color: var(--cb-bg-surface) !important;
                     border: 1px solid var(--cb-border) !important;
                     color: var(--cb-text-main) !important;
                     border-radius: 4px !important;
                 }
-                .cb-details .cbi-dynlist > .item {
+                .cb-accordion .cbi-dynlist > .item {
                     background: var(--cb-badge-bg) !important;
                     border: 1px solid var(--cb-badge-border) !important;
                     color: var(--cb-text-main) !important;
                 }
+
                 #chebur-nodes-table {
                     background: var(--cb-bg-card) !important;
                     color: var(--cb-text-main) !important;
@@ -260,7 +266,7 @@ return view.extend({
             ui.showIndicator('chebur-service-mgr', labels[action] || _('Выполнение...'));
 
             fs.exec('/etc/init.d/cheburnet', [action])
-                .then(function(res) {
+                .then(function() {
                     setTimeout(function() {
                         ui.hideIndicator('chebur-service-mgr');
                         window.location.reload();
@@ -273,7 +279,7 @@ return view.extend({
         };
 
         window.cheburCheckUpdates = function(e) {
-            e.preventDefault();
+            if (e) e.preventDefault();
             var statusDiv = document.getElementById('ws-update-status');
             if (statusDiv) {
                 statusDiv.innerHTML = '<span style="color:var(--cb-warn-text);">' + _('Выполняется проверка GitHub и пакетов...') + '</span>';
@@ -307,7 +313,7 @@ return view.extend({
         };
 
         window.cheburPerformUpgrade = function(e) {
-            e.preventDefault();
+            if (e) e.preventDefault();
             var statusDiv = document.getElementById('ws-update-status');
             var btnUpgrade = document.getElementById('ws-btn-upgrade');
             if (statusDiv) {
@@ -350,7 +356,6 @@ return view.extend({
             });
         };
 
-        // Вспомогательные функции для публичной подписки и токенов
         window.cheburGenSubToken = function() {
             var chars = '0123456789abcdef';
             var token = '';
@@ -431,14 +436,8 @@ return view.extend({
             var port = (portInput && portInput.value) ? portInput.value.trim() : '';
 
             if (!token) {
-                var sections = uci.sections('cheburnet');
-                for (var i = 0; i < sections.length; i++) {
-                    if (sections[i]['.type'] === 'cheburnet' || sections[i]['.name'] === 'main') {
-                        token = sections[i]['public_sub_token'] || '';
-                        if (!port) port = sections[i]['public_sub_port'] || '9443';
-                        break;
-                    }
-                }
+                token = uci.get('cheburnet', 'main', 'public_sub_token') || '';
+                if (!port) port = uci.get('cheburnet', 'main', 'public_sub_port') || '9443';
             }
 
             if (!port) port = '9443';
@@ -451,7 +450,7 @@ return view.extend({
             }
         };
 
-        // --- СЕКЦИЯ СОСТОЯНИЯ И КНОПКИ УПРАВЛЕНИЯ ДЕМОНОМ ---
+        // --- 1. СЕКЦИЯ СТАТУСА И ТЕЛЕМЕТРИИ ---
         var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
         statusSec.render = function() {
@@ -483,24 +482,10 @@ return view.extend({
             return E('div', {}, [ controlPanel, telemetryNode ]);
         };
 
-        var s = m.section(form.NamedSection, 'main', 'cheburnet');
+        // --- 2. СЕКЦИЯ ОСНОВНЫХ НАСТРОЕК (MAIN) ---
+        var s = m.section(form.NamedSection, 'main', 'cheburnet', _('Параметры маршрутизации, сети и ядра'));
         s.anonymous = true;
         s.addremove = false;
-
-        var origRender = s.render;
-        s.render = function() {
-            return Promise.resolve(origRender.apply(this, arguments)).then(function(contentNode) {
-                return E('details', {
-                    'class': 'cbi-section cb-details',
-                    'style': 'margin-top: 20px;'
-                }, [
-                    E('summary', {
-                        'style': 'font-size: 15px; font-weight: bold; padding: 8px 10px;'
-                    }, _('▶ Параметры маршрутизации, сети и обновлений (нажмите, чтобы развернуть)')),
-                    contentNode
-                ]);
-            });
-        };
 
         s.tab('general', _('Прокси и ядро'));
         s.tab('routing_rules', _('Маршрутизация списков'));
@@ -512,11 +497,6 @@ return view.extend({
 
         s.tab('updates', _('Менеджер обновлений'));
 
-        // Скрытое поле для сохранения api_token в UCI
-        var o_api_token = s.taboption('general', form.HiddenValue, 'api_token');
-        o_api_token.rmempty = false;
-
-        // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
         var o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
         o.value('rules', _('По спискам (Избирательный обход)'));
         o.value('global', _('Весь трафик (Полный туннель / Global VPN)'));
@@ -568,76 +548,41 @@ return view.extend({
         o.render = function() {
             return Promise.resolve(origClashSecretRender.apply(this, arguments)).then(function(node) {
                 var input = node.querySelector('input');
-                if (input) {
+                if (input && input.parentNode) {
                     input.id = 'cb-clash-secret-input';
+
+                    var toggleBtn = E('button', {
+                        'id': 'cb-clash-secret-toggle',
+                        'class': 'btn cbi-button-neutral',
+                        'type': 'button',
+                        'title': _('Показать / Скрыть пароль'),
+                        'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
+                        'click': window.cheburToggleClashSecret
+                    }, '👁');
+
+                    var copyBtn = E('button', {
+                        'class': 'btn cbi-button-neutral',
+                        'type': 'button',
+                        'title': _('Копировать секрет'),
+                        'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
+                        'click': window.cheburCopyClashSecret
+                    }, '📋');
+
+                    var genBtn = E('button', {
+                        'class': 'btn cbi-button-action',
+                        'type': 'button',
+                        'style': 'margin-left: 6px; white-space: nowrap;',
+                        'click': window.cheburGenClashSecret
+                    }, [ E('span', {}, '🔑 '), _('Сгенерировать') ]);
+
+                    input.parentNode.appendChild(toggleBtn);
+                    input.parentNode.appendChild(copyBtn);
+                    input.parentNode.appendChild(genBtn);
                 }
-
-                var toggleBtn = E('button', {
-                    'id': 'cb-clash-secret-toggle',
-                    'class': 'btn cbi-button-neutral',
-                    'type': 'button',
-                    'title': _('Показать / Скрыть пароль'),
-                    'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
-                    'click': window.cheburToggleClashSecret
-                }, '👁');
-
-                var copyBtn = E('button', {
-                    'class': 'btn cbi-button-neutral',
-                    'type': 'button',
-                    'title': _('Копировать секрет'),
-                    'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
-                    'click': window.cheburCopyClashSecret
-                }, '📋');
-
-                var genBtn = E('button', {
-                    'class': 'btn cbi-button-action',
-                    'type': 'button',
-                    'style': 'margin-left: 6px; white-space: nowrap;',
-                    'click': window.cheburGenClashSecret
-                }, [ E('span', {}, '🔑 '), _('Сгенерировать') ]);
-
-                var controlDiv = node.querySelector('.cbi-value-field');
-                var descDiv = node.querySelector('.cbi-value-description');
-
-                if (controlDiv && input) {
-                    var rowDiv = E('div', {
-                        'style': 'display: flex; align-items: center; gap: 4px; width: 100%; margin-bottom: 4px;'
-                    }, [ input, toggleBtn, copyBtn, genBtn ]);
-
-                    if (descDiv) {
-                        controlDiv.insertBefore(rowDiv, descDiv);
-                    } else {
-                        controlDiv.appendChild(rowDiv);
-                    }
-                }
-
                 return node;
             });
         };
 
-        function wrapGridSection(sectionObj, titleText, isOpen) {
-            var orig = sectionObj.render;
-            sectionObj.render = function() {
-                var self = this, args = arguments;
-                return Promise.resolve(orig.apply(self, args)).then(function(node) {
-                    var detailsNode = E('details', {
-                        'class': 'cbi-section cb-details'
-                    }, [
-                        E('summary', {
-                            'style': 'font-size: 14px; font-weight: bold; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center;'
-                        }, [
-                            E('span', {}, titleText),
-                            E('span', { 'style': 'font-size: 11px; font-weight: normal; color: var(--cb-text-muted);' }, _('(нажмите, чтобы развернуть/свернуть)'))
-                        ]),
-                        node
-                    ]);
-                    if (isOpen) detailsNode.open = true;
-                    return detailsNode;
-                });
-            };
-        }
-
-        // --- ВКЛАДКА 2: МАРШРУТИЗАЦИЯ СПИСКОВ ---
         o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
         o.value('24h', _('24 часа (каждый день)'));
         o.value('72h', _('72 часа (раз в 3 дня)'));
@@ -645,7 +590,7 @@ return view.extend({
         o.default = '72h';
 
         o = s.taboption('routing_rules', form.DynamicList, 'custom_srs_rulesets', _('Пользовательские SRS списки (Sing-box)'));
-        o.description = _('Формат ввода: <code>Имя|URL|[direct|proxy]</code> (например: <code>antizapret|https://example.com/rule.srs|direct</code>). Загружаются демоном с валидацией и резервированием.');
+        o.description = _('Формат ввода: <code>Имя|URL|[direct|proxy]</code> (например: <code>antizapret|https://example.com/rule.srs|direct</code>).');
         o.placeholder = 'my_list|https://example.com/rule.srs|direct';
 
         o = s.taboption('routing_rules', form.DynamicList, 'rulesets', _('Списки сервисов по умолчанию'));
@@ -660,7 +605,6 @@ return view.extend({
         o = s.taboption('routing_rules', form.TextValue, 'custom_ports', _('Список портов'));
         o.rows = 4;
 
-        // --- ВКЛАДКА 3: DNS И СЕТЬ ---
         o = s.taboption('dns_settings', form.ListValue, 'dns_protocol', _('Протокол DNS'));
         o.value('doh', 'DoH');
         o.value('dot', 'DoT');
@@ -677,7 +621,6 @@ return view.extend({
         o = s.taboption('dns_settings', widgets.NetworkSelect, 'source_interface', _('Интерфейс'));
         o.default = 'br-lan';
 
-        // --- ВКЛАДКА 4: ПУБЛИЧНАЯ ПОДПИСКА (HAPP) ---
         if (hasPublicSub) {
             o = s.taboption('public_sub', form.Flag, 'public_sub_enabled', _('Включить публичный сервер подписки'));
             o.description = _('Запускает изолированный HTTP-сервер на выделенном порту для мобильных клиентов (Happ, v2rayNG, Clash).');
@@ -704,41 +647,25 @@ return view.extend({
             o.depends('public_sub_enabled', '1');
             o.description = _('Токен защищает подписку от несанкционированного доступа. Доступен только при передаче токена в пути URL.');
             o.placeholder = '32-значный hex-токен';
-            o.rmempty = false;
 
             var origTokenRender = o.render;
-            o.render = function(option_index, section_id, in_table) {
-                var self = this;
-                return Promise.resolve(origTokenRender.apply(self, arguments)).then(function(node) {
+            o.render = function() {
+                return Promise.resolve(origTokenRender.apply(this, arguments)).then(function(node) {
                     var input = node.querySelector('input');
-                    if (input) {
+                    if (input && input.parentNode) {
                         input.id = 'cb-sub-token-input';
                         input.addEventListener('input', window.cheburUpdateSubLinkPreview);
                         input.addEventListener('change', window.cheburUpdateSubLinkPreview);
+
+                        var genBtn = E('button', {
+                            'class': 'btn cbi-button-action',
+                            'type': 'button',
+                            'style': 'margin-left: 8px; white-space: nowrap;',
+                            'click': window.cheburGenSubToken
+                        }, [ E('span', {}, '🔑 '), _('Сгенерировать токен') ]);
+
+                        input.parentNode.appendChild(genBtn);
                     }
-
-                    var genBtn = E('button', {
-                        'class': 'btn cbi-button-action',
-                        'type': 'button',
-                        'style': 'margin-left: 8px; white-space: nowrap;',
-                        'click': window.cheburGenSubToken
-                    }, [ E('span', {}, '🔑 '), _('Сгенерировать токен') ]);
-
-                    var controlDiv = node.querySelector('.cbi-value-field');
-                    var descDiv = node.querySelector('.cbi-value-description');
-
-                    if (controlDiv && input) {
-                        var rowDiv = E('div', {
-                            'style': 'display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 4px;'
-                        }, [ input, genBtn ]);
-
-                        if (descDiv) {
-                            controlDiv.insertBefore(rowDiv, descDiv);
-                        } else {
-                            controlDiv.appendChild(rowDiv);
-                        }
-                    }
-
                     return node;
                 });
             };
@@ -768,7 +695,6 @@ return view.extend({
             };
         }
 
-        // --- ВКЛАДКА 5: ОБНОВЛЕНИЯ ---
         var o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
         o_upd.rawhtml = true;
         o_upd.default = '' +
@@ -792,12 +718,11 @@ return view.extend({
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg/apk.');
         o.default = '0';
 
-        // --- ВНЕШНИЕ АККОРДЕОНЫ ---
+        // --- 3. СЕКЦИЯ ПОДПИСОК ---
         var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
         subSec.sortable = true;
-        wrapGridSection(subSec, _('▶ Таблица ссылок подписок'), false);
 
         o = subSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -827,7 +752,6 @@ return view.extend({
         o = subSec.option(form.DynamicList, 'exclude_regex', _('Регулярные выражения (RegExp)'));
         o.modalonly = true;
 
-        // Выпадающий список User-Agent
         o = subSec.option(form.ListValue, 'user_agent', _('User-Agent'));
         o.value('Happ/4.2.0 (iPhone; iOS 18.0; Scale/3.00)', 'Happ 4.2.0 (iOS)');
         o.value('Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)', 'Happ 4.1.3 (iOS)');
@@ -842,11 +766,11 @@ return view.extend({
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
         o.modalonly = true;
 
-        var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств'));
+        // --- 4. СЕКЦИЯ ПОЛИТИК УСТРОЙСТВ ---
+        var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'));
         clientSec.anonymous = true;
         clientSec.addremove = true;
         clientSec.sortable = true;
-        wrapGridSection(clientSec, _('▶ Политики для устройств (Client Policy)'), false);
 
         o = clientSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -872,11 +796,11 @@ return view.extend({
         o.default = 'rules';
         o.editable = true;
 
-        var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации'));
+        // --- 5. СЕКЦИЯ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
+        var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'));
         routeSec.anonymous = true;
         routeSec.addremove = true;
         routeSec.sortable = true;
-        wrapGridSection(routeSec, _('▶ Секции маршрутизации сервисов (Route Policies)'), false);
 
         o = routeSec.option(form.Flag, 'enabled', _('Вкл'));
         o.default = '1';
@@ -898,13 +822,15 @@ return view.extend({
 
         var outboundSelect = o;
         var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
-        var headers = {};
+        var nodeReqHeaders = {};
         if (apiToken) {
-            headers['X-API-Token'] = apiToken;
+            nodeReqHeaders['X-API-Token'] = apiToken;
         }
 
-        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes', { headers: headers })
-            .then(function(r) { return r.json(); })
+        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes', {
+            headers: nodeReqHeaders
+        })
+            .then(function(r) { return r.ok ? r.json() : []; })
             .then(function(nodes) {
                 if (Array.isArray(nodes)) {
                     nodes.forEach(function(n) {
@@ -922,7 +848,46 @@ return view.extend({
         o.rows = 4;
         o.modalonly = true;
 
-        return m.render();
+        // Оборачивание секций 2, 3, 4 и 5 в аккордеоны без разрушения CBA-привязок
+        return m.render().then(function(mapNode) {
+            var sections = mapNode.querySelectorAll('.cbi-section');
+            sections.forEach(function(secNode) {
+                var titleEl = secNode.querySelector('h2, h3, .cbi-section-title');
+                if (!titleEl) return;
+
+                var titleText = titleEl.textContent.trim();
+                if (!titleText || titleText.indexOf('Состояние, диагностика') !== -1) return;
+
+                var isMain = (titleText.indexOf('Параметры маршрутизации') !== -1);
+
+                var details = E('details', {
+                    'class': 'cb-accordion'
+                }, [
+                    E('summary', {}, [
+                        E('span', {}, '▶ ' + titleText),
+                        E('span', { 'style': 'font-size: 11px; font-weight: normal; color: var(--cb-text-muted); float: right;' }, _('(нажмите, чтобы развернуть/свернуть)'))
+                    ])
+                ]);
+
+                if (!isMain) {
+                    details.open = false;
+                } else {
+                    details.open = false;
+                }
+
+                titleEl.style.display = 'none';
+
+                var bodyWrapper = E('div', { 'style': 'margin-top: 10px;' });
+                while (secNode.firstChild) {
+                    bodyWrapper.appendChild(secNode.firstChild);
+                }
+
+                details.appendChild(bodyWrapper);
+                secNode.appendChild(details);
+            });
+
+            return mapNode;
+        });
     },
 
     handleSaveApply: function(ev, mode) {
@@ -930,20 +895,26 @@ return view.extend({
         return this.handleSave(ev).then(function() {
             return uci.save().then(function() {
                 return uci.apply().then(function() {
-                    ui.hideIndicator('saving-cheburnet');
-                    var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+                    var token = uci.get('cheburnet', 'main', 'api_token') || '';
                     var headers = {};
-                    if (apiToken) {
-                        headers['X-API-Token'] = apiToken;
+                    if (token) {
+                        headers['X-API-Token'] = token;
                     }
                     return fetch('http://' + window.location.hostname + ':8088/api/v1/reload', {
                         method: 'POST',
                         headers: headers
                     }).then(function() {
+                        ui.hideIndicator('saving-cheburnet');
+                        window.location.reload();
+                    }).catch(function() {
+                        ui.hideIndicator('saving-cheburnet');
                         window.location.reload();
                     });
                 });
             });
+        }).catch(function(err) {
+            ui.hideIndicator('saving-cheburnet');
+            ui.addNotification(null, E('p', {}, _('Ошибка сохранения: ') + err), 'error');
         });
     }
 });
