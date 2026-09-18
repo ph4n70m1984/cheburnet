@@ -76,15 +76,15 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             if echo "$VERSION" | grep -Eiq 'beta|rc|alpha|dev'; then
-              BUILD_TAGS="-tags metrics"
-              echo "[+] Pre-release tag detected ($VERSION): enabling '-tags metrics'"
+              BUILD_TAGS="-tags metrics,with_public_sub"
+              echo "[+] Pre-release tag detected ($VERSION): enabling '-tags metrics,with_public_sub'"
             else
-              echo "[+] Stable release tag detected ($VERSION): standard build (no metrics)"
+              echo "[+] Stable release tag detected ($VERSION): standard build (no metrics, no public_sub)"
             fi
           else
             VERSION="0.0.1-$(git rev-parse --short HEAD)"
-            BUILD_TAGS="-tags metrics"
-            echo "[+] Non-tag build ($VERSION): enabling '-tags metrics'"
+            BUILD_TAGS="-tags metrics,with_public_sub"
+            echo "[+] Non-tag build ($VERSION): enabling '-tags metrics,with_public_sub'"
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
