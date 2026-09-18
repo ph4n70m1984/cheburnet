@@ -35,7 +35,7 @@ fail() {
     exit 1
 }
 
-# 1. Проверка поддержки read -t и сброс лишних символов из буфера
+# 1. Проверка поддержки read -t
 READ_TIMEOUT_SUPPORTED="1"
 _READ_TIMEOUT_TEST=$( (read -r -t 0 _test) 2>&1 </dev/null )
 case "$_READ_TIMEOUT_TEST" in
@@ -47,19 +47,12 @@ unset _READ_TIMEOUT_TEST
 
 read_input() {
     READ_VALUE=""
-    if [ -t 0 ]; then
-        # Очищаем зависшие символы в терминале перед чтением
-        stty -icanon min 0 time 0 2>/dev/null || true
-        while read -r _discard; do :; done 2>/dev/null || true
-        stty icanon 2>/dev/null || true
-    fi
-
     if [ "$READ_TIMEOUT_SUPPORTED" = "1" ]; then
         read -r -t "$1" READ_VALUE || READ_VALUE=""
     else
         read -r READ_VALUE || READ_VALUE=""
     fi
-    READ_VALUE=$(echo "$READ_VALUE" | tr -d '\r\n')
+    READ_VALUE=$(echo "$READ_VALUE" | tr -d '\r\n ')
 }
 
 # 2. Сетевой транспорт
@@ -224,7 +217,7 @@ case "$CHOICE_SB" in
         ;;
 esac
 
-# 6. Проверка системных зависимостей и переустановка curl / libcurl
+# 6. Проверка системных зависимостей
 printf "\n${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle, libcurl, curl)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
     apk update
@@ -235,46 +228,65 @@ else
     opkg install nftables kmod-nft-tproxy ip-full ca-bundle
 fi
 
-# 7. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала
+# 7. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала и SemVer
 printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
-CHEBUR_RELEASE_JSON=""
+RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=25")
+[ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
 
-if [ "$SELECTED_CHANNEL" = "release" ]; then
-    CHEBUR_RELEASE_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases/latest")
-fi
+MATCH_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
 
-if [ -z "$CHEBUR_RELEASE_JSON" ] || echo "$CHEBUR_RELEASE_JSON" | grep -q '"message": *"Not Found"'; then
-    RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=20")
-    [ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
+PARSED_DATA=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" -v arch="$MATCH_ARCH" -v ext="$PKG_EXT" '
+    /"tag_name":/ {
+        t = $0
+        sub(/.*"tag_name":[[:space:]]*"/, "", t)
+        sub(/".*/, "", t)
+        gsub(/[v]/, "", t)
+        cur_tag = t
+        is_pre = 0
+        is_draft = 0
+    }
+    /"prerelease":[[:space:]]*true/ { is_pre = 1 }
+    /"draft":[[:space:]]*true/      { is_draft = 1 }
+    /"browser_download_url":/ {
+        u = $0
+        sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
+        sub(/".*/, "", u)
 
-    CHEBUR_RELEASE_JSON=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" '
-        BEGIN { RS="\"assets_url\":"; FS="\n" }
-        NR > 1 {
-            block = $0
-            is_pre = (block ~ /"prerelease": *true/)
-            is_draft = (block ~ /"draft": *true/)
-            if (is_draft) next;
+        if (cur_tag != "" && !is_draft && u ~ "\\." ext "$") {
+            if (chan == "release" && is_pre) next
 
-            if (chan == "release") {
-                if (!is_pre && block ~ /"tag_name":/) {
-                    print block
-                    exit
-                }
-            } else {
-                # В канале beta берем самый первый (наиболее свежий) релиз в списке
-                if (block ~ /"tag_name":/) {
-                    print block
-                    exit
+            if (u ~ arch || u ~ "aarch64") {
+                if (!url[cur_tag]) {
+                    url[cur_tag] = u
+                    tags[++n] = cur_tag
                 }
             }
         }
-    ')
-fi
+    }
+    END {
+        if (n == 0) exit 1
+        for (i = 1; i <= n; i++) {
+            for (j = i + 1; j <= n; j++) {
+                split(tags[i], a, "[-.]")
+                split(tags[j], b, "[-.]")
+                swap = 0
+                for (k = 1; k <= 4; k++) {
+                    va = a[k] + 0; vb = b[k] + 0
+                    if (vb > va) { swap = 1; break }
+                    if (va > vb) { break }
+                }
+                if (swap) { t = tags[i]; tags[i] = tags[j]; tags[j] = t }
+            }
+        }
+        print tags[1] "|" url[tags[1]]
+    }
+')
 
-[ -z "$CHEBUR_RELEASE_JSON" ] && fail "Не удалось найти подходящий релиз для канала $SELECTED_CHANNEL."
+[ -z "$PARSED_DATA" ] && fail "Не удалось найти подходящий пакет .$PKG_EXT под архитектуру $MATCH_ARCH для канала $SELECTED_CHANNEL."
 
-CHEBUR_LATEST_TAG=$(echo "$CHEBUR_RELEASE_JSON" | grep '"tag_name":' | head -n 1 | cut -d '"' -f 4)
-CHEBUR_CLEAN_VER=$(echo "$CHEBUR_LATEST_TAG" | sed 's/^v//')
+CHEBUR_CLEAN_VER=$(echo "$PARSED_DATA" | cut -d '|' -f 1)
+CHEBUR_URL=$(echo "$PARSED_DATA" | cut -d '|' -f 2)
+CHEBUR_LATEST_TAG="v${CHEBUR_CLEAN_VER}"
 
 printf "  Целевой релиз Chebur.NET (%s): ${Y}%s${N}\n" "$SELECTED_CHANNEL" "$CHEBUR_LATEST_TAG"
 
@@ -296,40 +308,19 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
         cp -f "/etc/config/cheburnet" "/tmp/cheburnet_config_backup"
     fi
 
+    printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
+    $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
+
+    printf "${C}[*] Установка пакета Chebur.NET...${N}\n"
     if [ "$PKG_MANAGER" = "apk" ]; then
-        MATCH_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
-        CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*_p[0-9]+.*${MATCH_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
-        if [ -z "$CHEBUR_URL" ]; then
-            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*${MATCH_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
-        fi
-        if [ -z "$CHEBUR_URL" ]; then
-            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep -E "browser_download_url.*_p[0-9]+.*${CHEBUR_ARCH}\.apk" | head -n 1 | cut -d '"' -f 4)
-        fi
-        if [ -z "$CHEBUR_URL" ]; then
-            CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*\.apk" | head -n 1 | cut -d '"' -f 4)
-        fi
-        [ -z "$CHEBUR_URL" ] && fail "Не найден подходящий .apk пакет для $MATCH_ARCH."
-
-        printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
-        $DOWNLOAD "/tmp/cheburnet.apk" "$CHEBUR_URL" || fail "Сбой при скачивании cheburnet.apk"
-
-        printf "${C}[*] Применение пакета Chebur.NET...${N}\n"
-        if ! apk add --allow-untrusted --force-overwrite /tmp/cheburnet.apk 2>/dev/null; then
+        if ! apk add --allow-untrusted --force-overwrite "/tmp/cheburnet.apk" 2>/dev/null; then
             printf "${Y}[!] Обход валидации пакета через распаковку архива...${N}\n"
             (tar -xzf /tmp/cheburnet.apk -C / 2>/dev/null || (dd if=/tmp/cheburnet.apk bs=1024 skip=1 2>/dev/null | tar -xzf - -C /))
         fi
         rm -f /tmp/cheburnet.apk /.PKGINFO /.pre-install /.post-install 2>/dev/null || true
     else
-        CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*${DISTRIB_ARCH:-$CHEBUR_ARCH}\.ipk" | head -n 1 | cut -d '"' -f 4)
-        [ -z "$CHEBUR_URL" ] && CHEBUR_URL=$(echo "$CHEBUR_RELEASE_JSON" | grep "browser_download_url.*\.ipk" | head -n 1 | cut -d '"' -f 4)
-        [ -z "$CHEBUR_URL" ] && fail "Не найден .ipk пакет под архитектуру $CHEBUR_ARCH."
-
-        printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
-        $DOWNLOAD "/tmp/cheburnet.ipk" "$CHEBUR_URL" || fail "Сбой при скачивании cheburnet.ipk"
-
-        printf "${C}[*] Установка пакета через opkg...${N}\n"
-        opkg install /tmp/cheburnet.ipk --force-reinstall
-        rm -f /tmp/cheburnet.ipk
+        opkg install "/tmp/cheburnet.ipk" --force-reinstall
+        rm -f "/tmp/cheburnet.ipk"
     fi
 
     if [ -f "/tmp/cheburnet_config_backup" ]; then
