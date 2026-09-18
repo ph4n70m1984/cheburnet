@@ -35,7 +35,7 @@ fail() {
     exit 1
 }
 
-# 1. Проверка поддержки read -t
+# 1. Проверка поддержки read -t и сброс лишних символов из буфера
 READ_TIMEOUT_SUPPORTED="1"
 _READ_TIMEOUT_TEST=$( (read -r -t 0 _test) 2>&1 </dev/null )
 case "$_READ_TIMEOUT_TEST" in
@@ -47,11 +47,19 @@ unset _READ_TIMEOUT_TEST
 
 read_input() {
     READ_VALUE=""
+    if [ -t 0 ]; then
+        # Очищаем зависшие символы в терминале перед чтением
+        stty -icanon min 0 time 0 2>/dev/null || true
+        while read -r _discard; do :; done 2>/dev/null || true
+        stty icanon 2>/dev/null || true
+    fi
+
     if [ "$READ_TIMEOUT_SUPPORTED" = "1" ]; then
         read -r -t "$1" READ_VALUE || READ_VALUE=""
     else
         read -r READ_VALUE || READ_VALUE=""
     fi
+    READ_VALUE=$(echo "$READ_VALUE" | tr -d '\r\n')
 }
 
 # 2. Сетевой транспорт
@@ -229,22 +237,20 @@ fi
 
 # 7. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала
 printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
-RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=20")
-[ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
-
 CHEBUR_RELEASE_JSON=""
 
 if [ "$SELECTED_CHANNEL" = "release" ]; then
-    # Пробуем получить через /releases/latest
     CHEBUR_RELEASE_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases/latest")
 fi
 
-# Если не удалось или выбран бета-канал — парсим первый подходящий блок релиза
-if [ -z "$CHEBUR_RELEASE_JSON" ] || echo "$CHEBUR_RELEASE_JSON" | grep -q "Not Found"; then
+if [ -z "$CHEBUR_RELEASE_JSON" ] || echo "$CHEBUR_RELEASE_JSON" | grep -q '"message": *"Not Found"'; then
+    RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=20")
+    [ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
+
     CHEBUR_RELEASE_JSON=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" '
-        BEGIN { RS="\"id\":"; FS="\n"; found=0 }
+        BEGIN { RS="\"assets_url\":"; FS="\n" }
         NR > 1 {
-            block = "\"id\":" $0
+            block = $0
             is_pre = (block ~ /"prerelease": *true/)
             is_draft = (block ~ /"draft": *true/)
             if (is_draft) next;
@@ -255,7 +261,7 @@ if [ -z "$CHEBUR_RELEASE_JSON" ] || echo "$CHEBUR_RELEASE_JSON" | grep -q "Not F
                     exit
                 }
             } else {
-                # Для beta берем самый свежий релиз
+                # В канале beta берем самый первый (наиболее свежий) релиз в списке
                 if (block ~ /"tag_name":/) {
                     print block
                     exit
@@ -276,7 +282,7 @@ NEED_UPDATE_CHEBUR="1"
 if [ -n "$CURRENT_CHEBUR_VER" ] && [ "$CURRENT_CHEBUR_VER" = "$CHEBUR_CLEAN_VER" ]; then
     printf "${G}[✓] Chebur.NET уже установлен с версией %s.${N}\n" "$CHEBUR_CLEAN_VER"
     printf "${C}[>] Переустановить пакет заново? [y/N]: ${N}"
-    read_input 15
+    read_input 20
     case "$READ_VALUE" in
         y|Y|д|Д) NEED_UPDATE_CHEBUR="1" ;;
         *) NEED_UPDATE_CHEBUR="0" ;;
