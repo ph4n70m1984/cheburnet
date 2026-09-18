@@ -121,21 +121,53 @@ func showHelp() {
 		"    get_system_info         Get device and OS specs (JSON)\n")
 }
 
-func main() {
-	// Принудительно настраиваем глобальный DNS-резолвер Go на публичные DNS,
-	// чтобы сбои локального [::1]:53 или dnsmasq не блокировали работу демона
+// setupBootstrapResolver конфигурирует net.DefaultResolver используя параметры bootstrap_dns
+// и dns_server из UCI, предотвращая сбои при блокировках жестко заданных IP.
+func setupBootstrapResolver(cfg *config.CheburConfig) {
+	var candidates []string
+
+	if cfg != nil {
+		if strings.TrimSpace(cfg.BootstrapDNS) != "" {
+			candidates = append(candidates, strings.TrimSpace(cfg.BootstrapDNS))
+		}
+		// Если основной dns_server является простым IP, используем его как второй fallback
+		if strings.TrimSpace(cfg.DNSServer) != "" && !strings.HasPrefix(cfg.DNSServer, "http") {
+			candidates = append(candidates, strings.TrimSpace(cfg.DNSServer))
+		}
+	}
+
+	// Fallback по умолчанию только если в UCI ничего не задано
+	if len(candidates) == 0 {
+		candidates = []string{"77.88.8.8", "1.1.1.1"}
+	}
+
+	var endpoints []string
+	for _, c := range candidates {
+		addr := c
+		if !strings.Contains(addr, ":") {
+			addr += ":53"
+		}
+		endpoints = append(endpoints, addr)
+	}
+
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 3 * time.Second}
-			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
-			if err != nil {
-				return d.DialContext(ctx, "udp", "1.1.1.1:53")
+			var lastErr error
+			for _, ep := range endpoints {
+				conn, err := d.DialContext(ctx, "udp", ep)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
 			}
-			return conn, nil
+			return nil, lastErr
 		},
 	}
+}
 
+func main() {
 	if len(os.Args) < 2 {
 		showHelp()
 		os.Exit(0)
@@ -376,7 +408,52 @@ func getRealActiveNode(defaultTag string) string {
 	return defaultTag
 }
 
+// acquirePIDLock захватывает неблокирующую эксклюзивную блокировку файла PID (LOCK_EX | LOCK_NB).
+// Предотвращает запуск второго экземпляра демона и повреждение сетевых правил.
+func acquirePIDLock(pidPath string) (*os.File, error) {
+	file, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PID file: %w", err)
+	}
+
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("another daemon instance is already running (PID locked): %w", err)
+	}
+
+	if err := file.Truncate(0); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to truncate PID file: %w", err)
+	}
+
+	if _, err := file.Seek(0, 0); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to seek PID file: %w", err)
+	}
+
+	if _, err := file.WriteString(fmt.Sprintf("%d\n", os.Getpid())); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to write PID: %w", err)
+	}
+
+	_ = file.Sync()
+	return file, nil
+}
+
 func runDaemon() {
+	pidLockFile, err := acquirePIDLock(PIDFile)
+	if err != nil {
+		log.Fatalf("[FATAL] Startup aborted: %v", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(pidLockFile.Fd()), syscall.LOCK_UN)
+		_ = pidLockFile.Close()
+		_ = os.Remove(PIDFile)
+	}()
+
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
@@ -390,9 +467,6 @@ func runDaemon() {
 		network.RestoreDnsmasq()
 	}()
 
-	_ = os.WriteFile(PIDFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
-	defer os.Remove(PIDFile)
-
 	ipv6Mgr := network.NewIPv6Manager()
 	if err := ipv6Mgr.EnsureIPv6Disabled(); err != nil {
 		log.Printf("[WARN] Failed to configure IPv6 state: %v", err)
@@ -403,6 +477,9 @@ func runDaemon() {
 	if err != nil {
 		log.Fatalf("[FATAL] Load config failed: %v", err)
 	}
+
+	// Инициализируем резолвер демона строго из загруженного конфига UCI
+	setupBootstrapResolver(initialConfig)
 
 	initialConfig.Engine = "sing-box"
 	if initialConfig.RulesetUpdateInterval == "" {
@@ -658,6 +735,9 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
+	// Обновляем резолвер при релоаде конфига
+	setupBootstrapResolver(&cfg)
+
 	if a.updManager != nil && cfg.UpdateChannel != "" {
 		a.updManager.SetUpdateChannel(cfg.UpdateChannel)
 	}
@@ -745,7 +825,7 @@ func (a *App) startActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("build %s config failed: %w", eng.Name(), err)
 	}
 
-	if err := a.singboxEng.ValidateConfig(targetPath); err != nil {
+	if err := a.singboxEng.ValidateConfig(ctx, targetPath); err != nil {
 		return fmt.Errorf("sing-box validate config failed: %w", err)
 	}
 

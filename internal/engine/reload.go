@@ -42,8 +42,8 @@ func SafeReload(ctx context.Context, eng Engine, cfg *config.CheburConfig, targe
 		return fmt.Errorf("build config failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 
-	// 2. Валидация бинарником (sing-box check)
-	if err := eng.ValidateConfig(stagingPath); err != nil {
+	// 2. Валидация бинарником (sing-box check) с передачей контекста
+	if err := eng.ValidateConfig(ctx, stagingPath); err != nil {
 		return fmt.Errorf("binary validation failed for %s: %w (active process untouched)", eng.Name(), err)
 	}
 

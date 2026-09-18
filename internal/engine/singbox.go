@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -19,18 +20,21 @@ import (
 
 const SingBoxPIDFile = "/var/run/cheburnet_singbox.pid"
 
+var ErrEngineBusy = errors.New("engine start/stop lifecycle transition already in progress")
+
 type ConfigBuilder interface {
 	Build(cfg *config.CheburConfig, targetPath string) error
 }
 
 type SingBoxEngine struct {
-	builder12 ConfigBuilder
-	builder13 ConfigBuilder
-	builder14 ConfigBuilder
-	cmd       *exec.Cmd
-	cfg       *config.CheburConfig
-	mu        sync.Mutex
-	client    *http.Client
+	builder12       ConfigBuilder
+	builder13       ConfigBuilder
+	builder14       ConfigBuilder
+	cmd             *exec.Cmd
+	cfg             *config.CheburConfig
+	mu              sync.Mutex
+	isTransitioning bool
+	client          *http.Client
 }
 
 func NewSingBoxEngine() *SingBoxEngine {
@@ -76,10 +80,16 @@ func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string)
 	}
 }
 
-func (s *SingBoxEngine) ValidateConfig(configPath string) error {
-	cmd := exec.Command("sing-box", "check", "-c", configPath)
+func (s *SingBoxEngine) ValidateConfig(ctx context.Context, configPath string) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(checkCtx, "sing-box", "check", "-c", configPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if checkCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("sing-box check timed out after 5s: configuration validation hung")
+		}
 		return fmt.Errorf("sing-box check failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -92,7 +102,6 @@ func killPIDSafely(pid int, expectedConfig string) {
 		return
 	}
 
-	// Читаем cmdline процесса для защиты от PID recycling
 	cmdlineBytes, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return
@@ -103,10 +112,8 @@ func killPIDSafely(pid int, expectedConfig string) {
 		return
 	}
 
-	// Отправляем мягкий сигнал SIGTERM
 	_ = syscall.Kill(pid, syscall.SIGTERM)
 
-	// Ожидаем завершения до 1.5 секунд
 	for i := 0; i < 15; i++ {
 		if err := syscall.Kill(pid, 0); err != nil {
 			return
@@ -114,7 +121,6 @@ func killPIDSafely(pid int, expectedConfig string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Принудительное завершение, если процесс завис
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
@@ -133,30 +139,41 @@ func (s *SingBoxEngine) cleanupStalePID(configPath string) {
 
 func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	if s.isTransitioning {
+		s.mu.Unlock()
+		return ErrEngineBusy
+	}
+	s.isTransitioning = true
+	defer func() {
+		s.mu.Lock()
+		s.isTransitioning = false
+		s.mu.Unlock()
+	}()
 
-	// 1. Штатно останавливаем сохранённый процесс, если он существует
-	if s.cmd != nil && s.cmd.Process != nil {
+	// Останавливаем предыдущий процесс, если он существует
+	if s.cmd != nil {
 		_ = s.stopLocked()
 	}
 
-	// 2. Безопасная очистка: завершаем только брошенный экземпляр по PID-файлу с проверкой cmdline
+	// Очищаем зависший экземпляр по PID-файлу
 	s.cleanupStalePID(configPath)
+	s.mu.Unlock()
 
 	if err := s.EnsureAssets(ctx); err != nil {
 		return fmt.Errorf("sing-box assets check failed: %w", err)
 	}
 
-	s.cmd = NewIsolatedCmd(ctx, "sing-box", "run", "-c", configPath)
-	if err := s.cmd.Start(); err != nil {
-		s.cmd = nil
+	newCmd := NewIsolatedCmd(ctx, "sing-box", "run", "-c", configPath)
+	if err := newCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start sing-box: %w", err)
 	}
 
-	// 3. Фиксируем PID нового дочернего процесса
-	if s.cmd.Process != nil {
-		_ = os.WriteFile(SingBoxPIDFile, []byte(strconv.Itoa(s.cmd.Process.Pid)), 0644)
+	s.mu.Lock()
+	s.cmd = newCmd
+	if newCmd.Process != nil {
+		_ = os.WriteFile(SingBoxPIDFile, []byte(strconv.Itoa(newCmd.Process.Pid)), 0644)
 	}
+	s.mu.Unlock()
 
 	return nil
 }
@@ -167,35 +184,39 @@ func (s *SingBoxEngine) Stop() error {
 	return s.stopLocked()
 }
 
+// stopLocked атомарно отвязывает активный *exec.Cmd и PID-файл, после чего
+// гарантирует полное завершение процесса sing-box.
 func (s *SingBoxEngine) stopLocked() error {
-	defer func() {
-		s.cmd = nil
-		_ = os.Remove(SingBoxPIDFile)
-	}()
+	// 1. Атомарно забираем дескриптор процесса и немедленно обнуляем поле структуры
+	targetCmd := s.cmd
+	s.cmd = nil
+	_ = os.Remove(SingBoxPIDFile)
 
-	if s.cmd == nil || s.cmd.Process == nil {
+	if targetCmd == nil || targetCmd.Process == nil {
 		return nil
 	}
 
-	pid := s.cmd.Process.Pid
+	pid := targetCmd.Process.Pid
 	done := make(chan error, 1)
 	go func() {
-		done <- s.cmd.Wait()
+		done <- targetCmd.Wait()
 	}()
 
-	_ = s.cmd.Process.Signal(syscall.SIGTERM)
+	// 2. Отправляем SIGTERM
+	_ = targetCmd.Process.Signal(syscall.SIGTERM)
 
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		_ = s.cmd.Process.Kill()
+		// Принудительное завершение через SIGKILL при таймауте
+		_ = targetCmd.Process.Kill()
 		select {
 		case <-done:
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
 
-	// Страховочная отправка SIGKILL строго по собственному PID
+	// 3. Страховочная проверка: если процесс остался в системе, добиваем строго по PID
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	return nil
 }
