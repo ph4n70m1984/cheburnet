@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"os/exec"
@@ -20,6 +22,12 @@ func generateSecureHex(n int) string {
 	return fmt.Sprintf("%x", b)
 }
 
+func sanitizeToken(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "'\"`")
+	return strings.TrimSpace(s)
+}
+
 func parseTextLines(raw string) []string {
 	var result []string
 	for _, line := range strings.Split(raw, "\n") {
@@ -34,9 +42,9 @@ func parseTextLines(raw string) []string {
 			return r == ' ' || r == ',' || r == '\t'
 		})
 		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				result = append(result, p)
+			clean := sanitizeToken(p)
+			if clean != "" {
+				result = append(result, clean)
 			}
 		}
 	}
@@ -46,7 +54,7 @@ func parseTextLines(raw string) []string {
 func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 	var rules []CustomSRSRule
 	for _, raw := range rawList {
-		raw = strings.TrimSpace(raw)
+		raw = sanitizeToken(raw)
 		if raw == "" {
 			continue
 		}
@@ -58,15 +66,15 @@ func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 		}
 
 		if len(parts) == 1 {
-			rule.URL = strings.TrimSpace(parts[0])
+			rule.URL = sanitizeToken(parts[0])
 			rule.Name = "custom"
 		} else if len(parts) == 2 {
-			rule.Name = strings.TrimSpace(parts[0])
-			rule.URL = strings.TrimSpace(parts[1])
+			rule.Name = sanitizeToken(parts[0])
+			rule.URL = sanitizeToken(parts[1])
 		} else if len(parts) >= 3 {
-			rule.Name = strings.TrimSpace(parts[0])
-			rule.URL = strings.TrimSpace(parts[1])
-			detour := strings.ToLower(strings.TrimSpace(parts[2]))
+			rule.Name = sanitizeToken(parts[0])
+			rule.URL = sanitizeToken(parts[1])
+			detour := strings.ToLower(sanitizeToken(parts[2]))
 			if detour == "proxy" {
 				rule.DownloadDetour = "proxy"
 			}
@@ -79,143 +87,207 @@ func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 	return rules
 }
 
-func (u *UCIStorage) Load() (*CheburConfig, error) {
-	cfg := &CheburConfig{
-		Engine:                u.get("cheburnet.main.engine", "sing-box"),
-		RoutingMode:           u.get("cheburnet.main.routing_mode", "rules"),
-		SourceMode:            u.get("cheburnet.main.source_mode", "subscription"),
-		AutoHWID:              u.get("cheburnet.main.auto_hwid", "1") == "1",
-		CustomHWID:            u.get("cheburnet.main.custom_hwid", ""),
-		RulesetUpdateInterval: u.get("cheburnet.main.ruleset_update_interval", "72h"),
-		TProxyPort:            u.getInt("cheburnet.main.tproxy_port", 1602),
-		DNSPort:               u.getInt("cheburnet.main.dns_port", 53),
-		MixedPort:             u.getInt("cheburnet.main.mixed_port", 4534),
-		SourceIface:           u.get("cheburnet.main.source_interface", "br-lan"),
-		DNSProtocol:           u.get("cheburnet.main.dns_protocol", "udp"),
-		DNSServer:             u.get("cheburnet.main.dns_server", "8.8.8.8"),
-		BootstrapDNS:          u.get("cheburnet.main.bootstrap_dns", "77.88.8.8"),
-		DNSTTL:                u.getInt("cheburnet.main.dns_ttl", 60),
-		EnableYACD:            u.get("cheburnet.main.enable_yacd", "1") == "1",
-		AutoUpdate:            u.get("cheburnet.main.auto_update", "0") == "1",
-		UpdateChannel:         u.get("cheburnet.main.update_channel", "release"),
+// uciCache представляет собой снимки конфигурации, загруженные ровно за один fork+exec
+type uciCache struct {
+	scalars map[string]string
+	lists   map[string][]string
+	rawShow string
+}
 
-		// Чтение настроек публичной подписки и Clash API
-		PublicSubEnabled: u.get("cheburnet.main.public_sub_enabled", "0") == "1",
-		PublicSubPort:    u.getInt("cheburnet.main.public_sub_port", 9443),
-		PublicSubToken:   u.get("cheburnet.main.public_sub_token", ""),
-		ClashAPISecret:   u.get("cheburnet.main.clash_api_secret", ""),
-
-		// Чтение токена доступа к внутреннему API
-		APIToken: u.get("cheburnet.main.api_token", ""),
+func loadUCICache(packageName string) (*uciCache, error) {
+	out, err := exec.Command("uci", "-q", "show", packageName).Output()
+	if err != nil {
+		return nil, err
 	}
 
-	// Автоматическая генерация токена API при первом запуске, если он отсутствует
+	cache := &uciCache{
+		scalars: make(map[string]string),
+		lists:   make(map[string][]string),
+		rawShow: string(out),
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := sanitizeToken(parts[1])
+
+		// Определение списков UCI вида: cheburnet.main.rulesets[0]='russia'
+		if idx := strings.Index(k, "["); idx != -1 && strings.HasSuffix(k, "]") {
+			baseKey := k[:idx]
+			if v != "" {
+				cache.lists[baseKey] = append(cache.lists[baseKey], v)
+			}
+		} else {
+			cache.scalars[k] = v
+		}
+	}
+
+	return cache, nil
+}
+
+func (c *uciCache) get(key, def string) string {
+	if val, ok := c.scalars[key]; ok && val != "" {
+		return val
+	}
+	return def
+}
+
+func (c *uciCache) getInt(key string, def int) int {
+	valStr := c.get(key, "")
+	if valStr == "" {
+		return def
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
+		return def
+	}
+	return val
+}
+
+func (c *uciCache) getList(key string) []string {
+	if list, ok := c.lists[key]; ok && len(list) > 0 {
+		clean := make([]string, 0, len(list))
+		for _, item := range list {
+			token := sanitizeToken(item)
+			if token != "" {
+				clean = append(clean, token)
+			}
+		}
+		return clean
+	}
+	if val, ok := c.scalars[key]; ok && strings.TrimSpace(val) != "" {
+		fields := strings.Fields(val)
+		clean := make([]string, 0, len(fields))
+		for _, f := range fields {
+			token := sanitizeToken(f)
+			if token != "" {
+				clean = append(clean, token)
+			}
+		}
+		return clean
+	}
+	return nil
+}
+
+func (u *UCIStorage) Load() (*CheburConfig, error) {
+	cache, err := loadUCICache("cheburnet")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read uci config: %w", err)
+	}
+
+	cfg := &CheburConfig{
+		Engine:                cache.get("cheburnet.main.engine", "sing-box"),
+		RoutingMode:           cache.get("cheburnet.main.routing_mode", "rules"),
+		SourceMode:            cache.get("cheburnet.main.source_mode", "subscription"),
+		AutoHWID:              cache.get("cheburnet.main.auto_hwid", "1") == "1",
+		CustomHWID:            cache.get("cheburnet.main.custom_hwid", ""),
+		RulesetUpdateInterval: cache.get("cheburnet.main.ruleset_update_interval", "72h"),
+		TProxyPort:            cache.getInt("cheburnet.main.tproxy_port", 1602),
+		DNSPort:               cache.getInt("cheburnet.main.dns_port", 53),
+		MixedPort:             cache.getInt("cheburnet.main.mixed_port", 4534),
+		SourceIface:           cache.get("cheburnet.main.source_interface", "br-lan"),
+		DNSProtocol:           cache.get("cheburnet.main.dns_protocol", "udp"),
+		DNSServer:             cache.get("cheburnet.main.dns_server", "8.8.8.8"),
+		BootstrapDNS:          cache.get("cheburnet.main.bootstrap_dns", "77.88.8.8"),
+		DNSTTL:                cache.getInt("cheburnet.main.dns_ttl", 60),
+		EnableYACD:            cache.get("cheburnet.main.enable_yacd", "1") == "1",
+		AutoUpdate:            cache.get("cheburnet.main.auto_update", "0") == "1",
+		UpdateChannel:         cache.get("cheburnet.main.update_channel", "release"),
+
+		URLTestInterval:  cache.get("cheburnet.main.urltest_interval", "3m"),
+		URLTestTolerance: cache.getInt("cheburnet.main.urltest_tolerance", 50),
+		URLTestURL:       cache.get("cheburnet.main.urltest_url", "https://www.gstatic.com/generate_204"),
+
+		PublicSubEnabled: cache.get("cheburnet.main.public_sub_enabled", "0") == "1",
+		PublicSubPort:    cache.getInt("cheburnet.main.public_sub_port", 9443),
+		PublicSubToken:   cache.get("cheburnet.main.public_sub_token", ""),
+		ClashAPISecret:   cache.get("cheburnet.main.clash_api_secret", ""),
+
+		APIToken: cache.get("cheburnet.main.api_token", ""),
+	}
+
 	if cfg.APIToken == "" {
-		generatedToken := generateSecureHex(16) // 32 hex-символа
+		generatedToken := generateSecureHex(16)
 		_ = exec.Command("uci", "set", "cheburnet.main.api_token="+generatedToken).Run()
 		_ = exec.Command("uci", "commit", "cheburnet").Run()
 		cfg.APIToken = generatedToken
 	}
 
-	// 1. Чтение секций 'subscription'
-	cfg.Subscriptions = u.loadSubscriptionSections()
+	// 1. Чтение подписок из памяти
+	cfg.Subscriptions = u.parseSubscriptionSections(cache.rawShow)
 
-	// 2. Обратная совместимость: чтение старого 'list subscription' из main
+	// 2. Обратная совместимость для старого main.subscription
 	if len(cfg.Subscriptions) == 0 {
-		if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.subscription").Output(); err == nil {
-			lines := strings.Fields(string(out))
-			for _, raw := range lines {
-				val := strings.TrimSpace(raw)
-				if val != "" {
-					cfg.Subscriptions = append(cfg.Subscriptions, SubscriptionConfig{
-						URL:            val,
-						UserAgent:      "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
-						Enabled:        true,
-						FilterMode:     "exclude",
-						UpdateInterval: "24h",
-					})
-				}
-			}
-		}
-	}
-
-	// 3. Чтение политик для устройств (client_rule)
-	cfg.ClientPolicies = u.loadClientRuleSections()
-
-	// 4. Чтение секций маршрутизации сервисов (route_policy)
-	cfg.RoutePolicies = u.loadRoutePolicySections()
-
-	// Чтение списка одиночных ссылок нод (vless://, hy2:// и др.)
-	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.manual_nodes").Output(); err == nil {
-		lines := strings.Fields(string(out))
-		for _, raw := range lines {
-			val := strings.TrimSpace(raw)
+		oldSubs := cache.getList("cheburnet.main.subscription")
+		for _, raw := range oldSubs {
+			val := sanitizeToken(raw)
 			if val != "" {
-				cfg.ManualNodes = append(cfg.ManualNodes, val)
+				sub := SubscriptionConfig{
+					URL:            val,
+					UserAgent:      "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
+					Enabled:        true,
+					FilterMode:     "exclude",
+					UpdateInterval: "24h",
+				}
+				sub.CompileFilters()
+				cfg.Subscriptions = append(cfg.Subscriptions, sub)
 			}
 		}
 	}
 
-	// Чтение наборов правил (.srs)
-	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.rulesets").Output(); err == nil {
-		trimmed := strings.TrimSpace(string(out))
-		if len(trimmed) > 0 {
-			lines := strings.Fields(trimmed)
-			cfg.RuleSets = append(cfg.RuleSets, lines...)
-		} else {
-			cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
+	// 3. Чтение политик клиентов
+	cfg.ClientPolicies = u.parseClientRuleSections(cache.rawShow)
+
+	// 4. Чтение секций маршрутизации сервисов
+	cfg.RoutePolicies = u.parseRoutePolicySections(cache.rawShow)
+
+	// Чтение одиночных узлов
+	cfg.ManualNodes = cache.getList("cheburnet.main.manual_nodes")
+
+	// Чтение наборов правил .srs
+	rawRuleSets := cache.getList("cheburnet.main.rulesets")
+	if len(rawRuleSets) > 0 {
+		cleanSets := make([]string, 0, len(rawRuleSets))
+		for _, rs := range rawRuleSets {
+			c := sanitizeToken(rs)
+			if c != "" {
+				cleanSets = append(cleanSets, c)
+			}
 		}
+		cfg.RuleSets = cleanSets
 	} else {
 		cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
 	}
 
-	// Чтение пользовательских списков SRS (custom_srs_rulesets)
-	var rawCustomSRS []string
-	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.custom_srs_rulesets").Output(); err == nil {
-		trimmed := strings.TrimSpace(string(out))
-		if len(trimmed) > 0 {
-			rawLines := strings.Split(trimmed, "\n")
-			for _, rl := range rawLines {
-				rl = strings.TrimSpace(rl)
-				if rl != "" {
-					rawCustomSRS = append(rawCustomSRS, rl)
-				}
-			}
-		}
-	}
-	cfg.CustomSRSRulesets = parseCustomSRSRules(rawCustomSRS)
+	// Чтение кастомных SRS правил
+	cfg.CustomSRSRulesets = parseCustomSRSRules(cache.getList("cheburnet.main.custom_srs_rulesets"))
 
 	// Чтение кастомных доменов, подсетей и портов
-	cfg.CustomDomains = parseTextLines(u.get("cheburnet.main.custom_domains", ""))
-	cfg.CustomSubnets = parseTextLines(u.get("cheburnet.main.custom_subnets", ""))
-	cfg.CustomPorts = parseTextLines(u.get("cheburnet.main.custom_ports", ""))
+	cfg.CustomDomains = parseTextLines(cache.get("cheburnet.main.custom_domains", ""))
+	cfg.CustomSubnets = parseTextLines(cache.get("cheburnet.main.custom_subnets", ""))
+	cfg.CustomPorts = parseTextLines(cache.get("cheburnet.main.custom_ports", ""))
 
-	// Чтение путей к локальным файлам .lst
-	if out, err := exec.Command("uci", "-q", "get", "cheburnet.main.local_list_files").Output(); err == nil {
-		lines := strings.Fields(string(out))
-		for _, raw := range lines {
-			val := strings.TrimSpace(raw)
-			if val != "" {
-				cfg.LocalListFiles = append(cfg.LocalListFiles, val)
-			}
-		}
-	}
+	// Чтение путей к локальным файлам
+	cfg.LocalListFiles = cache.getList("cheburnet.main.local_list_files")
 
 	return cfg, nil
 }
 
-func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
+func (u *UCIStorage) parseSubscriptionSections(rawShow string) []SubscriptionConfig {
 	var subs []SubscriptionConfig
-	out, err := exec.Command("uci", "-q", "show", "cheburnet").Output()
-	if err != nil {
-		return subs
-	}
-
 	secMap := make(map[string]*SubscriptionConfig)
-	lines := strings.Split(string(out), "\n")
+	scanner := bufio.NewScanner(strings.NewReader(rawShow))
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "cheburnet.@subscription[") {
 			continue
 		}
@@ -231,7 +303,7 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 		}
 
 		secID := keyParts[1]
-		val := strings.Trim(parts[1], "'\"")
+		val := sanitizeToken(parts[1])
 
 		if _, ok := secMap[secID]; !ok {
 			secMap[secID] = &SubscriptionConfig{
@@ -259,20 +331,20 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 		case "update_interval":
 			secMap[secID].UpdateInterval = val
 		case "filter_mode":
-			if val == "include" {
+			if strings.EqualFold(val, "include") {
 				secMap[secID].FilterMode = "include"
 			} else {
 				secMap[secID].FilterMode = "exclude"
 			}
 		case "enabled":
-			secMap[secID].Enabled = (val == "1" || val == "true")
+			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
 		case "exclude_regex":
 			rawRight := parts[1]
 			if strings.Contains(rawRight, "'") {
 				tokens := strings.Split(rawRight, "'")
 				for _, token := range tokens {
-					item := strings.TrimSpace(token)
-					if item != "" && item != "\"" {
+					item := sanitizeToken(token)
+					if item != "" {
 						secMap[secID].ExcludeRegex = append(secMap[secID].ExcludeRegex, item)
 					}
 				}
@@ -290,24 +362,20 @@ func (u *UCIStorage) loadSubscriptionSections() []SubscriptionConfig {
 			if sub.UpdateInterval == "" {
 				sub.UpdateInterval = "24h"
 			}
+			sub.CompileFilters()
 			subs = append(subs, *sub)
 		}
 	}
 	return subs
 }
 
-func (u *UCIStorage) loadRoutePolicySections() []RoutePolicy {
+func (u *UCIStorage) parseRoutePolicySections(rawShow string) []RoutePolicy {
 	var policies []RoutePolicy
-	out, err := exec.Command("uci", "-q", "show", "cheburnet").Output()
-	if err != nil {
-		return policies
-	}
-
 	secMap := make(map[string]*RoutePolicy)
-	lines := strings.Split(string(out), "\n")
+	scanner := bufio.NewScanner(strings.NewReader(rawShow))
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "cheburnet.@route_policy[") {
 			continue
 		}
@@ -323,7 +391,7 @@ func (u *UCIStorage) loadRoutePolicySections() []RoutePolicy {
 		}
 
 		secID := keyParts[1]
-		val := strings.Trim(parts[1], "'\"")
+		val := sanitizeToken(parts[1])
 
 		if _, ok := secMap[secID]; !ok {
 			secMap[secID] = &RoutePolicy{
@@ -342,14 +410,14 @@ func (u *UCIStorage) loadRoutePolicySections() []RoutePolicy {
 		case "outbound":
 			secMap[secID].Outbound = val
 		case "enabled":
-			secMap[secID].Enabled = (val == "1" || val == "true")
+			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
 		case "rulesets":
 			rawRight := parts[1]
 			if strings.Contains(rawRight, "'") {
 				tokens := strings.Split(rawRight, "'")
 				for _, token := range tokens {
-					item := strings.TrimSpace(token)
-					if item != "" && item != "\"" {
+					item := sanitizeToken(token)
+					if item != "" {
 						secMap[secID].RuleSets = append(secMap[secID].RuleSets, item)
 					}
 				}
@@ -371,18 +439,13 @@ func (u *UCIStorage) loadRoutePolicySections() []RoutePolicy {
 	return policies
 }
 
-func (u *UCIStorage) loadClientRuleSections() []ClientPolicy {
+func (u *UCIStorage) parseClientRuleSections(rawShow string) []ClientPolicy {
 	var policies []ClientPolicy
-	out, err := exec.Command("uci", "-q", "show", "cheburnet").Output()
-	if err != nil {
-		return policies
-	}
-
 	secMap := make(map[string]*ClientPolicy)
-	lines := strings.Split(string(out), "\n")
+	scanner := bufio.NewScanner(strings.NewReader(rawShow))
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "cheburnet.@client_rule[") {
 			continue
 		}
@@ -398,7 +461,7 @@ func (u *UCIStorage) loadClientRuleSections() []ClientPolicy {
 		}
 
 		secID := keyParts[1]
-		val := strings.Trim(parts[1], "'\"")
+		val := sanitizeToken(parts[1])
 
 		if _, ok := secMap[secID]; !ok {
 			secMap[secID] = &ClientPolicy{
@@ -415,7 +478,7 @@ func (u *UCIStorage) loadClientRuleSections() []ClientPolicy {
 		case "mode":
 			secMap[secID].Mode = ClientMode(val)
 		case "enabled":
-			secMap[secID].Enabled = (val == "1" || val == "true")
+			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
 		}
 	}
 
@@ -435,33 +498,12 @@ func (u *UCIStorage) SaveEngine(engineName string) error {
 func (u *UCIStorage) SaveRuleSets(rulesets []string) error {
 	_ = exec.Command("uci", "delete", "cheburnet.main.rulesets").Run()
 	for _, rs := range rulesets {
-		_ = exec.Command("uci", "add_list", "cheburnet.main.rulesets="+rs).Run()
+		clean := sanitizeToken(rs)
+		if clean != "" {
+			_ = exec.Command("uci", "add_list", "cheburnet.main.rulesets="+clean).Run()
+		}
 	}
 	return exec.Command("uci", "commit", "cheburnet").Run()
-}
-
-func (u *UCIStorage) get(key, def string) string {
-	out, err := exec.Command("uci", "-q", "get", key).Output()
-	if err != nil {
-		return def
-	}
-	val := strings.TrimSpace(string(out))
-	if val == "" {
-		return def
-	}
-	return val
-}
-
-func (u *UCIStorage) getInt(key string, def int) int {
-	valStr := u.get(key, "")
-	if valStr == "" {
-		return def
-	}
-	val, err := strconv.Atoi(valStr)
-	if err != nil {
-		return def
-	}
-	return val
 }
 
 func (u *UCIStorage) AddSubscription(sub SubscriptionConfig) error {
@@ -499,7 +541,7 @@ func (u *UCIStorage) AddSubscription(sub SubscriptionConfig) error {
 	_ = exec.Command("uci", "set", fmt.Sprintf("cheburnet.%s.enabled=1", secID)).Run()
 
 	for _, reg := range sub.ExcludeRegex {
-		reg = strings.TrimSpace(reg)
+		reg = sanitizeToken(reg)
 		if reg != "" {
 			_ = exec.Command("uci", "add_list", fmt.Sprintf("cheburnet.%s.exclude_regex=%s", secID, reg)).Run()
 		}

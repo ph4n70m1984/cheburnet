@@ -13,6 +13,7 @@ import (
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
+	"cheburnet/internal/service"
 	"cheburnet/internal/subscription"
 	"cheburnet/internal/telemetry"
 	"cheburnet/internal/updater"
@@ -181,6 +182,14 @@ func (s *Server) setupRoutes() {
 
 	api.Post("/actions/:action", auth, func(c *fiber.Ctx) error {
 		action := c.Params("action")
+		if action == "restart_service" {
+			log.Println("[INFO] Restart requested via API, delegating to procd ubus...")
+			if err := service.RestartAsync(); err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+			}
+			return c.JSON(fiber.Map{"status": "restarting"})
+		}
+
 		if s.onAction != nil {
 			if err := s.onAction(action); err != nil {
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
@@ -271,9 +280,8 @@ func (s *Server) setupRoutes() {
 
 					if tgt == "cheburnet" || tgt == "all" {
 						time.Sleep(1 * time.Second)
-						restartCtx, restartCancel := context.WithTimeout(context.Background(), 10*time.Second)
-						defer restartCancel()
-						_ = exec.CommandContext(restartCtx, "/etc/init.d/cheburnet", "restart").Run()
+						log.Printf("[INFO] Restarting daemon via procd ubus after upgrade...")
+						_ = service.RestartAsync()
 					}
 				}(target)
 			}

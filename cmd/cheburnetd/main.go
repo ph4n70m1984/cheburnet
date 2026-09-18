@@ -25,6 +25,7 @@ import (
 	"cheburnet/internal/engine"
 	"cheburnet/internal/network"
 	"cheburnet/internal/ruleset"
+	"cheburnet/internal/service"
 	"cheburnet/internal/subscription"
 	"cheburnet/internal/telemetry"
 	"cheburnet/internal/updater"
@@ -99,7 +100,7 @@ func showHelp() {
 		"Service Management:\n" +
 		"    start                   Start cheburnet daemon service (foreground)\n" +
 		"    stop                    Stop cheburnet background daemon\n" +
-		"    restart                 Restart daemon service\n" +
+		"    restart                 Restart daemon service via procd\n" +
 		"    reload                  Reload configuration without dropping routing\n" +
 		"    list_update             Update subscriptions and rulesets\n" +
 		"    check_updates           Check component and daemon updates\n" +
@@ -121,6 +122,20 @@ func showHelp() {
 }
 
 func main() {
+	// Принудительно настраиваем глобальный DNS-резолвер Go на публичные DNS,
+	// чтобы сбои локального [::1]:53 или dnsmasq не блокировали работу демона
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
+			if err != nil {
+				return d.DialContext(ctx, "udp", "1.1.1.1:53")
+			}
+			return conn, nil
+		},
+	}
+
 	if len(os.Args) < 2 {
 		showHelp()
 		os.Exit(0)
@@ -136,9 +151,7 @@ func main() {
 		stopDaemon()
 
 	case "restart":
-		stopDaemon()
-		time.Sleep(1 * time.Second)
-		runDaemon()
+		_ = service.RestartAsync()
 
 	case "reload":
 		callAPI(http.MethodPost, "/api/v1/reload", nil)
@@ -204,19 +217,23 @@ func main() {
 
 func collectAllRuleSets(cfg *config.CheburConfig) []string {
 	unique := make(map[string]struct{})
-	for _, rs := range cfg.RuleSets {
-		norm := strings.ToLower(strings.TrimSpace(rs))
-		if norm != "" {
-			unique[norm] = struct{}{}
+
+	addClean := func(raw string) {
+		clean := strings.TrimSpace(raw)
+		clean = strings.Trim(clean, "'\"`")
+		clean = strings.ToLower(clean)
+		if clean != "" {
+			unique[clean] = struct{}{}
 		}
+	}
+
+	for _, rs := range cfg.RuleSets {
+		addClean(rs)
 	}
 	for _, rp := range cfg.RoutePolicies {
 		if rp.Enabled {
 			for _, rs := range rp.RuleSets {
-				norm := strings.ToLower(strings.TrimSpace(rs))
-				if norm != "" {
-					unique[norm] = struct{}{}
-				}
+				addClean(rs)
 			}
 		}
 	}
@@ -529,8 +546,8 @@ func runDaemon() {
 			return cfg.AutoUpdate
 		},
 		func() {
-			log.Println("[INFO] Restarting daemon after auto-upgrade...")
-			_ = exec.Command("/etc/init.d/cheburnet", "restart").Start()
+			log.Println("[INFO] Restarting daemon via procd ubus after auto-upgrade...")
+			_ = service.RestartAsync()
 		},
 	)
 

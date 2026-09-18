@@ -61,12 +61,11 @@ func parseDurationSafe(intervalStr string) time.Duration {
 	}
 }
 
-// StartSubscriptionLoops запускает индивидуальные таймеры автообновления для каждой подписки
+// StartSubscriptionLoops запускает таймеры автообновления для каждой подписки
 func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.SubscriptionConfig, onUpdate func(sub config.SubscriptionConfig)) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Останавливаем предыдущие фоновые горутины
 	for _, cancel := range w.cancelMap {
 		cancel()
 	}
@@ -150,22 +149,8 @@ type xrayOutboundItem struct {
 	StreamSettings map[string]interface{} `json:"streamSettings"`
 }
 
-func filterNodesByRegex(nodes []*config.GenericNode, patterns []string, filterMode string) []*config.GenericNode {
-	if len(patterns) == 0 {
-		return nodes
-	}
-
-	var compiled []*regexp.Regexp
-	for _, p := range patterns {
-		p = strings.TrimSpace(strings.Trim(p, "'\""))
-		if p == "" {
-			continue
-		}
-		if re, err := regexp.Compile("(?i)" + p); err == nil {
-			compiled = append(compiled, re)
-		}
-	}
-
+// filterNodesByCompiledRegex использует уже скомпилированные регулярные выражения из памяти
+func filterNodesByCompiledRegex(nodes []*config.GenericNode, compiled []*regexp.Regexp, filterMode string) []*config.GenericNode {
 	if len(compiled) == 0 {
 		return nodes
 	}
@@ -209,9 +194,14 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		filterMode = "exclude"
 	}
 
+	// Гарантируем наличие скомпилированных регулярок
+	if len(sub.CompiledRegex) == 0 && len(sub.ExcludeRegex) > 0 {
+		sub.CompileFilters()
+	}
+
 	var body []byte
 
-	// 1. Обработка статической ссылки happ://crypt4/
+	// 1. Статическая ссылка happ://crypt4/
 	if happ.IsCrypt4(reqURL) {
 		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
 		if err != nil {
@@ -219,8 +209,8 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		}
 		body = decrypted
 	} else {
-		// 2. Обычный HTTP запрос
-		reqCtx, reqCancel := context.WithTimeout(context.Background(), 12*time.Second)
+		// 2. HTTP-запрос
+		reqCtx, reqCancel := context.WithTimeout(ctx, 12*time.Second)
 		defer reqCancel()
 
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
@@ -282,7 +272,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			return nil, err
 		}
 
-		// 3. Обработка случая, когда сервер вернул happ://crypt4/ в теле
 		strBody := strings.TrimSpace(string(rawBody))
 		if happ.IsCrypt4(strBody) {
 			decrypted, err := happ.DecryptCrypt4(strBody, targetHWID, sub.HWID, "HappDefaultSalt")
@@ -316,11 +305,11 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON массив профилей (Remnawave/Happ)[cite: 11]
-	if xrayNodes := parseXrayJSON(body, targetHWID, sub.ExcludeRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
+	// 1. Попытка распарсить как Xray JSON массив профилей
+	if xrayNodes := parseXrayJSON(body, targetHWID, sub.CompiledRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML[cite: 11]
+		// 2. Попытка распарсить как Clash YAML
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -357,7 +346,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Base64[cite: 11]
+			// 3. Base64
 			content := string(body)
 			trimmed := strings.TrimSpace(content)
 
@@ -371,7 +360,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				}
 			}
 
-			// 4. Plaintext построчно[cite: 11]
+			// 4. Plaintext построчно
 			scanner := bufio.NewScanner(strings.NewReader(content))
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
@@ -393,7 +382,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			}
 		}
 
-		nodes = filterNodesByRegex(nodes, sub.ExcludeRegex, filterMode)
+		nodes = filterNodesByCompiledRegex(nodes, sub.CompiledRegex, filterMode)
 	}
 
 	if len(nodes) == 0 {
@@ -403,7 +392,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 	return nodes, nil
 }
 
-func parseXrayJSON(data []byte, targetHWID string, patterns []string, filterMode string, subName string, seenTags map[string]bool) []*config.GenericNode {
+func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, filterMode string, subName string, seenTags map[string]bool) []*config.GenericNode {
 	var profiles []xrayProfileItem
 	if err := json.Unmarshal(data, &profiles); err != nil {
 		var single xrayProfileItem
@@ -411,17 +400,6 @@ func parseXrayJSON(data []byte, targetHWID string, patterns []string, filterMode
 			profiles = append(profiles, single)
 		} else {
 			return nil
-		}
-	}
-
-	var compiled []*regexp.Regexp
-	for _, p := range patterns {
-		p = strings.TrimSpace(strings.Trim(p, "'\""))
-		if p == "" {
-			continue
-		}
-		if re, err := regexp.Compile("(?i)" + p); err == nil {
-			compiled = append(compiled, re)
 		}
 	}
 

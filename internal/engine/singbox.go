@@ -85,12 +85,15 @@ func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 1. Штатно останавливаем текущий процесс демона, если он запущен
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.stopLocked()
 	}
 
-	_ = exec.Command("killall", "-9", "sing-box").Run()
-	time.Sleep(150 * time.Millisecond)
+	// 2. Безопасная очистка: завершаем только инстансы sing-box с нашим файлом конфигурации
+	_ = exec.Command("pkill", "-TERM", "-f", "sing-box.*"+configPath).Run()
+	time.Sleep(100 * time.Millisecond)
+	_ = exec.Command("pkill", "-KILL", "-f", "sing-box.*"+configPath).Run()
 
 	if err := s.EnsureAssets(ctx); err != nil {
 		return fmt.Errorf("sing-box assets check failed: %w", err)
@@ -135,10 +138,11 @@ func (s *SingBoxEngine) stopLocked() error {
 		}
 	}
 
+	// Принудительно очищаем конкретно этот PID, если он остался зомби
 	_ = exec.Command("kill", "-9", fmt.Sprintf("%d", pid)).Run()
 	s.cmd = nil
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	return nil
 }
 

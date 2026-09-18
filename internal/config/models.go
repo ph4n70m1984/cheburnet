@@ -1,5 +1,10 @@
 package config
 
+import (
+	"regexp"
+	"strings"
+)
+
 type ClientMode string
 
 const (
@@ -60,14 +65,29 @@ type BalancingGroup struct {
 }
 
 type SubscriptionConfig struct {
-	Name           string   `json:"name"`
-	URL            string   `json:"url"`
-	UserAgent      string   `json:"user_agent"`
-	HWID           string   `json:"hwid,omitempty"`
-	Enabled        bool     `json:"enabled"`
-	FilterMode     string   `json:"filter_mode,omitempty"`     // "exclude" (Blacklist) или "include" (Whitelist)
-	ExcludeRegex   []string `json:"exclude_regex,omitempty"`   // Регулярные выражения фильтра
-	UpdateInterval string   `json:"update_interval,omitempty"` // "1h", "3h", "6h", "12h", "24h"
+	Name           string           `json:"name"`
+	URL            string           `json:"url"`
+	UserAgent      string           `json:"user_agent"`
+	HWID           string           `json:"hwid,omitempty"`
+	Enabled        bool             `json:"enabled"`
+	FilterMode     string           `json:"filter_mode,omitempty"`     // "exclude" (Blacklist) или "include" (Whitelist)
+	ExcludeRegex   []string         `json:"exclude_regex,omitempty"`   // Регулярные выражения фильтра
+	CompiledRegex  []*regexp.Regexp `json:"-"`                         // Скомпилированные RegExp, не сериализуются в JSON
+	UpdateInterval string           `json:"update_interval,omitempty"` // "1h", "3h", "6h", "12h", "24h"
+}
+
+// CompileFilters компилирует регулярные выражения один раз для переиспользования воркером
+func (s *SubscriptionConfig) CompileFilters() {
+	s.CompiledRegex = make([]*regexp.Regexp, 0, len(s.ExcludeRegex))
+	for _, p := range s.ExcludeRegex {
+		p = strings.TrimSpace(strings.Trim(p, "'\""))
+		if p == "" {
+			continue
+		}
+		if re, err := regexp.Compile("(?i)" + p); err == nil {
+			s.CompiledRegex = append(s.CompiledRegex, re)
+		}
+	}
 }
 
 type CustomSRSRule struct {
@@ -124,10 +144,8 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		return nil
 	}
 
-	// 1. Поверхностное копирование скаляров (string, int, bool, включая PublicSub*, ClashAPISecret, APIToken)
 	cp := *c
 
-	// 2. Срезы строк
 	if c.ManualNodes != nil {
 		cp.ManualNodes = append([]string(nil), c.ManualNodes...)
 	}
@@ -147,12 +165,10 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		cp.LocalListFiles = append([]string(nil), c.LocalListFiles...)
 	}
 
-	// 3. CustomSRSRulesets ([]CustomSRSRule)
 	if c.CustomSRSRulesets != nil {
 		cp.CustomSRSRulesets = append([]CustomSRSRule(nil), c.CustomSRSRulesets...)
 	}
 
-	// 4. Nodes ([]*GenericNode)
 	if c.Nodes != nil {
 		cp.Nodes = make([]*GenericNode, len(c.Nodes))
 		for i, n := range c.Nodes {
@@ -163,7 +179,6 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		}
 	}
 
-	// 5. Groups ([]*BalancingGroup) со вложенным срезом Nodes
 	if c.Groups != nil {
 		cp.Groups = make([]*BalancingGroup, len(c.Groups))
 		for i, g := range c.Groups {
@@ -177,7 +192,6 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		}
 	}
 
-	// 6. Subscriptions ([]SubscriptionConfig) со вложенным ExcludeRegex
 	if c.Subscriptions != nil {
 		cp.Subscriptions = make([]SubscriptionConfig, len(c.Subscriptions))
 		for i, s := range c.Subscriptions {
@@ -185,16 +199,17 @@ func (c *CheburConfig) Clone() *CheburConfig {
 			if s.ExcludeRegex != nil {
 				subCopy.ExcludeRegex = append([]string(nil), s.ExcludeRegex...)
 			}
+			if s.CompiledRegex != nil {
+				subCopy.CompiledRegex = append([]*regexp.Regexp(nil), s.CompiledRegex...)
+			}
 			cp.Subscriptions[i] = subCopy
 		}
 	}
 
-	// 7. ClientPolicies ([]ClientPolicy)
 	if c.ClientPolicies != nil {
 		cp.ClientPolicies = append([]ClientPolicy(nil), c.ClientPolicies...)
 	}
 
-	// 8. RoutePolicies ([]RoutePolicy) со всеми вложенными срезами строк
 	if c.RoutePolicies != nil {
 		cp.RoutePolicies = make([]RoutePolicy, len(c.RoutePolicies))
 		for i, rp := range c.RoutePolicies {
