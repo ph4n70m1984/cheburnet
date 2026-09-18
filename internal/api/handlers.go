@@ -50,7 +50,7 @@ func getRealActiveNode(defaultTag string) string {
 	return defaultTag
 }
 
-// handleStatus возвращает текущий статус ядра, количество нод, внешний IP и активную ноду
+// handleStatus возвращает текущий статус ядра, количество нод, внешний IP, активную ноду и флаги возможностей
 func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
 
@@ -81,6 +81,9 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 		"auto_hwid":   cfg.AutoHWID,
 		"custom_hwid": cfg.CustomHWID,
 		"outbound_ip": outboundIP,
+		"features": fiber.Map{
+			"public_sub": HasPublicSubFeature,
+		},
 	})
 }
 

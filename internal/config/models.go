@@ -110,6 +110,12 @@ type CheburConfig struct {
 	LocalListFiles        []string             `json:"local_list_files"`    // Пути к .lst файлам на роутере
 	ClientPolicies        []ClientPolicy       `json:"client_policies"`     // Правила маршрутизации по клиентам
 	RoutePolicies         []RoutePolicy        `json:"route_policies"`      // Секции маршрутизации по сервисам
+
+	// Безопасность и внешний сервер подписок для Happ
+	PublicSubEnabled bool   `json:"public_sub_enabled"` // Включение отдельного HTTP-сервера подписки
+	PublicSubPort    int    `json:"public_sub_port"`    // Порт публичного сервера (по умолчанию 9443)
+	PublicSubToken   string `json:"public_sub_token"`   // Секретный токен для доступа к /sub/:token
+	ClashAPISecret   string `json:"clash_api_secret"`   // Секретный токен для внешнего контроллера Clash API
 }
 
 func (c *CheburConfig) Clone() *CheburConfig {
@@ -117,7 +123,7 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		return nil
 	}
 
-	// 1. Поверхностное копирование скаляров (string, int, bool, включая UpdateChannel)
+	// 1. Поверхностное копирование скаляров (string, int, bool, включая PublicSub* и ClashAPISecret)
 	cp := *c
 
 	// 2. Срезы строк

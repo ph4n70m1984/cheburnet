@@ -25,6 +25,7 @@ type ActionCallback func(action string) error
 
 type Server struct {
 	app         *fiber.App
+	pubSub      *publicSubController // Управляется тегом компиляции
 	state       *config.StateManager
 	hub         *telemetry.Hub
 	subWorker   *subscription.Worker
@@ -49,7 +50,7 @@ func NewServer(
 ) *Server {
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
-		AppName:               "Chebur.NET Daemon",
+		AppName:               "Chebur.NET Internal Daemon",
 	})
 
 	app.Use(cors.New(cors.Config{
@@ -61,6 +62,7 @@ func NewServer(
 
 	s := &Server{
 		app:        app,
+		pubSub:     newPublicSubController(),
 		state:      state,
 		hub:        hub,
 		subWorker:  subWorker,
@@ -210,10 +212,36 @@ func (s *Server) setupRoutes() {
 	}))
 }
 
+// BuildSingBoxClashConfig изолирует Clash API на 127.0.0.1 с опциональным паролем
+func BuildSingBoxClashConfig(clashSecret string) map[string]interface{} {
+	clashConfig := map[string]interface{}{
+		"external_controller": "127.0.0.1:9090",
+	}
+
+	trimmedSecret := clashSecret
+	if trimmedSecret != "" {
+		clashConfig["secret"] = trimmedSecret
+	}
+
+	return map[string]interface{}{
+		"clash_api": clashConfig,
+	}
+}
+
 func (s *Server) Listen(addr string) error {
+	cfg := s.state.Get()
+	if cfg.PublicSubEnabled {
+		pubPort := cfg.PublicSubPort
+		if pubPort == 0 {
+			pubPort = 9443
+		}
+		s.pubSub.Start(s, pubPort)
+	}
+
 	return s.app.Listen(addr)
 }
 
 func (s *Server) Shutdown() error {
+	s.pubSub.Stop()
 	return s.app.Shutdown()
 }

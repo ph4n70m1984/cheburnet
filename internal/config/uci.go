@@ -91,6 +91,12 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		EnableYACD:            u.get("cheburnet.main.enable_yacd", "1") == "1",
 		AutoUpdate:            u.get("cheburnet.main.auto_update", "0") == "1",
 		UpdateChannel:         u.get("cheburnet.main.update_channel", "release"),
+
+		// Rid di setting dɛn fɔ di poblik sabskripshɔn ɛn Clash API
+		PublicSubEnabled: u.get("cheburnet.main.public_sub_enabled", "0") == "1",
+		PublicSubPort:    u.getInt("cheburnet.main.public_sub_port", 9443),
+		PublicSubToken:   u.get("cheburnet.main.public_sub_token", ""),
+		ClashAPISecret:   u.get("cheburnet.main.clash_api_secret", ""),
 	}
 
 	// 1. Чтение секций 'subscription'

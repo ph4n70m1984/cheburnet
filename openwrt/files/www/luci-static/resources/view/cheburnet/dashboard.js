@@ -13,14 +13,23 @@
 
 return view.extend({
     load: function() {
+        var host = window.location.hostname;
+        var statusPromise = fetch('http://' + host + ':8088/api/v1/status')
+            .then(function(r) { return r.ok ? r.json() : {}; })
+            .catch(function() { return {}; });
+
         return Promise.all([
             network.getHostHints(),
-            uci.load('cheburnet')
+            uci.load('cheburnet'),
+            statusPromise
         ]);
     },
 
     render: function(data) {
         var hosts = (data && data[0]) ? data[0] : {};
+        var daemonStatus = (data && data[2]) ? data[2] : {};
+        var hasPublicSub = !!(daemonStatus.features && daemonStatus.features.public_sub);
+
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
 
@@ -226,6 +235,17 @@ return view.extend({
                     color: var(--cb-text-main) !important;
                     border-bottom: 1px solid var(--cb-border) !important;
                 }
+
+                .cb-link-box {
+                    font-family: monospace;
+                    padding: 8px 12px;
+                    border: 1px solid var(--cb-border);
+                    border-radius: 6px;
+                    background: var(--cb-bg-surface);
+                    color: var(--cb-text-main);
+                    word-break: break-all;
+                    user-select: all;
+                }
             `;
             document.head.appendChild(css);
         }
@@ -318,6 +338,78 @@ return view.extend({
             });
         };
 
+        // Вспомогательные функции для публичной подписки и токенов
+        window.cheburGenSubToken = function() {
+            var chars = '0123456789abcdef';
+            var token = '';
+            for (var i = 0; i < 32; i++) {
+                token += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            var input = document.getElementById('cb-sub-token-input');
+            if (input) {
+                input.value = token;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+            window.cheburUpdateSubLinkPreview();
+        };
+
+        window.cheburGenClashSecret = function() {
+            var chars = '0123456789abcdef';
+            var secret = '';
+            for (var i = 0; i < 32; i++) {
+                secret += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            var input = document.getElementById('cb-clash-secret-input');
+            if (input) {
+                input.value = secret;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+        };
+
+        window.cheburCopySubLink = function() {
+            var box = document.getElementById('cb-sub-link-text');
+            if (box && box.innerText && !box.innerText.startsWith('(')) {
+                navigator.clipboard.writeText(box.innerText).then(function() {
+                    ui.addNotification(null, E('p', {}, _('Ссылка подписки скопирована в буфер обмена!')), 'info');
+                });
+            }
+        };
+
+        window.cheburUpdateSubLinkPreview = function() {
+            var linkBox = document.getElementById('cb-sub-link-text');
+            if (!linkBox) return;
+
+            var tokenInput = document.getElementById('cb-sub-token-input');
+            var portInput = document.getElementById('cb-sub-port-input');
+
+            var token = (tokenInput && tokenInput.value) ? tokenInput.value.trim() : '';
+            var port = (portInput && portInput.value) ? portInput.value.trim() : '';
+
+            if (!token) {
+                var sections = uci.sections('cheburnet');
+                for (var i = 0; i < sections.length; i++) {
+                    if (sections[i]['.type'] === 'cheburnet' || sections[i]['.name'] === 'main') {
+                        token = sections[i]['public_sub_token'] || '';
+                        if (!port) port = sections[i]['public_sub_port'] || '9443';
+                        break;
+                    }
+                }
+            }
+
+            if (!port) port = '9443';
+
+            var host = window.location.hostname;
+            if (token) {
+                linkBox.innerText = 'http://' + host + ':' + port + '/sub/' + token;
+            } else {
+                linkBox.innerText = _('(Сгенерируйте токен для формирования ссылки)');
+            }
+        };
+
         // --- СЕКЦИЯ СОСТОЯНИЯ И КНОПКИ УПРАВЛЕНИЯ ДЕМОНОМ ---
         var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
@@ -372,6 +464,11 @@ return view.extend({
         s.tab('general', _('Прокси и ядро'));
         s.tab('routing_rules', _('Маршрутизация списков'));
         s.tab('dns_settings', _('Настройки DNS и сети'));
+
+        if (hasPublicSub) {
+            s.tab('public_sub', _('Публичная подписка (Happ)'));
+        }
+
         s.tab('updates', _('Менеджер обновлений'));
 
         // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
@@ -417,6 +514,44 @@ return view.extend({
 
         o = s.taboption('general', form.Value, 'custom_hwid', _('Глобальный кастомный HWID (опционально)'));
         o.depends('auto_hwid', '0');
+
+        o = s.taboption('general', form.Value, 'clash_api_secret', _('Секрет для Clash API (sing-box)'));
+        o.description = _('Опциональный Bearer-токен для защиты контроллера 127.0.0.1:9090. Оставьте пустым для доступа без пароля.');
+        o.password = true;
+        o.placeholder = 'Оставьте пустым или сгенерируйте токен';
+        var origClashSecretRender = o.render;
+        o.render = function() {
+            return Promise.resolve(origClashSecretRender.apply(this, arguments)).then(function(node) {
+                var input = node.querySelector('input');
+                if (input) {
+                    input.id = 'cb-clash-secret-input';
+                }
+
+                var genBtn = E('button', {
+                    'class': 'btn cbi-button-action',
+                    'type': 'button',
+                    'style': 'margin-left: 8px; white-space: nowrap;',
+                    'click': window.cheburGenClashSecret
+                }, [ E('span', {}, '🔑 '), _('Сгенерировать секрет') ]);
+
+                var controlDiv = node.querySelector('.cbi-value-field');
+                var descDiv = node.querySelector('.cbi-value-description');
+
+                if (controlDiv && input) {
+                    var rowDiv = E('div', {
+                        'style': 'display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 4px;'
+                    }, [ input, genBtn ]);
+
+                    if (descDiv) {
+                        controlDiv.insertBefore(rowDiv, descDiv);
+                    } else {
+                        controlDiv.appendChild(rowDiv);
+                    }
+                }
+
+                return node;
+            });
+        };
 
         function wrapGridSection(sectionObj, titleText, isOpen) {
             var orig = sectionObj.render;
@@ -480,7 +615,98 @@ return view.extend({
         o = s.taboption('dns_settings', widgets.NetworkSelect, 'source_interface', _('Интерфейс'));
         o.default = 'br-lan';
 
-        // --- ВКЛАДКА 4: ОБНОВЛЕНИЯ ---
+        // --- ВКЛАДКА 4: ПУБЛИЧНАЯ ПОДПИСКА (HAPP) ---
+        if (hasPublicSub) {
+            o = s.taboption('public_sub', form.Flag, 'public_sub_enabled', _('Включить публичный сервер подписки'));
+            o.description = _('Запускает изолированный HTTP-сервер на выделенном порту для мобильных клиентов (Happ, v2rayNG, Clash).');
+            o.default = '0';
+
+            o = s.taboption('public_sub', form.Value, 'public_sub_port', _('Порт сервера подписки'));
+            o.depends('public_sub_enabled', '1');
+            o.datatype = 'port';
+            o.default = '9443';
+            var origPortRender = o.render;
+            o.render = function() {
+                return Promise.resolve(origPortRender.apply(this, arguments)).then(function(node) {
+                    var input = node.querySelector('input');
+                    if (input) {
+                        input.id = 'cb-sub-port-input';
+                        input.addEventListener('input', window.cheburUpdateSubLinkPreview);
+                        input.addEventListener('change', window.cheburUpdateSubLinkPreview);
+                    }
+                    return node;
+                });
+            };
+
+            o = s.taboption('public_sub', form.Value, 'public_sub_token', _('Секретный токен подписки'));
+            o.depends('public_sub_enabled', '1');
+            o.description = _('Токен защищает подписку от несанкционированного доступа. Доступен только при передаче токена в пути URL.');
+            o.placeholder = '32-значный hex-токен';
+            o.rmempty = false;
+
+            var origTokenRender = o.render;
+            o.render = function(option_index, section_id, in_table) {
+                var self = this;
+                return Promise.resolve(origTokenRender.apply(self, arguments)).then(function(node) {
+                    var input = node.querySelector('input');
+                    if (input) {
+                        input.id = 'cb-sub-token-input';
+                        input.addEventListener('input', window.cheburUpdateSubLinkPreview);
+                        input.addEventListener('change', window.cheburUpdateSubLinkPreview);
+                    }
+
+                    var genBtn = E('button', {
+                        'class': 'btn cbi-button-action',
+                        'type': 'button',
+                        'style': 'margin-left: 8px; white-space: nowrap;',
+                        'click': window.cheburGenSubToken
+                    }, [ E('span', {}, '🔑 '), _('Сгенерировать токен') ]);
+
+                    var controlDiv = node.querySelector('.cbi-value-field');
+                    var descDiv = node.querySelector('.cbi-value-description');
+
+                    if (controlDiv && input) {
+                        var rowDiv = E('div', {
+                            'style': 'display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 4px;'
+                        }, [ input, genBtn ]);
+
+                        if (descDiv) {
+                            controlDiv.insertBefore(rowDiv, descDiv);
+                        } else {
+                            controlDiv.appendChild(rowDiv);
+                        }
+                    }
+
+                    return node;
+                });
+            };
+
+            var o_sub_link = s.taboption('public_sub', form.DummyValue, '_sub_link_display', _('Ссылка для клиента Happ'));
+            o_sub_link.depends('public_sub_enabled', '1');
+            o_sub_link.rawhtml = true;
+            o_sub_link.default = '' +
+                '<div style="padding: 12px; border: 1px solid var(--cb-border); border-radius: 6px; background: var(--cb-bg-card); margin-bottom: 12px;">' +
+                    '<div style="font-size: 12px; color: var(--cb-text-muted); margin-bottom: 6px;">' +
+                        _('Скопируйте эту ссылку и вставьте в приложение Happ (или любой совместимый клиент) в качестве подписки:') +
+                    '</div>' +
+                    '<div id="cb-sub-link-text" class="cb-link-box" style="margin-bottom: 8px;">' +
+                        _('(Загрузка ссылки...)') +
+                    '</div>' +
+                    '<button type="button" class="btn cbi-button-apply" onclick="window.cheburCopySubLink()">' +
+                        '📋 ' + _('Копировать ссылку') +
+                    '</button>' +
+                '</div>';
+
+            var origSubLinkRender = o_sub_link.render;
+            o_sub_link.render = function() {
+                return Promise.resolve(origSubLinkRender.apply(this, arguments)).then(function(node) {
+                    setTimeout(window.cheburUpdateSubLinkPreview, 100);
+                    return node;
+                });
+            };
+        }
+
+        // --- ВКЛАДКА 5: ОБНОВЛЕНИЯ ---
         var o_upd = s.taboption('updates', form.DummyValue, '_update_panel', _('Управление версиями'));
         o_upd.rawhtml = true;
         o_upd.default = '' +
