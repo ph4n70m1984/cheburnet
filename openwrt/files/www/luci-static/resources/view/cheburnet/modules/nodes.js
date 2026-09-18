@@ -1,6 +1,7 @@
 'use strict';
 'require baseclass';
 'require ui';
+'require uci';
 
 return baseclass.extend({
     highlightActiveNode: function(selectedTag, subResolvedTag) {
@@ -90,15 +91,21 @@ return baseclass.extend({
         var displayName = (nodeTag === 'auto') ? _('Автовыбор') : nodeTag;
         ui.showIndicator('selecting-node', _('Переключение на %s...').format(displayName));
 
+        var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+        var headers = { 'Content-Type': 'application/json' };
+        if (apiToken) {
+            headers['X-API-Token'] = apiToken;
+        }
+
         var self = this;
-        fetch('http://' + host + ':9090/proxies/PROXY', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: nodeTag })
+        fetch('http://' + host + ':8088/api/v1/nodes/select', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ tag: nodeTag })
         })
         .then(function(r) {
             ui.hideIndicator('selecting-node');
-            if (r.ok || r.status === 204) {
+            if (r.ok) {
                 self.highlightActiveNode(nodeTag, '');
                 ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + displayName), 'info');
                 if (onComplete) setTimeout(onComplete, 300);
@@ -106,24 +113,9 @@ return baseclass.extend({
                 throw new Error('HTTP ' + r.status);
             }
         })
-        .catch(function() {
-            fetch('http://' + host + ':8088/api/v1/nodes/select', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tag: nodeTag })
-            })
-            .then(function(r) {
-                ui.hideIndicator('selecting-node');
-                if (r.ok) {
-                    self.highlightActiveNode(nodeTag, '');
-                    ui.addNotification(null, E('p', {}, _('Сервер переключен на: ') + displayName), 'info');
-                    if (onComplete) setTimeout(onComplete, 300);
-                }
-            })
-            .catch(function(err) {
-                ui.hideIndicator('selecting-node');
-                ui.addNotification(null, E('p', {}, _('Ошибка переключения узла: ') + err), 'error');
-            });
+        .catch(function(err) {
+            ui.hideIndicator('selecting-node');
+            ui.addNotification(null, E('p', {}, _('Ошибка переключения узла: ') + err), 'error');
         });
     }
 });

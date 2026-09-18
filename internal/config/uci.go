@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -11,6 +12,12 @@ type UCIStorage struct{}
 
 func NewUCIStorage() *UCIStorage {
 	return &UCIStorage{}
+}
+
+func generateSecureHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
 }
 
 func parseTextLines(raw string) []string {
@@ -92,11 +99,22 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		AutoUpdate:            u.get("cheburnet.main.auto_update", "0") == "1",
 		UpdateChannel:         u.get("cheburnet.main.update_channel", "release"),
 
-		// Rid di setting dɛn fɔ di poblik sabskripshɔn ɛn Clash API
+		// Чтение настроек публичной подписки и Clash API
 		PublicSubEnabled: u.get("cheburnet.main.public_sub_enabled", "0") == "1",
 		PublicSubPort:    u.getInt("cheburnet.main.public_sub_port", 9443),
 		PublicSubToken:   u.get("cheburnet.main.public_sub_token", ""),
 		ClashAPISecret:   u.get("cheburnet.main.clash_api_secret", ""),
+
+		// Чтение токена доступа к внутреннему API
+		APIToken: u.get("cheburnet.main.api_token", ""),
+	}
+
+	// Автоматическая генерация токена API при первом запуске, если он отсутствует
+	if cfg.APIToken == "" {
+		generatedToken := generateSecureHex(16) // 32 hex-символа
+		_ = exec.Command("uci", "set", "cheburnet.main.api_token="+generatedToken).Run()
+		_ = exec.Command("uci", "commit", "cheburnet").Run()
+		cfg.APIToken = generatedToken
 	}
 
 	// 1. Чтение секций 'subscription'

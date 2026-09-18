@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strings"
 	"time"
 
 	"cheburnet/internal/config"
@@ -25,7 +26,7 @@ type ActionCallback func(action string) error
 
 type Server struct {
 	app         *fiber.App
-	pubSub      *publicSubController // Управляется тегом компиляции
+	pubSub      *publicSubController
 	state       *config.StateManager
 	hub         *telemetry.Hub
 	subWorker   *subscription.Worker
@@ -35,6 +36,7 @@ type Server struct {
 	diagEngine  *diagnostics.DiagnosticsEngine
 	onAction    ActionCallback
 	ipifyClient *http.Client
+	clashClient *http.Client
 }
 
 func NewServer(
@@ -52,11 +54,6 @@ func NewServer(
 		DisableStartupMessage: true,
 		AppName:               "Chebur.NET Internal Daemon",
 	})
-
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept",
-	}))
 
 	proxyURL, _ := url.Parse("http://127.0.0.1:4534")
 
@@ -79,29 +76,86 @@ func NewServer(
 			},
 			Timeout: 2 * time.Second,
 		},
+		clashClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				MaxIdleConnsPerHost: 5,
+				IdleConnTimeout:     60 * time.Second,
+				DisableKeepAlives:   false,
+			},
+			Timeout: 4 * time.Second,
+		},
 	}
 
 	s.setupRoutes()
 	return s
 }
 
+// authRequired проверяет наличие и валидность api_token для мутирующих запросов
+func (s *Server) authRequired() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		cfg := s.state.Get()
+		expectedToken := strings.TrimSpace(cfg.APIToken)
+
+		if expectedToken == "" {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "api token is not configured on daemon",
+			})
+		}
+
+		// 1. Проверка заголовка Authorization: Bearer <token>
+		authHeader := c.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+			if token == expectedToken {
+				return c.Next()
+			}
+		}
+
+		// 2. Проверка кастомного заголовка X-API-Token
+		if c.Get("X-API-Token") == expectedToken {
+			return c.Next()
+		}
+
+		// 3. Проверка query-параметра ?token= (необходимо для WebSocket)
+		if c.Query("token") == expectedToken {
+			return c.Next()
+		}
+
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "unauthorized: valid api token is required",
+		})
+	}
+}
+
 func (s *Server) setupRoutes() {
 	setupMetrics(s.app)
 
+	// Защита от DNS Rebinding и CSRF: ограничиваем Origin локальной сетью
+	s.app.Use(cors.New(cors.Config{
+		AllowOriginsFunc: func(origin string) bool {
+			if origin == "" {
+				return true
+			}
+			u, err := url.Parse(origin)
+			if err != nil {
+				return false
+			}
+			hostname := u.Hostname()
+			return hostname == "localhost" || hostname == "127.0.0.1" ||
+				strings.HasPrefix(hostname, "192.168.") ||
+				strings.HasPrefix(hostname, "10.") ||
+				strings.HasPrefix(hostname, "172.16.") ||
+				strings.HasSuffix(hostname, ".lan")
+		},
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-API-Token",
+		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
+	}))
+
 	api := s.app.Group("/api/v1")
 
+	// --- ОТКРЫТЫЕ READ-ONLY ЭНДПОИНТЫ ДЛЯ СИСТЕМЫ МОНИТОРИНГА И СТАТУСА ---
 	api.Get("/status", s.handleStatus)
-
-	api.Post("/engine/switch", func(c *fiber.Ctx) error {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "engine switching is disabled: sing-box is the dedicated core",
-		})
-	})
-
-	api.Post("/reload", s.handleReloadConfig)
-	api.Get("/updates/check", s.handleCheckUpdates)
-	api.Post("/updates/upgrade", s.handlePerformUpdate)
-
 	api.Get("/diagnostics", func(c *fiber.Ctx) error {
 		if s.diagEngine != nil {
 			return c.JSON(s.diagEngine.Snapshot())
@@ -112,7 +166,20 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	api.Post("/actions/:action", func(c *fiber.Ctx) error {
+	// --- ЗАЩИЩЕННЫЕ ЭНДПОИНТЫ УПРАВЛЕНИЯ, МУТАЦИЙ И ОБНОВЛЕНИЯ ---
+	auth := s.authRequired()
+
+	api.Post("/engine/switch", auth, func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "engine switching is disabled: sing-box is the dedicated core",
+		})
+	})
+
+	api.Post("/reload", auth, s.handleReloadConfig)
+	api.Get("/updates/check", auth, s.handleCheckUpdates)
+	api.Post("/updates/upgrade", auth, s.handlePerformUpdate)
+
+	api.Post("/actions/:action", auth, func(c *fiber.Ctx) error {
 		action := c.Params("action")
 		if s.onAction != nil {
 			if err := s.onAction(action); err != nil {
@@ -128,15 +195,17 @@ func (s *Server) setupRoutes() {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	api.Get("/nodes", s.handleGetNodes)
-	api.Post("/nodes", s.handleAddNode)
-	api.Post("/nodes/add", s.handleAddNode)
-	api.Post("/source", s.handleAddSource)
-	api.Post("/sources/add", s.handleAddSource)
-	api.Post("/subscriptions/update", s.handleUpdateSubscriptions)
-	api.Get("/proxies/:name/delay", s.handleProxyDelay)
+	api.Get("/nodes", auth, s.handleGetNodes)
+	api.Post("/nodes", auth, s.handleAddNode)
+	api.Post("/nodes/add", auth, s.handleAddNode)
+	api.Post("/nodes/select", auth, s.handleSelectNode)
+	api.Post("/source", auth, s.handleAddSource)
+	api.Post("/sources/add", auth, s.handleAddSource)
+	api.Post("/subscriptions/update", auth, s.handleUpdateSubscriptions)
+	api.Get("/proxies/:name/delay", auth, s.handleProxyDelay)
 
-	s.app.Use("/ws", func(c *fiber.Ctx) error {
+	// --- ЗАЩИЩЕННЫЙ WEBSOCKET КАНАЛ ТЕЛЕМЕТРИИ ---
+	s.app.Use("/ws", auth, func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
 		}
@@ -210,22 +279,6 @@ func (s *Server) setupRoutes() {
 			}
 		}
 	}))
-}
-
-// BuildSingBoxClashConfig изолирует Clash API на 127.0.0.1 с опциональным паролем
-func BuildSingBoxClashConfig(clashSecret string) map[string]interface{} {
-	clashConfig := map[string]interface{}{
-		"external_controller": "127.0.0.1:9090",
-	}
-
-	trimmedSecret := clashSecret
-	if trimmedSecret != "" {
-		clashConfig["secret"] = trimmedSecret
-	}
-
-	return map[string]interface{}{
-		"clash_api": clashConfig,
-	}
 }
 
 func (s *Server) Listen(addr string) error {

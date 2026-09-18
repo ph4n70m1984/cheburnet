@@ -28,10 +28,37 @@ type DelayResult struct {
 	Message string `json:"message,omitempty"`
 }
 
+// clashRequest выполняет HTTP-запрос к Clash API ядра с авторизацией через Bearer, если секрет задан
+func (s *Server) clashRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	targetURL := "http://127.0.0.1:9090" + path
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	cfg := s.state.Get()
+	if secret := strings.TrimSpace(cfg.ClashAPISecret); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+
+	return s.clashClient.Do(req)
+}
+
 // getRealActiveNode опрашивает sing-box Clash API для определения текущего активного аутбаунда
-func getRealActiveNode(defaultTag string) string {
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get("http://127.0.0.1:9090/proxies/PROXY")
+func (s *Server) getRealActiveNode(ctx context.Context, defaultTag string) string {
+	reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/PROXY", nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -71,7 +98,7 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 
 	activeNode := "auto"
 	if len(cfg.Nodes) > 0 {
-		activeNode = getRealActiveNode("auto")
+		activeNode = s.getRealActiveNode(c.Context(), "auto")
 	}
 
 	return c.JSON(fiber.Map{
@@ -90,7 +117,7 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 // handleGetNodes возвращает список серверов вместе с виртуальной нодой auto, задержками и статусом
 func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	cfg := s.state.Get()
-	activeNode := getRealActiveNode("auto")
+	activeNode := s.getRealActiveNode(c.Context(), "auto")
 
 	type nodeView struct {
 		Tag      string `json:"tag"`
@@ -105,8 +132,10 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	latencies := make(map[string]int)
 	bestLatency := 0
 
-	client := &http.Client{Timeout: 600 * time.Millisecond}
-	if resp, err := client.Get("http://127.0.0.1:9090/proxies"); err == nil && resp.StatusCode == http.StatusOK {
+	reqCtx, cancel := context.WithTimeout(c.Context(), 600*time.Millisecond)
+	defer cancel()
+
+	if resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies", nil); err == nil && resp.StatusCode == http.StatusOK {
 		var clashData struct {
 			Proxies map[string]struct {
 				History []struct {
@@ -192,14 +221,10 @@ func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 		"name": req.Tag,
 	})
 
-	putReq, err := http.NewRequestWithContext(c.Context(), http.MethodPut, "http://127.0.0.1:9090/proxies/PROXY", bytes.NewBuffer(payload))
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-	}
-	putReq.Header.Set("Content-Type", "application/json")
+	reqCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
+	defer cancel()
 
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Do(putReq)
+	resp, err := s.clashRequest(reqCtx, http.MethodPut, "/proxies/PROXY", payload)
 	if err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to reach sing-box API: " + err.Error()})
 	}
@@ -247,6 +272,7 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 			cfg.Subscriptions = freshCfg.Subscriptions
 			cfg.ManualNodes = freshCfg.ManualNodes
 			cfg.RulesetUpdateInterval = freshCfg.RulesetUpdateInterval
+			cfg.ClashAPISecret = freshCfg.ClashAPISecret
 		})
 
 		if s.rulesCron != nil {
@@ -493,9 +519,10 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 	timeout := c.Query("timeout", "3000")
 
 	if strings.EqualFold(name, "auto") {
-		client := &http.Client{Timeout: 1 * time.Second}
+		reqCtx, cancel := context.WithTimeout(c.Context(), 1*time.Second)
+		defer cancel()
 
-		resp, err := client.Get("http://127.0.0.1:9090/proxies/auto")
+		resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/auto", nil)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var groupData struct {
 				Now string `json:"now"`
@@ -504,9 +531,12 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 				_ = resp.Body.Close()
 
 				escapedTarget := url.PathEscape(groupData.Now)
-				targetDelayURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeout)
+				delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeout)
 
-				if dResp, dErr := client.Get(targetDelayURL); dErr == nil {
+				dCtx, dCancel := context.WithTimeout(c.Context(), 3*time.Second)
+				defer dCancel()
+
+				if dResp, dErr := s.clashRequest(dCtx, http.MethodGet, delayPath, nil); dErr == nil {
 					defer dResp.Body.Close()
 					var res DelayResult
 					if err := json.NewDecoder(dResp.Body).Decode(&res); err == nil {
@@ -525,10 +555,12 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 	}
 
 	escapedName := url.PathEscape(name)
-	targetURL := fmt.Sprintf("http://127.0.0.1:9090/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeout)
+	delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeout)
 
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get(targetURL)
+	reqCtx, cancel := context.WithTimeout(c.Context(), 4*time.Second)
+	defer cancel()
+
+	resp, err := s.clashRequest(reqCtx, http.MethodGet, delayPath, nil)
 	if err != nil {
 		return c.Status(fiber.StatusGatewayTimeout).JSON(DelayResult{
 			Delay:   nil,

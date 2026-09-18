@@ -26,6 +26,7 @@ type SingBoxEngine struct {
 	cmd       *exec.Cmd
 	cfg       *config.CheburConfig
 	mu        sync.Mutex
+	client    *http.Client
 }
 
 func NewSingBoxEngine() *SingBoxEngine {
@@ -33,6 +34,14 @@ func NewSingBoxEngine() *SingBoxEngine {
 		builder12: singbox.NewBuilder(),
 		builder13: singbox.NewBuilderV13(),
 		builder14: singbox.NewBuilderV14(),
+		client: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:      5,
+				IdleConnTimeout:   30 * time.Second,
+				DisableKeepAlives: false,
+			},
+			Timeout: 2 * time.Second,
+		},
 	}
 }
 
@@ -76,12 +85,10 @@ func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1. Если процесс уже зарегистрирован в структуре — принудительно останавливаем его
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.stopLocked()
 	}
 
-	// 2. Дополнительная зачистка сторонних или зависших экземпляров sing-box
 	_ = exec.Command("killall", "-9", "sing-box").Run()
 	time.Sleep(150 * time.Millisecond)
 
@@ -104,7 +111,6 @@ func (s *SingBoxEngine) Stop() error {
 	return s.stopLocked()
 }
 
-// stopLocked выполняет аккуратное завершение с ожиданием освобождения портов
 func (s *SingBoxEngine) stopLocked() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		s.cmd = nil
@@ -117,14 +123,11 @@ func (s *SingBoxEngine) stopLocked() error {
 		done <- s.cmd.Wait()
 	}()
 
-	// Сначала отправляем SIGTERM
 	_ = s.cmd.Process.Signal(syscall.SIGTERM)
 
 	select {
 	case <-done:
-		// Процесс успешно завершился штатно
 	case <-time.After(2 * time.Second):
-		// Если не остановился за 2 секунды — отправляем SIGKILL
 		_ = s.cmd.Process.Kill()
 		select {
 		case <-done:
@@ -132,23 +135,26 @@ func (s *SingBoxEngine) stopLocked() error {
 		}
 	}
 
-	// Убеждаемся, что процесс с данным PID больше не существует
 	_ = exec.Command("kill", "-9", fmt.Sprintf("%d", pid)).Run()
 	s.cmd = nil
 
-	// Пауза для сброса сокетов ядром Linux (TIME_WAIT)
 	time.Sleep(200 * time.Millisecond)
 	return nil
 }
 
 func (s *SingBoxEngine) CollectMetrics(ctx context.Context) (*UnifiedMetrics, error) {
-	client := &http.Client{Timeout: 2 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:9090/proxies", nil)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := client.Do(req)
+	s.mu.Lock()
+	if s.cfg != nil && strings.TrimSpace(s.cfg.ClashAPISecret) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(s.cfg.ClashAPISecret))
+	}
+	s.mu.Unlock()
+
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
 	}

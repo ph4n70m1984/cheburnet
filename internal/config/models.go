@@ -116,6 +116,7 @@ type CheburConfig struct {
 	PublicSubPort    int    `json:"public_sub_port"`    // Порт публичного сервера (по умолчанию 9443)
 	PublicSubToken   string `json:"public_sub_token"`   // Секретный токен для доступа к /sub/:token
 	ClashAPISecret   string `json:"clash_api_secret"`   // Секретный токен для внешнего контроллера Clash API
+	APIToken         string `json:"api_token"`          // Токен доступа к защищенным эндпоинтам демона
 }
 
 func (c *CheburConfig) Clone() *CheburConfig {
@@ -123,7 +124,7 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		return nil
 	}
 
-	// 1. Поверхностное копирование скаляров (string, int, bool, включая PublicSub* и ClashAPISecret)
+	// 1. Поверхностное копирование скаляров (string, int, bool, включая PublicSub*, ClashAPISecret, APIToken)
 	cp := *c
 
 	// 2. Срезы строк

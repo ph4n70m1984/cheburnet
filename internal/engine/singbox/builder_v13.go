@@ -225,16 +225,21 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		"independent_cache": true,
 	}
 
+	clashAPIMap := map[string]interface{}{
+		"external_controller": clashController,
+		"default_mode":        "rule",
+	}
+	if trimmedSecret := strings.TrimSpace(cfg.ClashAPISecret); trimmedSecret != "" {
+		clashAPIMap["secret"] = trimmedSecret
+	}
+
 	experimentalConfig := map[string]interface{}{
 		"cache_file": map[string]interface{}{
 			"enabled":      true,
 			"path":         "/tmp/sing-box-cache.db",
 			"store_fakeip": true,
 		},
-		"clash_api": map[string]interface{}{
-			"external_controller": clashController,
-			"default_mode":        "rule",
-		},
+		"clash_api": clashAPIMap,
 	}
 
 	if cfg.EnableYACD {

@@ -1,6 +1,7 @@
 'use strict';
 'require baseclass';
 'require ui';
+'require uci';
 
 return baseclass.extend({
     getChannelBadge: function(channel) {
@@ -96,6 +97,15 @@ return baseclass.extend({
         var diagPollIntervalId = null;
         var statusPollIntervalId = null;
 
+        function getAuthHeaders(customHeaders) {
+            var headers = customHeaders || {};
+            var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+            if (apiToken) {
+                headers['X-API-Token'] = apiToken;
+            }
+            return headers;
+        }
+
         function updateBannerContent() {
             var banner = document.getElementById('diag-banner');
             var content = document.getElementById('diag-banner-content');
@@ -138,6 +148,7 @@ return baseclass.extend({
 
             fetch('http://' + window.location.hostname + ':8088/api/v1/actions/' + action, {
                 method: 'POST',
+                headers: getAuthHeaders(),
                 signal: controller.signal
             })
             .then(function(r) {
@@ -206,26 +217,12 @@ return baseclass.extend({
             });
         }
 
-        function renderDiagnosticSnapshot(snap) {
-            if (!snap) return;
-            window.cheburLastDiagSnapshot = snap;
-            window.cheburProblems = {};
-            if (snap.problems && Array.isArray(snap.problems)) {
-                snap.problems.forEach(function(p, idx) {
-                    var pid = p.id || ('prob_' + idx);
-                    p.id = pid;
-                    window.cheburProblems[pid] = p;
-                });
-            }
-            updateBannerContent();
-            renderProblemsCards();
-        }
-
         function fetchDiagnosticsOnce() {
             var host = window.location.hostname;
             var controller = new AbortController();
             var timeoutId = setTimeout(function() { controller.abort(); }, 3500);
 
+            // /diagnostics является открытым read-only эндпоинтом
             fetch('http://' + host + ':8088/api/v1/diagnostics', { signal: controller.signal })
                 .then(function(r) {
                     clearTimeout(timeoutId);
@@ -237,22 +234,32 @@ return baseclass.extend({
 
         function checkUpdatesOnce() {
             var host = window.location.hostname;
-            fetch('http://' + host + ':8088/api/v1/updates/check')
-                .then(function(r) { return r.ok ? r.json() : null; })
-                .then(function(data) {
-                    if (data) {
-                        self.showUpdateNotification(data);
-                        self.renderUpdateReport(data);
-                    }
-                })
-                .catch(function() {});
+            fetch('http://' + host + ':8088/api/v1/updates/check', {
+                headers: getAuthHeaders()
+            })
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(data) {
+                if (data) {
+                    self.showUpdateNotification(data);
+                    self.renderUpdateReport(data);
+                }
+            })
+            .catch(function() {});
         }
 
         function syncClashDelays() {
             if (isSyncingDelays) return;
             isSyncingDelays = true;
 
-            fetch('http://' + window.location.hostname + ':9090/proxies')
+            var headers = {};
+            var secretInput = document.getElementById('cb-clash-secret-input');
+            var secret = (secretInput && secretInput.value) ? secretInput.value.trim() : (uci.get('cheburnet', 'main', 'clash_api_secret') || '');
+
+            if (secret) {
+                headers['Authorization'] = 'Bearer ' + secret;
+            }
+
+            fetch('http://' + window.location.hostname + ':9090/proxies', { headers: headers })
                 .then(function(r) { return r.ok ? r.json() : null; })
                 .then(function(data) {
                     if (!data || !data.proxies) return;
@@ -294,6 +301,7 @@ return baseclass.extend({
         }
 
         function syncRealtimeStatus() {
+            // /status является открытым read-only эндпоинтом
             fetch('http://' + window.location.hostname + ':8088/api/v1/status')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
@@ -327,7 +335,10 @@ return baseclass.extend({
 
         function connectWebSocket() {
             var host = window.location.hostname;
-            var ws = new WebSocket('ws://' + host + ':8088/ws/telemetry');
+            var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+            var wsUrl = 'ws://' + host + ':8088/ws/telemetry' + (apiToken ? ('?token=' + encodeURIComponent(apiToken)) : '');
+
+            var ws = new WebSocket(wsUrl);
             window.cheburWs = ws;
 
             ws.onmessage = function(event) {
@@ -402,7 +413,7 @@ return baseclass.extend({
                     ui.showIndicator('updating-system', _('Проверка свободного места и установка обновлений...'));
                     fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
                         body: JSON.stringify({ target: 'all' })
                     })
                     .then(function(r) { return r.json(); })
@@ -493,56 +504,58 @@ return baseclass.extend({
             var host = window.location.hostname;
             var tbl = document.getElementById('chebur-nodes-table');
 
-            fetch('http://' + host + ':8088/api/v1/nodes')
-                .then(function(r) { return r.json(); })
-                .then(function(nodes) {
-                    if (!nodes || nodes.length === 0) return;
+            fetch('http://' + host + ':8088/api/v1/nodes', {
+                headers: getAuthHeaders()
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(nodes) {
+                if (!nodes || nodes.length === 0) return;
 
-                    var countEl = document.getElementById('total-nodes');
-                    if (countEl) countEl.textContent = nodes.length;
+                var countEl = document.getElementById('total-nodes');
+                if (countEl) countEl.textContent = nodes.length;
 
-                    while (tbl.rows.length > 1) tbl.deleteRow(1);
+                while (tbl.rows.length > 1) tbl.deleteRow(1);
 
-                    nodes.forEach(function(node) {
-                        var row = tbl.insertRow(-1);
-                        row.className = 'tr';
-                        row.id = 'node-row-' + node.tag;
-                        row.style.cursor = 'pointer';
-                        row.style.borderBottom = '1px solid var(--cb-border)';
-                        row.onclick = function() {
-                            nodesModule.selectProxyNode(node.tag, syncClashDelays);
-                        };
+                nodes.forEach(function(node) {
+                    var row = tbl.insertRow(-1);
+                    row.className = 'tr';
+                    row.id = 'node-row-' + node.tag;
+                    row.style.cursor = 'pointer';
+                    row.style.borderBottom = '1px solid var(--cb-border)';
+                    row.onclick = function() {
+                        nodesModule.selectProxyNode(node.tag, syncClashDelays);
+                    };
 
-                        var cellTag = row.insertCell(0);
-                        cellTag.className = 'td';
-                        cellTag.style.padding = '8px';
-                        if (node.tag === 'auto') {
-                            cellTag.innerHTML = '<strong style="color:var(--cb-text-accent);">⚡ ' + _('Автовыбор сервера') + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(urltest)</span>';
-                        } else {
-                            cellTag.innerHTML = '<strong style="color:var(--cb-text-main);">' + node.tag + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(' + node.protocol + ')</span>';
-                        }
+                    var cellTag = row.insertCell(0);
+                    cellTag.className = 'td';
+                    cellTag.style.padding = '8px';
+                    if (node.tag === 'auto') {
+                        cellTag.innerHTML = '<strong style="color:var(--cb-text-accent);">⚡ ' + _('Автовыбор сервера') + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(urltest)</span>';
+                    } else {
+                        cellTag.innerHTML = '<strong style="color:var(--cb-text-main);">' + node.tag + '</strong> <span class="node-proto-label" style="color:var(--cb-text-muted); font-size: 0.85em;">(' + node.protocol + ')</span>';
+                    }
 
-                        var cellLat = row.insertCell(1);
-                        cellLat.className = 'td';
-                        cellLat.id = 'node-lat-' + node.tag;
-                        cellLat.style.padding = '8px';
-                        cellLat.style.fontWeight = 'bold';
-                        cellLat.style.fontFamily = 'monospace';
-                        cellLat.style.color = 'var(--cb-text-main)';
-                        cellLat.textContent = node.latency > 0 ? (node.latency + ' ms') : _('Опрос...');
+                    var cellLat = row.insertCell(1);
+                    cellLat.className = 'td';
+                    cellLat.id = 'node-lat-' + node.tag;
+                    cellLat.style.padding = '8px';
+                    cellLat.style.fontWeight = 'bold';
+                    cellLat.style.fontFamily = 'monospace';
+                    cellLat.style.color = 'var(--cb-text-main)';
+                    cellLat.textContent = node.latency > 0 ? (node.latency + ' ms') : _('Опрос...');
 
-                        var cellStatus = row.insertCell(2);
-                        cellStatus.className = 'td';
-                        cellStatus.id = 'node-status-' + node.tag;
-                        cellStatus.style.padding = '8px';
-                        cellStatus.innerHTML = (node.latency > 0)
-                            ? '<span style="color: var(--cb-ok-text); font-weight: bold;">● ' + _('Доступен') + '</span>'
-                            : '<span style="color: var(--cb-warn-text); font-weight: bold;">● ' + _('Ожидание') + '</span>';
-                    });
+                    var cellStatus = row.insertCell(2);
+                    cellStatus.className = 'td';
+                    cellStatus.id = 'node-status-' + node.tag;
+                    cellStatus.style.padding = '8px';
+                    cellStatus.innerHTML = (node.latency > 0)
+                        ? '<span style="color: var(--cb-ok-text); font-weight: bold;">● ' + _('Доступен') + '</span>'
+                        : '<span style="color: var(--cb-warn-text); font-weight: bold;">● ' + _('Ожидание') + '</span>';
+                });
 
-                    setTimeout(syncClashDelays, 400);
-                })
-                .catch(function() {});
+                setTimeout(syncClashDelays, 400);
+            })
+            .catch(function() {});
 
             syncRealtimeStatus();
             fetchDiagnosticsOnce();

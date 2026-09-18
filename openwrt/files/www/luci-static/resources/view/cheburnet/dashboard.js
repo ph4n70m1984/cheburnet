@@ -280,7 +280,13 @@ return view.extend({
             }
 
             var host = window.location.hostname;
-            fetch('http://' + host + ':8088/api/v1/updates/check')
+            var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+            var headers = {};
+            if (apiToken) {
+                headers['X-API-Token'] = apiToken;
+            }
+
+            fetch('http://' + host + ':8088/api/v1/updates/check', { headers: headers })
                 .then(function(r) {
                     if (!r.ok) throw new Error('HTTP ' + r.status);
                     return r.json();
@@ -311,9 +317,15 @@ return view.extend({
                 btnUpgrade.style.display = 'none';
             }
 
+            var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+            var headers = { 'Content-Type': 'application/json' };
+            if (apiToken) {
+                headers['X-API-Token'] = apiToken;
+            }
+
             fetch('http://' + window.location.hostname + ':8088/api/v1/updates/upgrade', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: headers,
                 body: JSON.stringify({ target: 'all' })
             })
             .then(function(r) { return r.json(); })
@@ -364,9 +376,38 @@ return view.extend({
             var input = document.getElementById('cb-clash-secret-input');
             if (input) {
                 input.value = secret;
+                input.type = 'text';
+                var toggleBtn = document.getElementById('cb-clash-secret-toggle');
+                if (toggleBtn) toggleBtn.textContent = '🙈';
+
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
                 input.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+        };
+
+        window.cheburToggleClashSecret = function() {
+            var input = document.getElementById('cb-clash-secret-input');
+            var toggleBtn = document.getElementById('cb-clash-secret-toggle');
+            if (!input) return;
+
+            if (input.type === 'password') {
+                input.type = 'text';
+                if (toggleBtn) toggleBtn.textContent = '🙈';
+            } else {
+                input.type = 'password';
+                if (toggleBtn) toggleBtn.textContent = '👁';
+            }
+        };
+
+        window.cheburCopyClashSecret = function() {
+            var input = document.getElementById('cb-clash-secret-input');
+            if (input && input.value) {
+                navigator.clipboard.writeText(input.value.trim()).then(function() {
+                    ui.addNotification(null, E('p', {}, _('Секрет Clash API скопирован в буфер обмена!')), 'info');
+                });
+            } else {
+                ui.addNotification(null, E('p', {}, _('Секрет пуст')), 'warning');
             }
         };
 
@@ -471,6 +512,10 @@ return view.extend({
 
         s.tab('updates', _('Менеджер обновлений'));
 
+        // Скрытое поле для сохранения api_token в UCI
+        var o_api_token = s.taboption('general', form.HiddenValue, 'api_token');
+        o_api_token.rmempty = false;
+
         // --- ВКЛАДКА 1: ПРОКСИ И ЯДРО ---
         var o = s.taboption('general', form.ListValue, 'routing_mode', _('Режим маршрутизации'));
         o.value('rules', _('По спискам (Избирательный обход)'));
@@ -527,20 +572,37 @@ return view.extend({
                     input.id = 'cb-clash-secret-input';
                 }
 
+                var toggleBtn = E('button', {
+                    'id': 'cb-clash-secret-toggle',
+                    'class': 'btn cbi-button-neutral',
+                    'type': 'button',
+                    'title': _('Показать / Скрыть пароль'),
+                    'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
+                    'click': window.cheburToggleClashSecret
+                }, '👁');
+
+                var copyBtn = E('button', {
+                    'class': 'btn cbi-button-neutral',
+                    'type': 'button',
+                    'title': _('Копировать секрет'),
+                    'style': 'margin-left: 6px; padding: 4px 10px; font-size: 13px;',
+                    'click': window.cheburCopyClashSecret
+                }, '📋');
+
                 var genBtn = E('button', {
                     'class': 'btn cbi-button-action',
                     'type': 'button',
-                    'style': 'margin-left: 8px; white-space: nowrap;',
+                    'style': 'margin-left: 6px; white-space: nowrap;',
                     'click': window.cheburGenClashSecret
-                }, [ E('span', {}, '🔑 '), _('Сгенерировать секрет') ]);
+                }, [ E('span', {}, '🔑 '), _('Сгенерировать') ]);
 
                 var controlDiv = node.querySelector('.cbi-value-field');
                 var descDiv = node.querySelector('.cbi-value-description');
 
                 if (controlDiv && input) {
                     var rowDiv = E('div', {
-                        'style': 'display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 4px;'
-                    }, [ input, genBtn ]);
+                        'style': 'display: flex; align-items: center; gap: 4px; width: 100%; margin-bottom: 4px;'
+                    }, [ input, toggleBtn, copyBtn, genBtn ]);
 
                     if (descDiv) {
                         controlDiv.insertBefore(rowDiv, descDiv);
@@ -835,7 +897,13 @@ return view.extend({
         o.editable = true;
 
         var outboundSelect = o;
-        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes')
+        var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+        var headers = {};
+        if (apiToken) {
+            headers['X-API-Token'] = apiToken;
+        }
+
+        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes', { headers: headers })
             .then(function(r) { return r.json(); })
             .then(function(nodes) {
                 if (Array.isArray(nodes)) {
@@ -863,8 +931,14 @@ return view.extend({
             return uci.save().then(function() {
                 return uci.apply().then(function() {
                     ui.hideIndicator('saving-cheburnet');
+                    var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+                    var headers = {};
+                    if (apiToken) {
+                        headers['X-API-Token'] = apiToken;
+                    }
                     return fetch('http://' + window.location.hostname + ':8088/api/v1/reload', {
-                        method: 'POST'
+                        method: 'POST',
+                        headers: headers
                     }).then(function() {
                         window.location.reload();
                     });
