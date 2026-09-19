@@ -2,9 +2,13 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"net"
 	"os/exec"
+	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -13,13 +17,32 @@ const (
 	SelfMark  = "0x00200000"
 )
 
+var ifaceRegex = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,16}$`)
+
 func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobalMode bool) error {
-	if len(ifaces) == 0 {
-		ifaces = []string{"br-lan"}
+	// Валидация TProxy порта
+	if tproxyPort <= 0 || tproxyPort > 65535 {
+		return fmt.Errorf("invalid tproxy port: %d (must be between 1 and 65535)", tproxyPort)
 	}
 
-	ifaceElements := strings.Join(ifaces, ", ")
+	// 1. Валидация интерфейсов (защита от инъекций в ifname)
+	var validIfaces []string
+	for _, iface := range ifaces {
+		clean := strings.TrimSpace(iface)
+		if clean == "" {
+			continue
+		}
+		if !ifaceRegex.MatchString(clean) {
+			return fmt.Errorf("invalid interface name (possible injection attempt): %q", clean)
+		}
+		validIfaces = append(validIfaces, fmt.Sprintf("%q", clean))
+	}
+	if len(validIfaces) == 0 {
+		validIfaces = []string{`"br-lan"`}
+	}
+	ifaceElements := strings.Join(validIfaces, ", ")
 
+	// 2. Валидация подсетей через строгий парсинг CIDR (только IPv4)
 	subnetElements := ""
 	bypassMangleRule := ""
 	bypassOutputRule := ""
@@ -30,9 +53,24 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 	} else if len(subnets) > 0 {
 		var validSubnets []string
 		for _, s := range subnets {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				validSubnets = append(validSubnets, s)
+			clean := strings.TrimSpace(s)
+			if clean == "" {
+				continue
+			}
+			_, ipNet, err := net.ParseCIDR(clean)
+			if err != nil {
+				// Пробуем распарсить как одиночный IPv4 адрес
+				ip := net.ParseIP(clean)
+				if ip == nil || ip.To4() == nil {
+					return fmt.Errorf("invalid bypass subnet/ip: %q", clean)
+				}
+				validSubnets = append(validSubnets, ip.To4().String()+"/32")
+			} else {
+				// P1: Защита от попадания IPv6 в set type ipv4_addr
+				if ipNet.IP.To4() == nil {
+					return fmt.Errorf("IPv6 subnets are not supported in IPv4 bypass set: %q", clean)
+				}
+				validSubnets = append(validSubnets, ipNet.String())
 			}
 		}
 
@@ -50,15 +88,21 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		}
 	}
 
+	// 3. Валидация full-proxy IP клиентов через строгий net.ParseIP (только IPv4)
 	clientSetElements := ""
 	clientMangleRule := ""
 	if len(fullProxyIPs) > 0 {
 		var validClients []string
-		for _, ip := range fullProxyIPs {
-			ip = strings.TrimSpace(ip)
-			if ip != "" {
-				validClients = append(validClients, ip)
+		for _, rawIP := range fullProxyIPs {
+			clean := strings.TrimSpace(rawIP)
+			if clean == "" {
+				continue
 			}
+			ip := net.ParseIP(clean)
+			if ip == nil || ip.To4() == nil {
+				return fmt.Errorf("invalid client IPv4 address: %q", clean)
+			}
+			validClients = append(validClients, ip.To4().String())
 		}
 
 		if len(validClients) > 0 {
@@ -73,8 +117,11 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		}
 	}
 
-	tpl := `
-table inet %s
+	// P0: Возвращаем транзакционную атомарную замену внутри одного batch:
+	// 1) table inet X       -> объявление таблицы (если её не было, delete не упадёт)
+	// 2) delete table inet X -> удаление старых правил
+	// 3) table inet X { ... } -> создание новой конфигурации
+	tpl := `table inet %s
 delete table inet %s
 table inet %s {
 	set localv4 {
@@ -137,17 +184,16 @@ table inet %s {
 		TableMark,
 	)
 
-	// 1. Проверка синтаксиса без применения (Dry-run)
-	checkCmd := exec.Command("nft", "-c", "-f", "-")
-	checkCmd.Stdin = bytes.NewBufferString(rules)
-	if out, err := checkCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("nft syntax check failed: %w (output: %s)", err, string(out))
-	}
+	// Атомарное применение транзакции через stdin
+	applyCtx, cancelApply := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelApply()
 
-	// 2. Атомарное применение правил
-	applyCmd := exec.Command("nft", "-f", "-")
+	applyCmd := exec.CommandContext(applyCtx, "nft", "-f", "-")
 	applyCmd.Stdin = bytes.NewBufferString(rules)
 	if out, err := applyCmd.CombinedOutput(); err != nil {
+		if applyCtx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("nft apply timed out (netlink socket blocked)")
+		}
 		return fmt.Errorf("nft apply error: %w (output: %s)", err, string(out))
 	}
 
@@ -155,9 +201,15 @@ table inet %s {
 }
 
 func FlushNFTRules() error {
-	cmd := exec.Command("nft", "delete", "table", "inet", TableName)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "nft", "delete", "table", "inet", TableName)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("flush nft rules timed out")
+		}
 		if strings.Contains(string(out), "No such file or directory") {
 			return nil
 		}
