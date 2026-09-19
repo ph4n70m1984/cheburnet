@@ -53,6 +53,7 @@ type GenericNode struct {
 	ObfsPassword string `json:"obfs_password,omitempty"`
 	PortRange    string `json:"port_range,omitempty"`
 	SocksVersion string `json:"socks_version,omitempty"`
+	SourceURL    string `json:"source_url,omitempty"`
 }
 
 type BalancingGroup struct {
