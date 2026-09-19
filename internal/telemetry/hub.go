@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,6 +12,10 @@ import (
 
 	"github.com/gofiber/websocket/v2"
 )
+
+const maxClients = 16
+
+var ErrClientUnavailable = errors.New("telemetry client queue is full or connection closed")
 
 type Hub struct {
 	clients    map[*websocket.Conn]*Client
@@ -31,17 +36,26 @@ func (h *Hub) SetDiagnosticsEngine(d *diagnostics.DiagnosticsEngine) {
 }
 
 func (h *Hub) Register(c *websocket.Conn) {
-	client := newClient(c)
-
 	h.mu.Lock()
+	// Жесткий лимит клиентов: защита от DoS, утечки дескрипторов и переполнения памяти
+	if len(h.clients) >= maxClients {
+		h.mu.Unlock()
+		_ = c.Close()
+		return
+	}
+
+	client := newClient(c)
 	h.clients[c] = client
 	diag := h.diagEngine
 	h.mu.Unlock()
 
-	// Запускаем единственный writer для этого подключения
-	go client.writePump()
+	// Запуск единственного писателя с гарантированным удалением из мапы при завершении
+	go func() {
+		defer h.Unregister(c)
+		client.writePump()
+	}()
 
-	// При подключении клиента отправляем диагностический снимок через защищенную очередь
+	// Первичный снимок состояния при успешном подключении
 	if diag != nil {
 		snap := diag.Snapshot()
 		_ = h.SendJSON(c, diagnostics.DiagnosticEvent{
@@ -56,12 +70,12 @@ func (h *Hub) Unregister(c *websocket.Conn) {
 	client, ok := h.clients[c]
 	if ok {
 		delete(h.clients, c)
-		close(client.send)
+		client.close()
 	}
 	h.mu.Unlock()
 }
 
-// SendJSON безопасно отправляет JSON конкретному клиенту без блокировок
+// SendJSON безопасно отправляет JSON конкретному клиенту и сигнализирует о переполнении/разрыве
 func (h *Hub) SendJSON(c *websocket.Conn, v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -73,40 +87,49 @@ func (h *Hub) SendJSON(c *websocket.Conn, v interface{}) error {
 	h.mu.RUnlock()
 
 	if !ok {
-		return nil
+		return ErrClientUnavailable
 	}
 
 	if !client.tryEnqueue(data) {
 		h.Unregister(c)
-		_ = c.Close()
+		return ErrClientUnavailable
 	}
 	return nil
 }
 
-// BroadcastJSON сериализует payload один раз и распределяет по очередям без создания горутин
+// BroadcastJSON сериализует payload один раз и атомарно очищает отставших клиентов
 func (h *Hub) BroadcastJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
 
+	var deadConns []*websocket.Conn
+
 	h.mu.RLock()
-	var deadConnections []*websocket.Conn
 	for conn, client := range h.clients {
 		if !client.tryEnqueue(data) {
-			deadConnections = append(deadConnections, conn)
+			deadConns = append(deadConns, conn)
 		}
 	}
 	h.mu.RUnlock()
 
-	// Отключаем клиентов, не справившихся даже со сбросом старых сообщений
-	for _, conn := range deadConnections {
-		h.Unregister(conn)
-		_ = conn.Close()
+	if len(deadConns) == 0 {
+		return
 	}
+
+	// Атомарно удаляем неотвечающих клиентов под Lock
+	h.mu.Lock()
+	for _, conn := range deadConns {
+		if client, ok := h.clients[conn]; ok {
+			delete(h.clients, conn)
+			client.close()
+		}
+	}
+	h.mu.Unlock()
 }
 
-// Run опрашивает задержки нод и транслирует события диагностики
+// Run опрашивает задержки нод и транслирует события диагностики без риска busy-loop
 func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine, getActiveNode func() string) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -127,12 +150,22 @@ func (h *Hub) Run(ctx context.Context, getEngine func() engine.Engine, getActive
 	for {
 		select {
 		case <-ctx.Done():
+			h.mu.Lock()
+			for conn, client := range h.clients {
+				delete(h.clients, conn)
+				client.close()
+			}
+			h.mu.Unlock()
 			return
 
 		case ev, ok := <-diagSub:
-			if ok {
-				h.BroadcastJSON(ev)
+			if !ok {
+				// КРИТИЧНО: отключаем case закрытого канала через nil,
+				// исключая 100% CPU busy-loop рантайма
+				diagSub = nil
+				continue
 			}
+			h.BroadcastJSON(ev)
 
 		case <-ticker.C:
 			latencies := make(map[string]int64)
