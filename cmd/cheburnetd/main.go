@@ -82,6 +82,7 @@ func (a *diagReporterAdapter) ResolveProblem(id string) {
 
 type App struct {
 	state         *config.StateManager
+	uciStorage    *config.UCIStorage
 	singboxEng    *engine.SingBoxEngine
 	activeEng     engine.Engine
 	hub           *telemetry.Hub
@@ -122,7 +123,6 @@ func showHelp() {
 		"    get_system_info         Get device and OS specs (JSON)\n")
 }
 
-// setupBootstrapResolver конфигурирует net.DefaultResolver для Bootstrap DNS-запросов.
 func setupBootstrapResolver(cfg *config.CheburConfig) {
 	endpoints := []string{"77.88.8.8:53", "8.8.8.8:53", "1.1.1.1:53"}
 
@@ -152,6 +152,22 @@ func setupBootstrapResolver(cfg *config.CheburConfig) {
 			return nil, lastErr
 		},
 	}
+}
+
+func isMixedProxyAlive(mixedPort int) bool {
+	if mixedPort <= 0 {
+		mixedPort = 4534
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", mixedPort))
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func main() {
@@ -487,18 +503,18 @@ func runDaemon() {
 		initialConfig.UpdateChannel = "release"
 	}
 
-	state := config.NewStateManager(initialConfig)
+	state := config.NewStateManager(initialConfig, uciStorage)
 
-	// Быстрый локальный опрос состояния ядра для SmartTransport
-	engineAliveChecker := func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-		defer cancel()
+	mixedProxyAliveChecker := func() bool {
 		cfg := state.Get()
-		return engine.VerifyEngineAlive(ctx, &cfg) == nil
+		port := cfg.MixedPort
+		if port <= 0 {
+			port = initialConfig.MixedPort
+		}
+		return isMixedProxyAlive(port)
 	}
 
-	// Инициализируем subscription.Worker с передачей initialConfig.MixedPort
-	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID, initialConfig.MixedPort, engineAliveChecker)
+	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID, initialConfig.MixedPort, mixedProxyAliveChecker)
 
 	switch initialConfig.SourceMode {
 	case "manual":
@@ -535,7 +551,6 @@ func runDaemon() {
 
 	log.Printf("[INFO] Total active nodes initialized: %d (source mode: %s)", len(initialConfig.Nodes), initialConfig.SourceMode)
 
-	// ВАЖНО: Фиксируем полученные ноды в StateManager перед запуском движка!
 	state.Update(func(c *config.CheburConfig) {
 		c.Nodes = initialConfig.Nodes
 	})
@@ -562,7 +577,7 @@ func runDaemon() {
 	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
 	hub.SetDiagnosticsEngine(diagEngine)
 
-	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel, initialConfig.MixedPort, engineAliveChecker)
+	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel, initialConfig.MixedPort, mixedProxyAliveChecker)
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
 	if len(initialConfig.CustomSRSRulesets) > 0 {
@@ -584,6 +599,7 @@ func runDaemon() {
 
 	app := &App{
 		state:         state,
+		uciStorage:    uciStorage,
 		singboxEng:    sbEngine,
 		activeEng:     sbEngine,
 		hub:           hub,
@@ -754,28 +770,30 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
 
-	a.mu.RLock()
-	eng := a.activeEng
-	cfg := a.state.Get()
-	a.mu.RUnlock()
-
-	if eng == nil {
-		return fmt.Errorf("no active engine")
+	// 1. Вычитываем конфигурацию из UCI (чтобы подхватить изменения из LuCI)
+	diskCfg, err := a.uciStorage.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load uci config on reload: %w", err)
 	}
 
-	setupBootstrapResolver(&cfg)
+	// 2. Объединяем: берем обновленные параметры из UCI, но сохраняем живые ноды из памяти
+	candidate := *diskCfg
+	currentRuntime := a.state.Get()
+	candidate.Nodes = currentRuntime.Nodes
 
-	if a.updManager != nil && cfg.UpdateChannel != "" {
-		a.updManager.SetUpdateChannel(cfg.UpdateChannel)
+	setupBootstrapResolver(&candidate)
+
+	if a.updManager != nil && candidate.UpdateChannel != "" {
+		a.updManager.SetUpdateChannel(candidate.UpdateChannel)
 	}
 
-	if a.rulesMgr != nil && len(cfg.CustomSRSRulesets) > 0 {
-		log.Printf("[INFO] Reload: Syncing %d custom SRS rulesets...", len(cfg.CustomSRSRulesets))
-		a.rulesMgr.SyncAll(cfg.CustomSRSRulesets)
+	if a.rulesMgr != nil && len(candidate.CustomSRSRulesets) > 0 {
+		log.Printf("[INFO] Reload: Syncing %d custom SRS rulesets...", len(candidate.CustomSRSRulesets))
+		a.rulesMgr.SyncAll(candidate.CustomSRSRulesets)
 	}
 
 	targetPath := RuntimeConfigPathSingBox
-	allRuleSets := collectAllRuleSets(&cfg)
+	allRuleSets := collectAllRuleSets(&candidate)
 
 	if a.rulesMgr != nil && len(allRuleSets) > 0 {
 		for _, rs := range allRuleSets {
@@ -787,14 +805,30 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		a.rulesCron.UpdateRulesets(allRuleSets)
 	}
 
-	isGlobal := cfg.RoutingMode == "global"
-	sourceIface := cfg.SourceIface
+	a.mu.RLock()
+	eng := a.activeEng
+	a.mu.RUnlock()
+
+	if eng == nil {
+		return fmt.Errorf("no active engine")
+	}
+
+	// ФАЗА 1: Валидация и перезагрузка ядра sing-box[cite: 12]
+	// Если новый конфиг содержит ошибки или битый синтаксис — выходим ДО изменения правил nftables[cite: 12]
+	if err := engine.SafeReload(ctx, eng, &candidate, targetPath); err != nil {
+		log.Printf("[ERROR] SafeReload aborted: sing-box rejected candidate config: %v (nftables kept untouched)", err)
+		return fmt.Errorf("engine reload rejected: %w", err)
+	}
+
+	// ФАЗА 2: Синхронизация сетевого стека nftables (строго после успешной перезагрузки ядра)[cite: 12]
+	isGlobal := candidate.RoutingMode == "global"
+	sourceIface := candidate.SourceIface
 	if sourceIface == "" || sourceIface == "lan" {
 		sourceIface = "br-lan"
 	}
 
-	allSubnets := append([]string(nil), cfg.CustomSubnets...)
-	for _, rp := range cfg.RoutePolicies {
+	allSubnets := append([]string(nil), candidate.CustomSubnets...)
+	for _, rp := range candidate.RoutePolicies {
 		if rp.Enabled && len(rp.Subnets) > 0 {
 			allSubnets = append(allSubnets, rp.Subnets...)
 		}
@@ -804,12 +838,19 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		allSubnets = append(allSubnets, fetched...)
 	}
 
-	fullProxyIPs := extractFullProxyIPs(cfg.ClientPolicies)
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, cfg.TProxyPort, isGlobal); err != nil {
-		log.Printf("[WARN] Failed to re-apply nftables rules on reload: %v", err)
+	fullProxyIPs := extractFullProxyIPs(candidate.ClientPolicies)
+	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, candidate.TProxyPort, isGlobal); err != nil {
+		log.Printf("[WARN] Engine reloaded successfully, but failed to re-apply nftables rules: %v", err)
+		return fmt.Errorf("nftables sync failed: %w", err)
 	}
 
-	return engine.SafeReload(ctx, eng, &cfg, targetPath)
+	// ФАЗА 3: Успешная фиксация состояния в памяти StateManager
+	if _, err := a.state.Commit(&candidate, false); err != nil {
+		log.Printf("[WARN] State committed to memory, but persistence returned: %v", err)
+	}
+
+	log.Printf("[INFO] Reload synchronized: sing-box core and nftables are aligned (global: %v, tproxy_port: %d)", isGlobal, candidate.TProxyPort)
+	return nil
 }
 
 func (a *App) restartActiveEngine(ctx context.Context) error {
@@ -1047,7 +1088,6 @@ func (a *App) supervisorLoop(ctx context.Context) {
 
 func callAPI(method, endpoint string, body io.Reader) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	// Запросы шлем строго на петлю 127.0.0.1
 	req, err := http.NewRequest(method, "http://127.0.0.1:8088"+endpoint, body)
 	if err != nil {
 		fmt.Printf("Error creating request: %v\n", err)

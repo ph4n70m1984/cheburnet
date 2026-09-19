@@ -11,10 +11,10 @@ import (
 	"time"
 )
 
-// SingBoxSelfMark — системная метка обхода TProxy (0x00200000 = 2097152)
+// SingBoxSelfMark — системная метка обхода TProxy (0x00200000 = 2097152)[cite: 9]
 const SingBoxSelfMark = 0x00200000
 
-func NewSmartTransport(timeout time.Duration, mixedPort int, isEngineAlive func() bool) *http.Transport {
+func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive func() bool) *http.Transport {
 	if mixedPort <= 0 {
 		mixedPort = 4534
 	}
@@ -22,12 +22,12 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isEngineAlive func(
 	proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", mixedPort)
 	proxyURL, _ := url.Parse(proxyAddr)
 
-	// Чистый диалер без системных меток для подключения к локальному сокету 127.0.0.1:mixedPort
+	// Чистый диалер без меток для соединения с локальным прокси 127.0.0.1:mixedPort[cite: 9]
 	cleanLocalDialer := &net.Dialer{
 		Timeout: timeout,
 	}
 
-	// Аварийный прямой диалер с установкой SO_MARK = 0x00200000 для обхода правил TProxy nftables[cite: 6]
+	// Аварийный диалер с SO_MARK 0x00200000 для прямого обхода правил TProxy nftables[cite: 9]
 	directBypassDialer := &net.Dialer{
 		Timeout: timeout,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -39,7 +39,7 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isEngineAlive func(
 
 	return &http.Transport{
 		Proxy: func(req *http.Request) (*url.URL, error) {
-			alive := isEngineAlive != nil && isEngineAlive()
+			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
 			targetHost := req.URL.Host
 			if targetHost == "" {
 				targetHost = req.Host
@@ -51,26 +51,26 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isEngineAlive func(
 				return proxyURL, nil
 			}
 
-			log.Printf("[network/transport] Target: %s%s -> ROUTE: Emergency Direct (core inactive, fail-open bypass)",
+			log.Printf("[network/transport] Target: %s%s -> ROUTE: Emergency Direct (proxy port down, fail-open bypass)",
 				targetHost, req.URL.Path)
 			return nil, nil
 		},
 		DialContext: func(ctx context.Context, networkProto, addr string) (net.Conn, error) {
 			start := time.Now()
-			alive := isEngineAlive != nil && isEngineAlive()
+			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
 
 			if alive {
 				conn, err := cleanLocalDialer.DialContext(ctx, networkProto, addr)
-				rtt := time.Since(start).Milliseconds()
-				if err != nil {
-					log.Printf("[network/dialer] Proxy Dial ERROR to %s (via %s) after %dms: %v",
-						addr, proxyAddr, rtt, err)
-					return nil, err
+				if err == nil {
+					rtt := time.Since(start).Milliseconds()
+					log.Printf("[network/dialer] Proxy Dial OK to %s (rtt: %dms, socket: clean)", addr, rtt)
+					return conn, nil
 				}
-				log.Printf("[network/dialer] Proxy Dial OK to %s (rtt: %dms, socket: clean)", addr, rtt)
-				return conn, nil
+				// Мгновенный Fail-Open fallback: если порт прокси отвалился прямо перед установкой соединения
+				log.Printf("[network/dialer] Proxy Dial FAILED to %s (%v). Immediate Fail-Open fallback to Direct Bypass...", addr, err)
 			}
 
+			// Аварийный сокет с меткой обхода nftables
 			conn, err := directBypassDialer.DialContext(ctx, networkProto, addr)
 			rtt := time.Since(start).Milliseconds()
 			if err != nil {

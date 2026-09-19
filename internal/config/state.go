@@ -1,15 +1,17 @@
 package config
 
 import (
+	"fmt"
 	"sync"
 )
 
 type StateManager struct {
-	mu     sync.RWMutex
-	config *CheburConfig
+	mu      sync.RWMutex
+	config  *CheburConfig
+	storage *UCIStorage
 }
 
-func NewStateManager(initial *CheburConfig) *StateManager {
+func NewStateManager(initial *CheburConfig, storage *UCIStorage) *StateManager {
 	if initial == nil {
 		initial = &CheburConfig{
 			Engine:     "sing-box",
@@ -20,43 +22,52 @@ func NewStateManager(initial *CheburConfig) *StateManager {
 		}
 	}
 	return &StateManager{
-		config: cloneConfig(initial),
+		config:  cloneConfig(initial),
+		storage: storage,
 	}
 }
 
-// Get возвращает глубокую изолированную копию конфигурации (Snapshot)
+// Get возвращает глубокую изолированную копию конфигурации (Snapshot)[cite: 10]
 func (s *StateManager) Get() CheburConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return *cloneConfig(s.config)
 }
 
-// Clone возвращает указатель на глубокую изолированную копию конфигурации для подготовки кандидата
+// Clone возвращает указатель на глубокую изолированную копию конфигурации для подготовки кандидата[cite: 10]
 func (s *StateManager) Clone() *CheburConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneConfig(s.config)
 }
 
-// Snapshot является алиасом Get для явного отражения семантики снапшота
+// Snapshot является алиасом Get для явного отражения семантики снапшота[cite: 10]
 func (s *StateManager) Snapshot() CheburConfig {
 	return s.Get()
 }
 
-// Commit атомарно фиксирует новую проверенную конфигурацию ТОЛЬКО после успешного SafeReload ядра
-func (s *StateManager) Commit(validated *CheburConfig) CheburConfig {
+// Commit атомарно фиксирует новую конфигурацию и опционально синхронизирует декларативные параметры в UCI
+func (s *StateManager) Commit(validated *CheburConfig, persistUCI bool) (CheburConfig, error) {
 	if validated == nil {
-		return s.Get()
+		return s.Get(), nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 1. Если требуется персистентность (изменение портов, режимов и флагов из API)
+	if persistUCI && s.storage != nil {
+		if err := s.storage.SaveCoreSettings(validated); err != nil {
+			return *cloneConfig(s.config), fmt.Errorf("failed to persist state to UCI: %w", err)
+		}
+	}
+
+	// 2. Атомарное обновление оперативной памяти демона
 	s.config = cloneConfig(validated)
-	return *cloneConfig(s.config)
+	return *cloneConfig(s.config), nil
 }
 
-// Update выполняет атомарную мутацию состояния через замыкание под эксклюзивным Lock
+// Update выполняет атомарную мутацию состояния через замыкание под эксклюзивным Lock[cite: 10]
 func (s *StateManager) Update(fn func(cfg *CheburConfig)) CheburConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,7 +98,7 @@ func (s *StateManager) SetAutoHWID(enabled bool, custom string) {
 	})
 }
 
-// cloneConfig выполняет полное глубокое копирование структуры и её вложенных ссылок
+// cloneConfig выполняет полное глубокое копирование структуры и её вложенных ссылок[cite: 10]
 func cloneConfig(src *CheburConfig) *CheburConfig {
 	if src == nil {
 		return nil
@@ -95,10 +106,10 @@ func cloneConfig(src *CheburConfig) *CheburConfig {
 
 	dst := *src
 
-	// 1. Копирование среза указателей на GenericNode с созданием новых структур
+	// 1. Копирование среза указателей на GenericNode с созданием новых структур[cite: 10]
 	dst.Nodes = cloneNodes(src.Nodes)
 
-	// 2. Копирование среза указателей на BalancingGroup
+	// 2. Копирование среза указателей на BalancingGroup[cite: 10]
 	if src.Groups != nil {
 		dst.Groups = make([]*BalancingGroup, len(src.Groups))
 		for i, g := range src.Groups {
@@ -112,7 +123,7 @@ func cloneConfig(src *CheburConfig) *CheburConfig {
 		}
 	}
 
-	// 3. Копирование срезов структур по значению
+	// 3. Копирование срезов структур по значению[cite: 10]
 	if src.Subscriptions != nil {
 		dst.Subscriptions = append([]SubscriptionConfig(nil), src.Subscriptions...)
 	}
@@ -121,7 +132,7 @@ func cloneConfig(src *CheburConfig) *CheburConfig {
 		dst.ClientPolicies = append([]ClientPolicy(nil), src.ClientPolicies...)
 	}
 
-	// 4. Копирование срезов строк
+	// 4. Копирование срезов строк[cite: 10]
 	if src.ManualNodes != nil {
 		dst.ManualNodes = append([]string(nil), src.ManualNodes...)
 	}

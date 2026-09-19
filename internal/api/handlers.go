@@ -267,8 +267,12 @@ func (s *Server) handleAddNode(c *fiber.Ctx) error {
 		}
 	}
 
-	// Фиксируем стейт только после успешного SafeReload
-	committed := s.state.Commit(candidate)
+	// Фиксируем стейт только после успешного SafeReload (строка 271)
+	committed, err := s.state.Commit(candidate, false)
+	if err != nil {
+		log.Printf("[WARN] State commit warning: %v", err)
+	}
+
 	return c.JSON(fiber.Map{"status": "ok", "node": node, "total_nodes": len(committed.Nodes)})
 }
 
@@ -317,8 +321,12 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		})
 	}
 
-	// 3. Только после успешного старта процесса фиксируем новое состояние
-	committed := s.state.Commit(candidate)
+	// 3. Только после успешного старта процесса фиксируем новое состояние (строка 321)
+	// persistUCI: false — динамические узлы подписок сохраняются в RAM, сберегая флеш
+	committed, err := s.state.Commit(candidate, false)
+	if err != nil {
+		log.Printf("[WARN] State commit warning: %v", err)
+	}
 
 	if s.rulesCron != nil {
 		s.rulesCron.UpdateRulesets(committed.RuleSets)
@@ -419,7 +427,11 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		_ = uci.AddManualNode(manualNodeToAdd)
 	}
 
-	committed := s.state.Commit(candidate)
+	// Фиксируем обновленное состояние (строка 422)
+	committed, err := s.state.Commit(candidate, false)
+	if err != nil {
+		log.Printf("[WARN] State commit warning: %v", err)
+	}
 
 	return c.JSON(fiber.Map{
 		"status":      "ok",
@@ -444,7 +456,6 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		})
 	}
 
-	// Создаем кандидата на основе загруженных параметров
 	candidate := s.state.Clone()
 	*candidate = *newCfg
 
@@ -480,8 +491,11 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		_ = eng.Stop()
 	}
 
-	// Фиксируем новое состояние после прохождения SafeReload
-	committed := s.state.Commit(candidate)
+	// Фиксируем новое состояние после прохождения SafeReload (строка 484)
+	committed, err := s.state.Commit(candidate, false)
+	if err != nil {
+		log.Printf("[WARN] State commit warning: %v", err)
+	}
 
 	if s.rulesCron != nil {
 		s.rulesCron.UpdateRulesets(committed.RuleSets)

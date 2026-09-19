@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cheburnet/internal/config"
@@ -25,7 +27,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const maxSubscriptionSize = 8 << 20 // 8 MiB лимит для embedded-устройств OpenWrt
+const maxSubscriptionSize = 8 << 20 // 8 MiB лимит для embedded-устройств OpenWrt[cite: 7]
 
 type Worker struct {
 	autoHWID      bool
@@ -33,11 +35,27 @@ type Worker struct {
 	mu            sync.Mutex
 	cancelMap     map[string]context.CancelFunc
 	client        *http.Client
+	directClient  *http.Client // Аварийный прямой клиент с SO_MARK 0x00200000 для обхода TProxy
 	isEngineAlive func() bool
 }
 
 func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveChecker func() bool) *Worker {
+	// 1. Основной смарт-транспорт (ходит в http://127.0.0.1:mixedPort, когда sing-box активен)[cite: 7]
 	transport := network.NewSmartTransport(8*time.Second, mixedPort, engineAliveChecker)
+
+	// 2. Прямой диалер с меткой 0x00200000: при сбое VPN выпускает служебный запрос напрямую через WAN в обход правил nftables
+	directTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 8 * time.Second,
+			Control: func(networkProto, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, network.SingBoxSelfMark)
+				})
+			},
+		}).DialContext,
+		ResponseHeaderTimeout: 8 * time.Second,
+		DisableKeepAlives:     true,
+	}
 
 	return &Worker{
 		autoHWID:      autoHWID,
@@ -47,6 +65,10 @@ func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveCheck
 		client: &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: transport,
+		},
+		directClient: &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: directTransport,
 		},
 	}
 }
@@ -72,7 +94,6 @@ func parseDurationSafe(intervalStr string) time.Duration {
 	}
 }
 
-// StartSubscriptionLoops запускает таймеры автообновления для каждой подписки
 func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.SubscriptionConfig, onUpdate func(sub config.SubscriptionConfig)) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -160,7 +181,6 @@ type xrayOutboundItem struct {
 	StreamSettings map[string]interface{} `json:"streamSettings"`
 }
 
-// filterNodesByCompiledRegex использует уже скомпилированные регулярные выражения из памяти
 func filterNodesByCompiledRegex(nodes []*config.GenericNode, compiled []*regexp.Regexp, filterMode string) []*config.GenericNode {
 	if len(compiled) == 0 {
 		return nodes
@@ -193,13 +213,108 @@ func filterNodesByCompiledRegex(nodes []*config.GenericNode, compiled []*regexp.
 
 func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) ([]*config.GenericNode, error) {
 	reqURL := strings.TrimSpace(sub.URL)
-	subName := strings.TrimSpace(sub.Name)
-
 	targetHWID := strings.TrimSpace(sub.HWID)
 	if targetHWID == "" && w.autoHWID {
 		targetHWID = w.getOrGenerateHWID()
 	}
 
+	// 1. Ссылка формата happ://crypt4/ обрабатывается локально без сети[cite: 7]
+	if happ.IsCrypt4(reqURL) {
+		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt inline crypt4: %w", err)
+		}
+		return w.parseContent(decrypted, sub, targetHWID)
+	}
+
+	// 2. Попытка загрузки через основной клиент (через SmartTransport/VPN)
+	body, err := w.fetchPayload(ctx, sub, targetHWID, w.client)
+	if err == nil {
+		nodes, parseErr := w.parseContent(body, sub, targetHWID)
+		if parseErr == nil && len(nodes) > 0 {
+			return nodes, nil
+		}
+		if parseErr != nil {
+			err = parseErr
+		}
+	}
+
+	// 3. Аварийный откат (Fallback): если ядро работает, но VPN-нода заблокирована сервером подписки
+	if w.isEngineAlive != nil && w.isEngineAlive() {
+		log.Printf("[subscription] WARN: Fetch via active VPN failed for %s (%v). Retrying via Direct Bypass...", reqURL, err)
+		directBody, directErr := w.fetchPayload(ctx, sub, targetHWID, w.directClient)
+		if directErr == nil {
+			nodes, parseErr := w.parseContent(directBody, sub, targetHWID)
+			if parseErr == nil && len(nodes) > 0 {
+				log.Printf("[subscription] INFO: Direct Bypass fetch SUCCESS for %s (recovered %d nodes)", reqURL, len(nodes))
+				return nodes, nil
+			}
+		} else {
+			log.Printf("[subscription] ERROR: Direct Bypass fetch also failed for %s: %v", reqURL, directErr)
+		}
+	}
+
+	return nil, err
+}
+
+func (w *Worker) fetchPayload(ctx context.Context, sub config.SubscriptionConfig, targetHWID string, httpClient *http.Client) ([]byte, error) {
+	reqURL := strings.TrimSpace(sub.URL)
+	reqCtx, reqCancel := context.WithTimeout(ctx, 12*time.Second)
+	defer reqCancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	ua := strings.TrimSpace(sub.UserAgent)
+	if ua == "" {
+		ua = "Happ/4.3.5"
+	}
+
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "close")
+
+	if targetHWID != "" {
+		req.Header.Set("x-hwid", targetHWID)
+		req.Header.Set("hwid", targetHWID)
+		req.Header.Set("X-HWID", targetHWID)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http fetch error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
+	}
+
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if len(rawBody) > maxSubscriptionSize {
+		return nil, fmt.Errorf("subscription response exceeded maximum size limit of %d bytes", maxSubscriptionSize)
+	}
+
+	strBody := strings.TrimSpace(string(rawBody))
+	if happ.IsCrypt4(strBody) {
+		decrypted, err := happ.DecryptCrypt4(strBody, targetHWID, sub.HWID, "HappDefaultSalt")
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt downloaded crypt4 body: %w", err)
+		}
+		return decrypted, nil
+	}
+
+	return rawBody, nil
+}
+
+func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, targetHWID string) ([]*config.GenericNode, error) {
+	subName := strings.TrimSpace(sub.Name)
 	filterMode := sub.FilterMode
 	if filterMode == "" {
 		filterMode = "exclude"
@@ -207,72 +322,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 
 	if len(sub.CompiledRegex) == 0 && len(sub.ExcludeRegex) > 0 {
 		sub.CompileFilters()
-	}
-
-	var body []byte
-
-	// 1. Статическая ссылка happ://crypt4/
-	if happ.IsCrypt4(reqURL) {
-		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt inline crypt4: %w", err)
-		}
-		body = decrypted
-	} else {
-		// 2. HTTP-запрос через динамический SmartTransport
-		reqCtx, reqCancel := context.WithTimeout(ctx, 12*time.Second)
-		defer reqCancel()
-
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		ua := strings.TrimSpace(sub.UserAgent)
-		if ua == "" {
-			ua = "Happ/4.3.5"
-		}
-
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Connection", "close")
-
-		if targetHWID != "" {
-			req.Header.Set("x-hwid", targetHWID)
-			req.Header.Set("hwid", targetHWID)
-			req.Header.Set("X-HWID", targetHWID)
-		}
-
-		resp, err := w.client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("http fetch error: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
-		}
-
-		// Читаем не более maxSubscriptionSize + 1 байт для защиты памяти OpenWrt
-		rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionSize+1))
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response body: %w", err)
-		}
-
-		if len(rawBody) > maxSubscriptionSize {
-			return nil, fmt.Errorf("subscription response exceeded maximum size limit of %d bytes", maxSubscriptionSize)
-		}
-
-		strBody := strings.TrimSpace(string(rawBody))
-		if happ.IsCrypt4(strBody) {
-			decrypted, err := happ.DecryptCrypt4(strBody, targetHWID, sub.HWID, "HappDefaultSalt")
-			if err != nil {
-				return nil, fmt.Errorf("failed to decrypt downloaded crypt4 body: %w", err)
-			}
-			body = decrypted
-		} else {
-			body = rawBody
-		}
 	}
 
 	var nodes []*config.GenericNode
@@ -296,11 +345,11 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON массив профилей
+	// 1. Попытка распарсить как Xray JSON[cite: 7]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.CompiledRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML
+		// 2. Попытка распарсить как Clash YAML[cite: 7]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -337,7 +386,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Base64
+			// 3. Base64 декодирование[cite: 7]
 			content := string(body)
 			trimmed := strings.TrimSpace(content)
 
@@ -351,7 +400,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 				}
 			}
 
-			// 4. Plaintext построчно
+			// 4. Построчный парсинг Plaintext URI[cite: 7]
 			scanner := bufio.NewScanner(strings.NewReader(content))
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())

@@ -87,7 +87,6 @@ func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 	return rules
 }
 
-// uciCache представляет собой снимки конфигурации, загруженные ровно за один fork+exec
 type uciCache struct {
 	scalars map[string]string
 	lists   map[string][]string
@@ -119,7 +118,6 @@ func loadUCICache(packageName string) (*uciCache, error) {
 		k := strings.TrimSpace(parts[0])
 		v := sanitizeToken(parts[1])
 
-		// Определение списков UCI вида: cheburnet.main.rulesets[0]='russia'
 		if idx := strings.Index(k, "["); idx != -1 && strings.HasSuffix(k, "]") {
 			baseKey := k[:idx]
 			if v != "" {
@@ -221,10 +219,8 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		cfg.APIToken = generatedToken
 	}
 
-	// 1. Чтение подписок из памяти
 	cfg.Subscriptions = u.parseSubscriptionSections(cache.rawShow)
 
-	// 2. Обратная совместимость для старого main.subscription
 	if len(cfg.Subscriptions) == 0 {
 		oldSubs := cache.getList("cheburnet.main.subscription")
 		for _, raw := range oldSubs {
@@ -243,16 +239,11 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		}
 	}
 
-	// 3. Чтение политик клиентов
 	cfg.ClientPolicies = u.parseClientRuleSections(cache.rawShow)
-
-	// 4. Чтение секций маршрутизации сервисов
 	cfg.RoutePolicies = u.parseRoutePolicySections(cache.rawShow)
 
-	// Чтение одиночных узлов
 	cfg.ManualNodes = cache.getList("cheburnet.main.manual_nodes")
 
-	// Чтение наборов правил .srs
 	rawRuleSets := cache.getList("cheburnet.main.rulesets")
 	if len(rawRuleSets) > 0 {
 		cleanSets := make([]string, 0, len(rawRuleSets))
@@ -267,18 +258,43 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
 	}
 
-	// Чтение кастомных SRS правил
 	cfg.CustomSRSRulesets = parseCustomSRSRules(cache.getList("cheburnet.main.custom_srs_rulesets"))
-
-	// Чтение кастомных доменов, подсетей и портов
 	cfg.CustomDomains = parseTextLines(cache.get("cheburnet.main.custom_domains", ""))
 	cfg.CustomSubnets = parseTextLines(cache.get("cheburnet.main.custom_subnets", ""))
 	cfg.CustomPorts = parseTextLines(cache.get("cheburnet.main.custom_ports", ""))
-
-	// Чтение путей к локальным файлам
 	cfg.LocalListFiles = cache.getList("cheburnet.main.local_list_files")
 
 	return cfg, nil
+}
+
+// SaveCoreSettings фиксирует на диске только структурные и системные параметры, исключая перезапись динамических серверов
+func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("cannot persist nil config")
+	}
+
+	cmds := [][]string{
+		{"set", fmt.Sprintf("cheburnet.main.engine=%s", cfg.Engine)},
+		{"set", fmt.Sprintf("cheburnet.main.routing_mode=%s", cfg.RoutingMode)},
+		{"set", fmt.Sprintf("cheburnet.main.source_mode=%s", cfg.SourceMode)},
+		{"set", fmt.Sprintf("cheburnet.main.tproxy_port=%d", cfg.TProxyPort)},
+		{"set", fmt.Sprintf("cheburnet.main.dns_port=%d", cfg.DNSPort)},
+		{"set", fmt.Sprintf("cheburnet.main.mixed_port=%d", cfg.MixedPort)},
+		{"set", fmt.Sprintf("cheburnet.main.update_channel=%s", cfg.UpdateChannel)},
+	}
+
+	for _, args := range cmds {
+		cmd := exec.Command("uci", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("uci %v failed: %s (%w)", args, string(out), err)
+		}
+	}
+
+	if out, err := exec.Command("uci", "commit", "cheburnet").CombinedOutput(); err != nil {
+		return fmt.Errorf("uci commit cheburnet failed: %s (%w)", string(out), err)
+	}
+
+	return nil
 }
 
 func (u *UCIStorage) parseSubscriptionSections(rawShow string) []SubscriptionConfig {
