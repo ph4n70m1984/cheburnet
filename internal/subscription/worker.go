@@ -218,7 +218,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		targetHWID = w.getOrGenerateHWID()
 	}
 
-	// 1. Ссылка формата happ://crypt4/ обрабатывается локально без сети[cite: 7]
+	// 1. Статические happ://crypt4/ парсятся офлайн
 	if happ.IsCrypt4(reqURL) {
 		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
 		if err != nil {
@@ -227,7 +227,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return w.parseContent(decrypted, sub, targetHWID)
 	}
 
-	// 2. Попытка загрузки через основной клиент (через SmartTransport/VPN)
+	// 2. Первая попытка через основной клиент (SmartTransport: VPN или Direct при выключенном ядре)
 	body, err := w.fetchPayload(ctx, sub, targetHWID, w.client)
 	if err == nil {
 		nodes, parseErr := w.parseContent(body, sub, targetHWID)
@@ -239,22 +239,21 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		}
 	}
 
-	// 3. Аварийный откат (Fallback): если ядро работает, но VPN-нода заблокирована сервером подписки
-	if w.isEngineAlive != nil && w.isEngineAlive() {
-		log.Printf("[subscription] WARN: Fetch via active VPN failed for %s (%v). Retrying via Direct Bypass...", reqURL, err)
-		directBody, directErr := w.fetchPayload(ctx, sub, targetHWID, w.directClient)
-		if directErr == nil {
-			nodes, parseErr := w.parseContent(directBody, sub, targetHWID)
-			if parseErr == nil && len(nodes) > 0 {
-				log.Printf("[subscription] INFO: Direct Bypass fetch SUCCESS for %s (recovered %d nodes)", reqURL, len(nodes))
-				return nodes, nil
-			}
-		} else {
-			log.Printf("[subscription] ERROR: Direct Bypass fetch also failed for %s: %v", reqURL, directErr)
+	// 3. Безусловный фоллбэк: если запрос через SmartTransport не удался
+	// (прокси упал прямо во время запроса, таймаут, Cloudflare 403/503 через IP датацентра VPN)
+	log.Printf("[subscription] WARN: Primary fetch failed for %s (%v). Retrying via Direct Bypass...", reqURL, err)
+	directBody, directErr := w.fetchPayload(ctx, sub, targetHWID, w.directClient)
+	if directErr == nil {
+		nodes, parseErr := w.parseContent(directBody, sub, targetHWID)
+		if parseErr == nil && len(nodes) > 0 {
+			log.Printf("[subscription] INFO: Direct Bypass fetch SUCCESS for %s (recovered %d nodes)", reqURL, len(nodes))
+			return nodes, nil
 		}
+		directErr = parseErr
 	}
 
-	return nil, err
+	log.Printf("[subscription] ERROR: Direct Bypass fetch also failed for %s: %v", reqURL, directErr)
+	return nil, fmt.Errorf("primary error: %v; direct bypass error: %w", err, directErr)
 }
 
 func (w *Worker) fetchPayload(ctx context.Context, sub config.SubscriptionConfig, targetHWID string, httpClient *http.Client) ([]byte, error) {

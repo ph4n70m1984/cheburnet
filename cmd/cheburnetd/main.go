@@ -770,16 +770,18 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
 
-	// 1. Вычитываем конфигурацию из UCI (чтобы подхватить изменения из LuCI)
+	// 1. Сохраняем снимок текущей гарантированно рабочей конфигурации для отката
+	previousConfig := a.state.Get()
+
+	// 2. Вычитываем конфигурацию из UCI (подхватываем изменения настроек из LuCI)
 	diskCfg, err := a.uciStorage.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load uci config on reload: %w", err)
 	}
 
-	// 2. Объединяем: берем обновленные параметры из UCI, но сохраняем живые ноды из памяти
+	// 3. Формируем кандидата: берем новые параметры с диска, сохраняя живые ноды из памяти
 	candidate := *diskCfg
-	currentRuntime := a.state.Get()
-	candidate.Nodes = currentRuntime.Nodes
+	candidate.Nodes = previousConfig.Nodes
 
 	setupBootstrapResolver(&candidate)
 
@@ -813,38 +815,69 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	// ФАЗА 1: Валидация и перезагрузка ядра sing-box[cite: 12]
-	// Если новый конфиг содержит ошибки или битый синтаксис — выходим ДО изменения правил nftables[cite: 12]
+	// ФАЗА 1: Валидация и перевод ядра sing-box на конфигурацию кандидата
+	// Если здесь произошла ошибка — nftables даже не трогаем, откат ядра не нужен
 	if err := engine.SafeReload(ctx, eng, &candidate, targetPath); err != nil {
-		log.Printf("[ERROR] SafeReload aborted: sing-box rejected candidate config: %v (nftables kept untouched)", err)
-		return fmt.Errorf("engine reload rejected: %w", err)
+		log.Printf("[ERROR] SafeReload candidate aborted: sing-box rejected candidate config: %v (nftables kept untouched)", err)
+		return fmt.Errorf("candidate engine reload rejected: %w", err)
 	}
 
-	// ФАЗА 2: Синхронизация сетевого стека nftables (строго после успешной перезагрузки ядра)[cite: 12]
-	isGlobal := candidate.RoutingMode == "global"
-	sourceIface := candidate.SourceIface
-	if sourceIface == "" || sourceIface == "lan" {
-		sourceIface = "br-lan"
-	}
-
-	allSubnets := append([]string(nil), candidate.CustomSubnets...)
-	for _, rp := range candidate.RoutePolicies {
-		if rp.Enabled && len(rp.Subnets) > 0 {
-			allSubnets = append(allSubnets, rp.Subnets...)
+	// Хелпер подготовки параметров nftables для любой версии конфигурации
+	prepareNFTParams := func(cfg *config.CheburConfig) (iface string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobal bool) {
+		isGlobal = cfg.RoutingMode == "global"
+		iface = cfg.SourceIface
+		if iface == "" || iface == "lan" {
+			iface = "br-lan"
 		}
-	}
-	if len(allRuleSets) > 0 && a.rulesLoader != nil {
-		fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, allRuleSets)
-		allSubnets = append(allSubnets, fetched...)
+		subnets = append([]string(nil), cfg.CustomSubnets...)
+		for _, rp := range cfg.RoutePolicies {
+			if rp.Enabled && len(rp.Subnets) > 0 {
+				subnets = append(subnets, rp.Subnets...)
+			}
+		}
+		rs := collectAllRuleSets(cfg)
+		if len(rs) > 0 && a.rulesLoader != nil {
+			fetched := loadSubnetsFromCompressedStorage(a.rulesLoader, rs)
+			subnets = append(subnets, fetched...)
+		}
+		fullProxyIPs = extractFullProxyIPs(cfg.ClientPolicies)
+		tproxyPort = cfg.TProxyPort
+		return
 	}
 
-	fullProxyIPs := extractFullProxyIPs(candidate.ClientPolicies)
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, candidate.TProxyPort, isGlobal); err != nil {
-		log.Printf("[WARN] Engine reloaded successfully, but failed to re-apply nftables rules: %v", err)
-		return fmt.Errorf("nftables sync failed: %w", err)
+	// ФАЗА 2: Применение правил nftables под параметры кандидата
+	sIface, subnets, fullProxyIPs, tproxyPort, isGlobal := prepareNFTParams(&candidate)
+	if err := network.ApplyNFTRules([]string{sIface}, subnets, fullProxyIPs, tproxyPort, isGlobal); err != nil {
+		log.Printf("[CRITICAL] ApplyNFTRules failed for candidate: %v. Initiating ROLLBACK to previous stable configuration...", err)
+
+		// -------------------------------------------------------------
+		// ROLLBACK ШАГ 1: Откатываем ядро sing-box на previousConfig
+		// -------------------------------------------------------------
+		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelRollback()
+
+		rollbackErr := engine.SafeReload(rollbackCtx, eng, &previousConfig, targetPath)
+		if rollbackErr != nil {
+			log.Printf("[EMERGENCY] Rollback engine reload FAILED: %v (engine in indeterminate state!)", rollbackErr)
+		} else {
+			log.Printf("[INFO] Rollback engine SafeReload to previous configuration SUCCESS.")
+		}
+
+		// -------------------------------------------------------------
+		// ROLLBACK ШАГ 2: Восстанавливаем правила nftables для previousConfig
+		// -------------------------------------------------------------
+		prevIface, prevSubnets, prevFullProxy, prevPort, prevGlobal := prepareNFTParams(&previousConfig)
+		if prevNFTErr := network.ApplyNFTRules([]string{prevIface}, prevSubnets, prevFullProxy, prevPort, prevGlobal); prevNFTErr != nil {
+			log.Printf("[EMERGENCY] Rollback ApplyNFTRules to previous state FAILED: %v", prevNFTErr)
+		} else {
+			log.Printf("[INFO] Rollback ApplyNFTRules restored previous firewall state successfully.")
+		}
+
+		// Память state НЕ меняется — остается старая стабильная previousConfig
+		return fmt.Errorf("nftables setup failed: %w (rollback executed)", err)
 	}
 
-	// ФАЗА 3: Успешная фиксация состояния в памяти StateManager
+	// ФАЗА 3: Успешный коммит транзакции в память StateManager
 	if _, err := a.state.Commit(&candidate, false); err != nil {
 		log.Printf("[WARN] State committed to memory, but persistence returned: %v", err)
 	}

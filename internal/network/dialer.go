@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// SingBoxSelfMark — системная метка обхода TProxy (0x00200000 = 2097152)[cite: 9]
+// SingBoxSelfMark — системная метка обхода TProxy (0x00200000 = 2097152)[cite: 6]
 const SingBoxSelfMark = 0x00200000
 
 func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive func() bool) *http.Transport {
@@ -22,12 +22,10 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 	proxyAddr := fmt.Sprintf("http://127.0.0.1:%d", mixedPort)
 	proxyURL, _ := url.Parse(proxyAddr)
 
-	// Чистый диалер без меток для соединения с локальным прокси 127.0.0.1:mixedPort[cite: 9]
 	cleanLocalDialer := &net.Dialer{
 		Timeout: timeout,
 	}
 
-	// Аварийный диалер с SO_MARK 0x00200000 для прямого обхода правил TProxy nftables[cite: 9]
 	directBypassDialer := &net.Dialer{
 		Timeout: timeout,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -59,18 +57,20 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 			start := time.Now()
 			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
 
+			// Если ядро живо, соединяемся с 127.0.0.1:mixedPort чистым сокетом без меток[cite: 6]
 			if alive {
 				conn, err := cleanLocalDialer.DialContext(ctx, networkProto, addr)
-				if err == nil {
-					rtt := time.Since(start).Milliseconds()
-					log.Printf("[network/dialer] Proxy Dial OK to %s (rtt: %dms, socket: clean)", addr, rtt)
-					return conn, nil
+				rtt := time.Since(start).Milliseconds()
+				if err != nil {
+					log.Printf("[network/dialer] Proxy Dial ERROR to %s (via %s) after %dms: %v",
+						addr, proxyAddr, rtt, err)
+					return nil, err
 				}
-				// Мгновенный Fail-Open fallback: если порт прокси отвалился прямо перед установкой соединения
-				log.Printf("[network/dialer] Proxy Dial FAILED to %s (%v). Immediate Fail-Open fallback to Direct Bypass...", addr, err)
+				log.Printf("[network/dialer] Proxy Dial OK to %s (rtt: %dms, socket: clean)", addr, rtt)
+				return conn, nil
 			}
 
-			// Аварийный сокет с меткой обхода nftables
+			// Если ядро не работает, сокет открывается напрямую к целевому серверу с меткой обхода nftables[cite: 6]
 			conn, err := directBypassDialer.DialContext(ctx, networkProto, addr)
 			rtt := time.Since(start).Milliseconds()
 			if err != nil {
