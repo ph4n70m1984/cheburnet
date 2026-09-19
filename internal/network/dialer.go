@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const SingBoxSelfMark = SelfMarkInt
+type proxyDecisionKey struct{}
 
 func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive func() bool) *http.Transport {
 	if mixedPort <= 0 {
@@ -25,11 +25,12 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 		Timeout: timeout,
 	}
 
+	// Единый аварийный диалер: использует каноничную метку EmergencyDirectMarkInt (0x00300000)
 	directBypassDialer := &net.Dialer{
 		Timeout: timeout,
-		Control: func(network, address string, c syscall.RawConn) error {
+		Control: func(protoName, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, SingBoxSelfMark)
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, EmergencyDirectMarkInt)
 			})
 		},
 	}
@@ -37,27 +38,35 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 	return &http.Transport{
 		Proxy: func(req *http.Request) (*url.URL, error) {
 			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
+
+			// Сохраняем атомарное решение в контексте запроса для устранения P1-гонки с DialContext
+			*req = *req.WithContext(context.WithValue(req.Context(), proxyDecisionKey{}, alive))
+
 			targetHost := req.URL.Host
 			if targetHost == "" {
 				targetHost = req.Host
 			}
 
 			if alive {
-				log.Printf("[network/transport] Target: %s%s -> ROUTE: VPN Tunnel (via sing-box %s)",
-					targetHost, req.URL.Path, proxyAddr)
 				return proxyURL, nil
 			}
 
-			log.Printf("[network/transport] Target: %s%s -> ROUTE: Emergency Direct (proxy port down, fail-open bypass)",
-				targetHost, req.URL.Path)
+			log.Printf("[network/transport] Target: %s%s -> ROUTE: Emergency Direct (proxy down, bypass mark 0x%08x)",
+				targetHost, req.URL.Path, EmergencyDirectMarkInt)
 			return nil, nil
 		},
 		DialContext: func(ctx context.Context, networkProto, addr string) (net.Conn, error) {
 			start := time.Now()
-			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
 
-			// Если ядро живо, соединяемся с 127.0.0.1:mixedPort чистым сокетом без меток[cite: 6]
-			if alive {
+			// Считываем зафиксированное на этапе Proxy() решение из контекста
+			useProxy, hasDecision := ctx.Value(proxyDecisionKey{}).(bool)
+			if !hasDecision {
+				// Фоллбэк на случай прямого вызова DialContext без прохождения Proxy func
+				useProxy = isMixedProxyAlive != nil && isMixedProxyAlive()
+			}
+
+			// 1. Маршрут через локальный mixedPort sing-box
+			if useProxy {
 				conn, err := cleanLocalDialer.DialContext(ctx, networkProto, addr)
 				rtt := time.Since(start).Milliseconds()
 				if err != nil {
@@ -65,20 +74,17 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 						addr, proxyAddr, rtt, err)
 					return nil, err
 				}
-				log.Printf("[network/dialer] Proxy Dial OK to %s (rtt: %dms, socket: clean)", addr, rtt)
 				return conn, nil
 			}
 
-			// Если ядро не работает, сокет открывается напрямую к целевому серверу с меткой обхода nftables[cite: 6]
+			// 2. Аварийный прямой маршрут в обход TProxy с меткой EmergencyDirectMarkInt
 			conn, err := directBypassDialer.DialContext(ctx, networkProto, addr)
 			rtt := time.Since(start).Milliseconds()
 			if err != nil {
 				log.Printf("[network/dialer] Direct Dial ERROR to %s (mark: 0x%08x) after %dms: %v",
-					addr, SingBoxSelfMark, rtt, err)
+					addr, EmergencyDirectMarkInt, rtt, err)
 				return nil, err
 			}
-			log.Printf("[network/dialer] Direct Dial OK to %s (rtt: %dms, bypass mark: 0x%08x)",
-				addr, rtt, SingBoxSelfMark)
 			return conn, nil
 		},
 		ResponseHeaderTimeout: timeout,
