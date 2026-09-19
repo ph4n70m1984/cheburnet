@@ -240,7 +240,7 @@ func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 	})
 }
 
-// handleAddNode добавляет одиночную ссылку ноды (vless, hy2, trojan, ss, socks)
+// handleAddNode добавляет одиночную ноду по ссылке с валидацией через кандидата
 func (s *Server) handleAddNode(c *fiber.Ctx) error {
 	var req struct {
 		URI string `json:"uri"`
@@ -249,48 +249,53 @@ func (s *Server) handleAddNode(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	cfg := s.state.Get()
-	node, err := uri.ParseNodeURI(req.URI, cfg.AutoHWID, cfg.CustomHWID)
+	candidate := s.state.Clone()
+	node, err := uri.ParseNodeURI(req.URI, candidate.AutoHWID, candidate.CustomHWID)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	s.state.Update(func(c *config.CheburConfig) {
-		c.Nodes = append(c.Nodes, node)
-	})
+	candidate.Nodes = append(candidate.Nodes, node)
+	candidate.ManualNodes = append(candidate.ManualNodes, req.URI)
 
-	return c.JSON(fiber.Map{"status": "ok", "node": node})
-}
-
-// handleUpdateSubscriptions обновляет все сохраненные подписки
-func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
-	uciStorage := config.NewUCIStorage()
-	freshCfg, err := uciStorage.Load()
-	if err == nil {
-		s.state.Update(func(cfg *config.CheburConfig) {
-			cfg.RuleSets = freshCfg.RuleSets
-			cfg.Subscriptions = freshCfg.Subscriptions
-			cfg.ManualNodes = freshCfg.ManualNodes
-			cfg.RulesetUpdateInterval = freshCfg.RulesetUpdateInterval
-			cfg.ClashAPISecret = freshCfg.ClashAPISecret
-		})
-
-		if s.rulesCron != nil {
-			s.rulesCron.UpdateRulesets(freshCfg.RuleSets)
-			s.rulesCron.SetInterval(freshCfg.RulesetUpdateInterval)
+	eng := s.getEngine()
+	if eng != nil {
+		if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to safely reload engine with new node: " + err.Error(),
+			})
 		}
 	}
 
-	currentSnapshot := s.state.Get()
+	// Фиксируем стейт только после успешного SafeReload
+	committed := s.state.Commit(candidate)
+	return c.JSON(fiber.Map{"status": "ok", "node": node, "total_nodes": len(committed.Nodes)})
+}
+
+// handleUpdateSubscriptions обновляет все сохраненные подписки по модели Two-Phase Commit
+func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
+	// 1. Создаем изолированного кандидата конфигурации
+	candidate := s.state.Clone()
+
+	uciStorage := config.NewUCIStorage()
+	freshCfg, err := uciStorage.Load()
+	if err == nil && freshCfg != nil {
+		candidate.RuleSets = freshCfg.RuleSets
+		candidate.Subscriptions = freshCfg.Subscriptions
+		candidate.ManualNodes = freshCfg.ManualNodes
+		candidate.RulesetUpdateInterval = freshCfg.RulesetUpdateInterval
+		candidate.ClashAPISecret = freshCfg.ClashAPISecret
+	}
+
 	var allNodes []*config.GenericNode
 
-	for _, raw := range currentSnapshot.ManualNodes {
-		if node, err := uri.ParseNodeURI(raw, currentSnapshot.AutoHWID, currentSnapshot.CustomHWID); err == nil {
+	for _, raw := range candidate.ManualNodes {
+		if node, err := uri.ParseNodeURI(raw, candidate.AutoHWID, candidate.CustomHWID); err == nil {
 			allNodes = append(allNodes, node)
 		}
 	}
 
-	for _, sub := range currentSnapshot.Subscriptions {
+	for _, sub := range candidate.Subscriptions {
 		if sub.URL == "" || !sub.Enabled {
 			continue
 		}
@@ -300,27 +305,35 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		}
 	}
 
-	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
-		cfg.Nodes = allNodes
-	})
+	candidate.Nodes = allNodes
 
+	// 2. SafeReload выполняется строго над кандидатом
 	eng := s.getEngine()
-	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
+	if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
 		log.Printf("[api] update subscriptions reload error: %v", err)
+		// Состояние s.state НЕ затронуто, старые рабочие ноды сохранены
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to safely apply updated subscriptions: " + err.Error(),
 		})
 	}
 
+	// 3. Только после успешного старта процесса фиксируем новое состояние
+	committed := s.state.Commit(candidate)
+
+	if s.rulesCron != nil {
+		s.rulesCron.UpdateRulesets(committed.RuleSets)
+		s.rulesCron.SetInterval(committed.RulesetUpdateInterval)
+	}
+
 	return c.JSON(fiber.Map{
 		"status":         "ok",
-		"total_nodes":    len(freshSnapshot.Nodes),
-		"total_rulesets": len(freshSnapshot.RuleSets),
-		"rulesets":       freshSnapshot.RuleSets,
+		"total_nodes":    len(committed.Nodes),
+		"total_rulesets": len(committed.RuleSets),
+		"rulesets":       committed.RuleSets,
 	})
 }
 
-// handleAddSource универсально добавляет подписку или одиночную ноду с релоадом ядра
+// handleAddSource универсально добавляет подписку или ноду с валидацией кандидата до коммита
 func (s *Server) handleAddSource(c *fiber.Ctx) error {
 	var req struct {
 		Type      string `json:"type"`
@@ -337,10 +350,11 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "url cannot be empty"})
 	}
 
-	cfg := s.state.Get()
+	candidate := s.state.Clone()
 	uci := config.NewUCIStorage()
 
-	var freshSnapshot config.CheburConfig
+	var subToAdd *config.SubscriptionConfig
+	var manualNodeToAdd string
 
 	switch req.Type {
 	case "subscription":
@@ -362,50 +376,58 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no valid nodes found in subscription"})
 		}
 
-		_ = uci.AddSubscription(subCfg)
-		freshSnapshot = s.state.Update(func(c *config.CheburConfig) {
-			c.Subscriptions = append(c.Subscriptions, subCfg)
-			existingTags := make(map[string]bool)
-			for _, n := range c.Nodes {
+		candidate.Subscriptions = append(candidate.Subscriptions, subCfg)
+		existingTags := make(map[string]bool)
+		for _, n := range candidate.Nodes {
+			existingTags[n.Tag] = true
+		}
+		for _, n := range newNodes {
+			if !existingTags[n.Tag] {
+				candidate.Nodes = append(candidate.Nodes, n)
 				existingTags[n.Tag] = true
 			}
-			for _, n := range newNodes {
-				if !existingTags[n.Tag] {
-					c.Nodes = append(c.Nodes, n)
-					existingTags[n.Tag] = true
-				}
-			}
-		})
+		}
+		subToAdd = &subCfg
 
 	case "node":
-		node, err := uri.ParseNodeURI(req.URL, cfg.AutoHWID, cfg.CustomHWID)
+		node, err := uri.ParseNodeURI(req.URL, candidate.AutoHWID, candidate.CustomHWID)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid node uri: " + err.Error()})
 		}
 
-		_ = uci.AddManualNode(req.URL)
-		freshSnapshot = s.state.Update(func(c *config.CheburConfig) {
-			c.Nodes = append(c.Nodes, node)
-		})
+		candidate.Nodes = append(candidate.Nodes, node)
+		candidate.ManualNodes = append(candidate.ManualNodes, req.URL)
+		manualNodeToAdd = req.URL
 
 	default:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "type must be 'subscription' or 'node'"})
 	}
 
+	// Валидируем и перезагружаем ядро над кандидатом
 	eng := s.getEngine()
-	if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
+	if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "failed to safely reload engine with new source: " + err.Error(),
 		})
 	}
 
+	// Сохраняем в UCI и фиксируем стейт только после успешного применения ядром
+	if subToAdd != nil {
+		_ = uci.AddSubscription(*subToAdd)
+	}
+	if manualNodeToAdd != "" {
+		_ = uci.AddManualNode(manualNodeToAdd)
+	}
+
+	committed := s.state.Commit(candidate)
+
 	return c.JSON(fiber.Map{
 		"status":      "ok",
-		"total_nodes": len(freshSnapshot.Nodes),
+		"total_nodes": len(committed.Nodes),
 	})
 }
 
-// handleReloadConfig считывает актуальный UCI-файл и обновляет ноды с таймаутом выполнения
+// handleReloadConfig считывает конфигурацию с диска и применяет через кандидата
 func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 	defer cancel()
@@ -422,15 +444,19 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		})
 	}
 
+	// Создаем кандидата на основе загруженных параметров
+	candidate := s.state.Clone()
+	*candidate = *newCfg
+
 	var allNodes []*config.GenericNode
 
-	for _, raw := range newCfg.ManualNodes {
-		if node, err := uri.ParseNodeURI(raw, newCfg.AutoHWID, newCfg.CustomHWID); err == nil {
+	for _, raw := range candidate.ManualNodes {
+		if node, err := uri.ParseNodeURI(raw, candidate.AutoHWID, candidate.CustomHWID); err == nil {
 			allNodes = append(allNodes, node)
 		}
 	}
 
-	for _, sub := range newCfg.Subscriptions {
+	for _, sub := range candidate.Subscriptions {
 		if sub.URL == "" || !sub.Enabled {
 			continue
 		}
@@ -440,21 +466,12 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		}
 	}
 
-	newCfg.Nodes = allNodes
-
-	freshSnapshot := s.state.Update(func(cfg *config.CheburConfig) {
-		*cfg = *newCfg
-	})
-
-	if s.rulesCron != nil {
-		s.rulesCron.UpdateRulesets(freshSnapshot.RuleSets)
-		s.rulesCron.SetInterval(freshSnapshot.RulesetUpdateInterval)
-	}
+	candidate.Nodes = allNodes
 
 	eng := s.getEngine()
 
-	if len(freshSnapshot.Nodes) > 0 {
-		if err := engine.SafeReload(c.Context(), eng, &freshSnapshot, TargetConfigPath); err != nil {
+	if len(candidate.Nodes) > 0 {
+		if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to safely reload engine: " + err.Error(),
 			})
@@ -463,10 +480,18 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		_ = eng.Stop()
 	}
 
+	// Фиксируем новое состояние после прохождения SafeReload
+	committed := s.state.Commit(candidate)
+
+	if s.rulesCron != nil {
+		s.rulesCron.UpdateRulesets(committed.RuleSets)
+		s.rulesCron.SetInterval(committed.RulesetUpdateInterval)
+	}
+
 	return c.JSON(fiber.Map{
 		"status":  "ok",
 		"message": "Configuration reloaded successfully",
-		"nodes":   len(freshSnapshot.Nodes),
+		"nodes":   len(committed.Nodes),
 	})
 }
 

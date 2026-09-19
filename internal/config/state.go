@@ -31,9 +31,29 @@ func (s *StateManager) Get() CheburConfig {
 	return *cloneConfig(s.config)
 }
 
+// Clone возвращает указатель на глубокую изолированную копию конфигурации для подготовки кандидата
+func (s *StateManager) Clone() *CheburConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneConfig(s.config)
+}
+
 // Snapshot является алиасом Get для явного отражения семантики снапшота
 func (s *StateManager) Snapshot() CheburConfig {
 	return s.Get()
+}
+
+// Commit атомарно фиксирует новую проверенную конфигурацию ТОЛЬКО после успешного SafeReload ядра
+func (s *StateManager) Commit(validated *CheburConfig) CheburConfig {
+	if validated == nil {
+		return s.Get()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.config = cloneConfig(validated)
+	return *cloneConfig(s.config)
 }
 
 // Update выполняет атомарную мутацию состояния через замыкание под эксклюзивным Lock

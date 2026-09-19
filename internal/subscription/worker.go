@@ -25,6 +25,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const maxSubscriptionSize = 8 << 20 // 8 MiB лимит для embedded-устройств OpenWrt
+
 type Worker struct {
 	autoHWID   bool
 	customHWID string
@@ -267,9 +269,14 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
 		}
 
-		rawBody, err := io.ReadAll(resp.Body)
+		// Читаем не более maxSubscriptionSize + 1 байт для детектирования переполнения RAM
+		rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionSize+1))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+
+		if len(rawBody) > maxSubscriptionSize {
+			return nil, fmt.Errorf("subscription response exceeded maximum size limit of %d bytes", maxSubscriptionSize)
 		}
 
 		strBody := strings.TrimSpace(string(rawBody))

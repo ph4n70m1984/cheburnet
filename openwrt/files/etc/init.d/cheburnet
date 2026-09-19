@@ -6,12 +6,13 @@ STOP=10
 
 PROG=/usr/bin/cheburnetd
 CONF=/etc/config/cheburnet
+PIDFILE=/var/run/cheburnetd.pid
 
 cleanup_children() {
     # Корректно глушим запущенные ядра, чтобы освободить порты
-    killall -15 sing-box xray 2>/dev/null
+    killall -15 sing-box 2>/dev/null
     sleep 1
-    killall -9 sing-box xray 2>/dev/null
+    killall -9 sing-box 2>/dev/null
 }
 
 start_service() {
@@ -47,16 +48,18 @@ stop_service() {
 }
 
 service_triggers() {
-    # Перезапуск сервиса при изменении конфигурации uci
+    # Мягкая перезагрузка демона при изменении конфигурации uci
     procd_add_reload_trigger "cheburnet"
     # Отслеживание поднятия локальной сети
     procd_add_interface_trigger "interface.*.up" "lan" /etc/init.d/cheburnet restart
 }
 
 reload_service() {
-    # Сначала пытаемся мягко обновить конфигурацию через REST API демона
-    if ! ubus call network.interface dump >/dev/null 2>&1 || ! wget -q -O- --post-data="" http://127.0.0.1:8088/api/v1/reload >/dev/null 2>&1; then
-        # Если демон не ответил по API — делаем полный рестарт
-        restart
+    # Мягкая перезагрузка через локальный IPC вызов CLI без зависимости от HTTP API и токенов
+    if [ -f "$PIDFILE" ] && "$PROG" reload >/dev/null 2>&1; then
+        return 0
     fi
+
+    # Если процесс не запущен или вызов не прошел — делаем полный рестарт
+    restart
 }

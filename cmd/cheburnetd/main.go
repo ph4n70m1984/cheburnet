@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -130,13 +131,11 @@ func setupBootstrapResolver(cfg *config.CheburConfig) {
 		if strings.TrimSpace(cfg.BootstrapDNS) != "" {
 			candidates = append(candidates, strings.TrimSpace(cfg.BootstrapDNS))
 		}
-		// Если основной dns_server является простым IP, используем его как второй fallback
 		if strings.TrimSpace(cfg.DNSServer) != "" && !strings.HasPrefix(cfg.DNSServer, "http") {
 			candidates = append(candidates, strings.TrimSpace(cfg.DNSServer))
 		}
 	}
 
-	// Fallback по умолчанию только если в UCI ничего не задано
 	if len(candidates) == 0 {
 		candidates = []string{"77.88.8.8", "1.1.1.1"}
 	}
@@ -186,7 +185,21 @@ func main() {
 		_ = service.RestartAsync()
 
 	case "reload":
-		callAPI(http.MethodPost, "/api/v1/reload", nil)
+		data, err := os.ReadFile(PIDFile)
+		if err != nil {
+			fmt.Printf("Chebur.NET is not running (cannot read %s): %v\n", PIDFile, err)
+			os.Exit(1)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid <= 1 {
+			fmt.Printf("Invalid PID found in %s\n", PIDFile)
+			os.Exit(1)
+		}
+		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+			fmt.Printf("Failed to send SIGHUP to pid %d: %v\n", pid, err)
+			os.Exit(1)
+		}
+		fmt.Println("Reload signal sent successfully.")
 
 	case "list_update":
 		callAPI(http.MethodPost, "/api/v1/subscriptions/update", nil)
@@ -409,7 +422,6 @@ func getRealActiveNode(defaultTag string) string {
 }
 
 // acquirePIDLock захватывает неблокирующую эксклюзивную блокировку файла PID (LOCK_EX | LOCK_NB).
-// Предотвращает запуск второго экземпляра демона и повреждение сетевых правил.
 func acquirePIDLock(pidPath string) (*os.File, error) {
 	file, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -478,7 +490,6 @@ func runDaemon() {
 		log.Fatalf("[FATAL] Load config failed: %v", err)
 	}
 
-	// Инициализируем резолвер демона строго из загруженного конфига UCI
 	setupBootstrapResolver(initialConfig)
 
 	initialConfig.Engine = "sing-box"
@@ -692,9 +703,24 @@ func runDaemon() {
 
 	go app.supervisorLoop(daemonCtx)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	for sig := range sigChan {
+		if sig == syscall.SIGHUP {
+			log.Println("[INFO] Received SIGHUP: executing soft reload...")
+			go func() {
+				if err := app.reloadActiveEngine(daemonCtx); err != nil {
+					log.Printf("[ERROR] SIGHUP soft reload failed: %v", err)
+				} else {
+					log.Println("[INFO] SIGHUP soft reload completed successfully.")
+				}
+			}()
+			continue
+		}
+
+		break
+	}
 
 	log.Println("[INFO] Shutting down Chebur.NET...")
 	_ = srv.Shutdown()
@@ -735,7 +761,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	// Обновляем резолвер при релоаде конфига
 	setupBootstrapResolver(&cfg)
 
 	if a.updManager != nil && cfg.UpdateChannel != "" {
