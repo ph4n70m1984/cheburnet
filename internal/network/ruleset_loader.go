@@ -5,23 +5,27 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	RulesStorageDir = "tmp/cheburnet/rulesets"
-	TempDownloadDir = "/tmp"
-	DownloadTimeout = 30 * time.Second
+	RulesStorageDir       = "/tmp/cheburnet/rulesets"
+	TempDownloadDir       = "/tmp"
+	DownloadTimeout       = 30 * time.Second
+	MaxRawRulesetDownload = 15 << 20 // 15 MiB лимит для сырого списка правил
 )
 
 type CompressedRulesetLoader struct {
 	storageDir string
 	client     *http.Client
+	downloadMu sync.Map // Map[string]*sync.Mutex для исключения TOCTOU гонок на скачивание
 }
 
 func NewCompressedRulesetLoader() *CompressedRulesetLoader {
@@ -34,6 +38,11 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	}
 }
 
+func (l *CompressedRulesetLoader) getFileMutex(key string) *sync.Mutex {
+	m, _ := l.downloadMu.LoadOrStore(key, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // GetSubnets читает локальный .gz кэш или скачивает его при первом запуске
 func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, error) {
 	normName := l.normalizeName(rulesetName)
@@ -43,9 +52,14 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 
 	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.txt.gz", normName))
 
-	// Если файла нет или он пустой (артефакт старого бага) — скачиваем
+	mu := l.getFileMutex(normName)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Если файла нет или он пустой — скачиваем
 	if stat, err := os.Stat(targetGz); os.IsNotExist(err) || (err == nil && stat.Size() <= 30) {
 		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
+			log.Printf("[ruleset] ERROR: Failed to download subnets for '%s': %v", normName, err)
 			return nil, nil
 		}
 	}
@@ -59,6 +73,11 @@ func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
 	if normName == "" {
 		return nil
 	}
+
+	mu := l.getFileMutex(normName)
+	mu.Lock()
+	defer mu.Unlock()
+
 	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.txt.gz", normName))
 	return l.downloadAndCompressAtomic(normName, targetGz)
 }
@@ -75,9 +94,8 @@ func (l *CompressedRulesetLoader) normalizeName(name string) string {
 	}
 }
 
-// downloadAndCompressAtomic пробует скачать .txt файл из репозитория
+// downloadAndCompressAtomic скачивает поток и сжимает его на лету с сохранением реальной ошибки
 func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
-	// В репозитории itdoginfo/allow-domains/Subnets/IPv4 файлы лежат в формате: telegram.txt, discord.txt
 	candidates := []string{
 		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.txt", rulesetName),
 		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.lst", rulesetName),
@@ -85,11 +103,12 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	}
 
 	var resp *http.Response
-	var err error
+	var lastErr error
 
-	for _, url := range candidates {
-		req, reqErr := http.NewRequest("GET", url, nil)
+	for _, u := range candidates {
+		req, reqErr := http.NewRequest("GET", u, nil)
 		if reqErr != nil {
+			lastErr = reqErr
 			continue
 		}
 		req.Header.Set("User-Agent", "CheburNET-Daemon")
@@ -99,35 +118,43 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 			resp = r
 			break
 		}
-		if r != nil {
+		if doErr != nil {
+			lastErr = doErr
+		} else if r != nil {
+			lastErr = fmt.Errorf("HTTP %d from %s", r.StatusCode, u)
 			_ = r.Body.Close()
 		}
 	}
 
 	if resp == nil {
-		return fmt.Errorf("subnets for ruleset '%s' not found on github", rulesetName)
+		return fmt.Errorf("subnets for ruleset '%s' not found on remote (last error: %w)", rulesetName, lastErr)
 	}
 	defer resp.Body.Close()
 
-	tmpGz := filepath.Join(TempDownloadDir, fmt.Sprintf("%s.txt.gz.tmp", rulesetName))
+	// Уникальный staging-файл для исключения гонок при параллельных загрузках
+	tmpFile, err := os.CreateTemp(TempDownloadDir, fmt.Sprintf("%s-*.txt.gz.tmp", rulesetName))
+	if err != nil {
+		return fmt.Errorf("create tmp file: %w", err)
+	}
+	tmpGz := tmpFile.Name()
 	defer os.Remove(tmpGz)
 
-	outFile, err := os.OpenFile(tmpGz, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	gzWriter, err := gzip.NewWriterLevel(tmpFile, gzip.BestSpeed)
 	if err != nil {
-		return fmt.Errorf("create tmp: %w", err)
-	}
-
-	gzWriter, err := gzip.NewWriterLevel(outFile, gzip.BestCompression)
-	if err != nil {
-		outFile.Close()
+		_ = tmpFile.Close()
 		return err
 	}
 
-	_, err = io.Copy(gzWriter, resp.Body)
+	limitedBody := io.LimitReader(resp.Body, MaxRawRulesetDownload+1)
+	written, err := io.Copy(gzWriter, limitedBody)
 	_ = gzWriter.Close()
-	_ = outFile.Close()
+	_ = tmpFile.Close()
+
 	if err != nil {
 		return fmt.Errorf("gzip stream copy failed: %w", err)
+	}
+	if written > MaxRawRulesetDownload {
+		return fmt.Errorf("ruleset '%s' exceeded max download limit of %d bytes", rulesetName, MaxRawRulesetDownload)
 	}
 
 	if err := l.validateGzFile(tmpGz); err != nil {
@@ -138,70 +165,114 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 }
 
 func (l *CompressedRulesetLoader) validateGzFile(filePath string) error {
-	subnets, err := l.readCIDRsFromGz(filePath)
-	if err != nil {
+	count := 0
+	err := l.StreamCIDRsFromGz(filePath, func(cidr string) error {
+		count++
+		if count >= 1 {
+			return io.EOF
+		}
+		return nil
+	})
+	if err != nil && err != io.EOF {
 		return err
 	}
-	if len(subnets) == 0 {
+	if count == 0 {
 		return fmt.Errorf("archive contains 0 valid subnets")
 	}
 	return nil
 }
 
-func (l *CompressedRulesetLoader) readCIDRsFromGz(filePath string) ([]string, error) {
+// StreamCIDRsFromGz валидирует CIDR построчно, исключая попадание IPv6 и мусорных строк
+func (l *CompressedRulesetLoader) StreamCIDRsFromGz(filePath string, onSubnet func(cidr string) error) error {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
 	gzReader, err := gzip.NewReader(file)
 	if err != nil {
-		return nil, fmt.Errorf("gzip init: %w", err)
+		return fmt.Errorf("gzip init: %w", err)
 	}
 	defer gzReader.Close()
 
-	var subnets []string
 	scanner := bufio.NewScanner(gzReader)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 64*1024)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		if !strings.Contains(line, "/") {
-			if ip := net.ParseIP(line); ip != nil && ip.To4() != nil {
-				line += "/32"
+		// Строгая проверка валидности CIDR или отдельного IPv4
+		if _, ipNet, err := net.ParseCIDR(line); err == nil {
+			if ipNet.IP.To4() == nil {
+				continue // Отклоняем IPv6
 			}
+			if err := onSubnet(ipNet.String()); err != nil {
+				return err
+			}
+			continue
 		}
 
-		subnets = append(subnets, line)
+		// Если передан чистый IPv4 без слэша
+		if ip := net.ParseIP(line); ip != nil && ip.To4() != nil {
+			if err := onSubnet(ip.To4().String() + "/32"); err != nil {
+				return err
+			}
+		}
 	}
+	return scanner.Err()
+}
 
-	return subnets, scanner.Err()
+func (l *CompressedRulesetLoader) readCIDRsFromGz(filePath string) ([]string, error) {
+	var subnets []string
+	err := l.StreamCIDRsFromGz(filePath, func(cidr string) error {
+		subnets = append(subnets, cidr)
+		return nil
+	})
+	return subnets, err
 }
 
 func (l *CompressedRulesetLoader) safeCopyToFlash(src, dst string) error {
-	dstTmp := dst + ".new"
+	dstDir := filepath.Dir(dst)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return err
+	}
+
+	// Уникальный staging-файл в том же каталоге для атомарного Rename
+	tmpFile, err := os.CreateTemp(dstDir, filepath.Base(dst)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	dstTmp := tmpFile.Name()
+	defer os.Remove(dstTmp)
 
 	s, err := os.Open(src)
 	if err != nil {
+		_ = tmpFile.Close()
 		return err
 	}
 	defer s.Close()
 
-	d, err := os.OpenFile(dstTmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
+	if _, err := io.Copy(tmpFile, s); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	_ = tmpFile.Sync()
+	_ = tmpFile.Close()
+
+	if err := os.Rename(dstTmp, dst); err != nil {
 		return err
 	}
 
-	if _, err := io.Copy(d, s); err != nil {
-		d.Close()
-		os.Remove(dstTmp)
-		return err
+	// Fsync директории для гарантии записи метаданных в файловую систему OpenWrt
+	if d, err := os.Open(dstDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
-	_ = d.Sync()
-	d.Close()
 
-	return os.Rename(dstTmp, dst)
+	return nil
 }

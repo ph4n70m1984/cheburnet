@@ -13,19 +13,28 @@ import (
 
 const (
 	TableName = "CheburTable"
-	TableMark = "0x00100000"
-	SelfMark  = "0x00200000"
+
+	// Строковые представления меток для шаблонизатора nftables
+	TableMark           = "0x00100000"
+	SelfMark            = "0x00200000"
+	EmergencyDirectMark = "0x00300000"
+
+	// Числовые целочисленные константы для системных вызовов syscall.SetsockoptInt
+	TableMarkInt           = 0x00100000
+	SelfMarkInt            = 0x00200000
+	EmergencyDirectMarkInt = 0x00300000
 )
 
 var ifaceRegex = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,16}$`)
 
+// ApplyNFTRules выполняет атомарное применение правил nftables для перехвата сетевого трафика через TProxy
 func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobalMode bool) error {
 	// Валидация TProxy порта
 	if tproxyPort <= 0 || tproxyPort > 65535 {
 		return fmt.Errorf("invalid tproxy port: %d (must be between 1 and 65535)", tproxyPort)
 	}
 
-	// 1. Валидация интерфейсов (защита от инъекций в ifname)
+	// 1. Валидация сетевых интерфейсов (защита от DSL-инъекций в @interfaces)
 	var validIfaces []string
 	for _, iface := range ifaces {
 		clean := strings.TrimSpace(iface)
@@ -59,14 +68,14 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 			}
 			_, ipNet, err := net.ParseCIDR(clean)
 			if err != nil {
-				// Пробуем распарсить как одиночный IPv4 адрес
+				// Пробуем распарсить как единичный IPv4-адрес
 				ip := net.ParseIP(clean)
 				if ip == nil || ip.To4() == nil {
 					return fmt.Errorf("invalid bypass subnet/ip: %q", clean)
 				}
 				validSubnets = append(validSubnets, ip.To4().String()+"/32")
 			} else {
-				// P1: Защита от попадания IPv6 в set type ipv4_addr
+				// Защита от сбоя nftables при попытке положить IPv6 в set type ipv4_addr
 				if ipNet.IP.To4() == nil {
 					return fmt.Errorf("IPv6 subnets are not supported in IPv4 bypass set: %q", clean)
 				}
@@ -88,7 +97,7 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		}
 	}
 
-	// 3. Валидация full-proxy IP клиентов через строгий net.ParseIP (только IPv4)
+	// 3. Валидация IP-адресов клиентов Full-Proxy через строгий net.ParseIP (только IPv4)
 	clientSetElements := ""
 	clientMangleRule := ""
 	if len(fullProxyIPs) > 0 {
@@ -117,10 +126,8 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		}
 	}
 
-	// P0: Возвращаем транзакционную атомарную замену внутри одного batch:
-	// 1) table inet X       -> объявление таблицы (если её не было, delete не упадёт)
-	// 2) delete table inet X -> удаление старых правил
-	// 3) table inet X { ... } -> создание новой конфигурации
+	// Атомарный Netlink batch: объявление -> удаление старых правил -> применение новой таблицы.
+	// В случае синтаксической ошибки ядро Linux целиком откатывает транзакцию без fail-open утечек[cite: 8].
 	tpl := `table inet %s
 delete table inet %s
 table inet %s {
@@ -159,6 +166,7 @@ table inet %s {
 		type route hook output priority -150; policy accept;
 		ip daddr @localv4 return
 		meta mark %s counter return
+		meta mark %s counter return
 		%s
 		ip daddr 198.18.0.0/15 meta l4proto tcp meta mark set %s counter
 		ip daddr 198.18.0.0/15 meta l4proto udp meta mark set %s counter
@@ -178,13 +186,14 @@ table inet %s {
 		TableMark,
 		TableMark, TableMark, tproxyPort,
 		TableMark, TableMark, tproxyPort,
-		SelfMark,
+		SelfMark,            // Пропуск собственного служебного трафика ядра sing-box[cite: 8]
+		EmergencyDirectMark, // Пропуск прямого аварийного трафика демона (fallback обновления подписок)
 		bypassOutputRule,
 		TableMark,
 		TableMark,
 	)
 
-	// Атомарное применение транзакции через stdin
+	// Атомарное применение правил через stdin с жестким таймаутом
 	applyCtx, cancelApply := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelApply()
 
@@ -200,6 +209,7 @@ table inet %s {
 	return nil
 }
 
+// FlushNFTRules удаляет таблицу CheburTable из ядра Netfilter
 func FlushNFTRules() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -210,6 +220,7 @@ func FlushNFTRules() error {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("flush nft rules timed out")
 		}
+		// Если таблица уже отсутствует, ошибкой не считается
 		if strings.Contains(string(out), "No such file or directory") {
 			return nil
 		}

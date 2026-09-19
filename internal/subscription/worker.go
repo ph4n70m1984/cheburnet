@@ -2,7 +2,9 @@ package subscription
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -27,7 +30,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const maxSubscriptionSize = 8 << 20 // 8 MiB лимит для embedded-устройств OpenWrt[cite: 7]
+// maxSubscriptionSize снижен до 4 MiB: защита от OOM на роутерах со 128 МБ RAM
+const maxSubscriptionSize = 4 << 20
+
+// EmergencyDirectMark — отдельная метка для аварийного запроса подписок напрямую
+const EmergencyDirectMark = 0x00300000
 
 type Worker struct {
 	autoHWID      bool
@@ -35,21 +42,20 @@ type Worker struct {
 	mu            sync.Mutex
 	cancelMap     map[string]context.CancelFunc
 	client        *http.Client
-	directClient  *http.Client // Аварийный прямой клиент с SO_MARK 0x00200000 для обхода TProxy
+	directClient  *http.Client
 	isEngineAlive func() bool
 }
 
 func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveChecker func() bool) *Worker {
-	// 1. Основной смарт-транспорт (ходит в http://127.0.0.1:mixedPort, когда sing-box активен)[cite: 7]
 	transport := network.NewSmartTransport(8*time.Second, mixedPort, engineAliveChecker)
 
-	// 2. Прямой диалер с меткой 0x00200000: при сбое VPN выпускает служебный запрос напрямую через WAN в обход правил nftables
+	// Используем каноничную метку network.EmergencyDirectMarkInt
 	directTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout: 8 * time.Second,
 			Control: func(networkProto, address string, c syscall.RawConn) error {
 				return c.Control(func(fd uintptr) {
-					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, network.SingBoxSelfMark)
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, network.EmergencyDirectMarkInt)
 				})
 			},
 		}).DialContext,
@@ -71,6 +77,13 @@ func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveCheck
 			Transport: directTransport,
 		},
 	}
+}
+
+func safeHost(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return "unknown-host"
 }
 
 func parseDurationSafe(intervalStr string) time.Duration {
@@ -111,9 +124,16 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 		s := sub
 		interval := parseDurationSafe(s.UpdateInterval)
 		subCtx, subCancel := context.WithCancel(ctx)
-		w.cancelMap[s.URL] = subCancel
+		// Ключ включает имя и URL для исключения конфликтов коллизий
+		w.cancelMap[s.Name+"|"+s.URL] = subCancel
 
 		go func(targetSub config.SubscriptionConfig, d time.Duration) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[subscription] PANIC recovered in auto-update loop for %s: %v", targetSub.Name, r)
+				}
+			}()
+
 			ticker := time.NewTicker(d)
 			defer ticker.Stop()
 
@@ -122,7 +142,7 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 				case <-subCtx.Done():
 					return
 				case <-ticker.C:
-					log.Printf("[INFO] Auto-updating subscription: %s (%s, interval: %v)", targetSub.Name, targetSub.URL, d)
+					log.Printf("[subscription] Triggered auto-update for: %s (host: %s, interval: %v)", targetSub.Name, safeHost(targetSub.URL), d)
 					onUpdate(targetSub)
 				}
 			}
@@ -146,7 +166,10 @@ func (w *Worker) getOrGenerateHWID() string {
 			}
 		}
 	}
-	return "00112233445566778899aabbccddeeff"
+	// Генерация уникального псевдослучайного HWID вместо хардкода
+	randBytes := make([]byte, 16)
+	_, _ = rand.Read(randBytes)
+	return hex.EncodeToString(randBytes)
 }
 
 type ClashConfig struct {
@@ -227,7 +250,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return w.parseContent(decrypted, sub, targetHWID)
 	}
 
-	// 2. Первая попытка через основной клиент (SmartTransport: VPN или Direct при выключенном ядре)
+	// 2. Первая попытка через основной клиент (SmartTransport)
 	body, err := w.fetchPayload(ctx, sub, targetHWID, w.client)
 	if err == nil {
 		nodes, parseErr := w.parseContent(body, sub, targetHWID)
@@ -239,20 +262,20 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		}
 	}
 
-	// 3. Безусловный фоллбэк: если запрос через SmartTransport не удался
-	// (прокси упал прямо во время запроса, таймаут, Cloudflare 403/503 через IP датацентра VPN)
-	log.Printf("[subscription] WARN: Primary fetch failed for %s (%v). Retrying via Direct Bypass...", reqURL, err)
+	// 3. Безусловный фоллбэк на прямой аварийный клиент
+	host := safeHost(reqURL)
+	log.Printf("[subscription] WARN: Primary fetch failed for host %s (%v). Retrying via Direct Bypass...", host, err)
 	directBody, directErr := w.fetchPayload(ctx, sub, targetHWID, w.directClient)
 	if directErr == nil {
 		nodes, parseErr := w.parseContent(directBody, sub, targetHWID)
 		if parseErr == nil && len(nodes) > 0 {
-			log.Printf("[subscription] INFO: Direct Bypass fetch SUCCESS for %s (recovered %d nodes)", reqURL, len(nodes))
+			log.Printf("[subscription] INFO: Direct Bypass fetch SUCCESS for host %s (recovered %d nodes)", host, len(nodes))
 			return nodes, nil
 		}
 		directErr = parseErr
 	}
 
-	log.Printf("[subscription] ERROR: Direct Bypass fetch also failed for %s: %v", reqURL, directErr)
+	log.Printf("[subscription] ERROR: Direct Bypass fetch also failed for host %s: %v", host, directErr)
 	return nil, fmt.Errorf("primary error: %v; direct bypass error: %w", err, directErr)
 }
 
@@ -331,8 +354,9 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 		if tag == "" {
 			tag = "node"
 		}
-		if subName != "" && !strings.HasPrefix(tag, subName+" ") {
-			tag = fmt.Sprintf("[%s] %s", subName, tag)
+		prefix := fmt.Sprintf("[%s] ", subName)
+		if subName != "" && !strings.HasPrefix(tag, prefix) {
+			tag = prefix + tag
 		}
 		base := tag
 		counter := 1
@@ -344,11 +368,11 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON[cite: 7]
+	// 1. Попытка распарсить как Xray JSON[cite: 11]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.CompiledRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML[cite: 7]
+		// 2. Попытка распарсить как Clash YAML[cite: 11]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -385,22 +409,34 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Base64 декодирование[cite: 7]
-			content := string(body)
-			trimmed := strings.TrimSpace(content)
+			// 3. Потоковое Base64 декодирование и Plaintext URI парсинг без раздувания кучи
+			trimmed := bytes.TrimSpace(body)
+			var streamReader io.Reader = bytes.NewReader(trimmed)
 
-			if !strings.Contains(trimmed, "://") {
-				if dec, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
-					content = string(dec)
-				} else if decURL, err := base64.RawURLEncoding.DecodeString(trimmed); err == nil {
-					content = string(decURL)
-				} else if decRaw, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil {
-					content = string(decRaw)
+			if !bytes.Contains(trimmed, []byte("://")) {
+				encodings := []*base64.Encoding{
+					base64.StdEncoding,
+					base64.RawStdEncoding,
+					base64.URLEncoding,
+					base64.RawURLEncoding,
+				}
+
+				for _, enc := range encodings {
+					decodedStream := base64.NewDecoder(enc, bytes.NewReader(trimmed))
+					checkBuf := make([]byte, 4096)
+					n, err := decodedStream.Read(checkBuf)
+					if err == nil && n > 0 && bytes.Contains(checkBuf[:n], []byte("://")) {
+						streamReader = io.MultiReader(bytes.NewReader(checkBuf[:n]), decodedStream)
+						break
+					}
 				}
 			}
 
-			// 4. Построчный парсинг Plaintext URI[cite: 7]
-			scanner := bufio.NewScanner(strings.NewReader(content))
+			// 4. Построчный потоковый парсинг URI
+			scanner := bufio.NewScanner(streamReader)
+			scanBuf := make([]byte, 32*1024)
+			scanner.Buffer(scanBuf, 64*1024)
+
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
 				if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "не поддерживается") {
@@ -450,8 +486,9 @@ func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, fi
 		if tag == "" {
 			tag = "node"
 		}
-		if subName != "" && !strings.HasPrefix(tag, subName+" ") {
-			tag = fmt.Sprintf("[%s] %s", subName, tag)
+		prefix := fmt.Sprintf("[%s] ", subName)
+		if subName != "" && !strings.HasPrefix(tag, prefix) {
+			tag = prefix + tag
 		}
 		base := tag
 		counter := 1
@@ -566,6 +603,7 @@ func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, fi
 
 			if proto == "hysteria" || proto == "hysteria2" {
 				node.Protocol = "hysteria2"
+				node.Security = "tls"
 				if addr, ok := ob.Settings["address"].(string); ok {
 					node.Address = addr
 				}
@@ -586,6 +624,23 @@ func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, fi
 						}
 						if fp, ok := tls["fingerprint"].(string); ok {
 							node.Fingerprint = fp
+						}
+					}
+				}
+			}
+
+			if proto == "trojan" {
+				node.Security = "tls"
+				if servers, ok := ob.Settings["servers"].([]interface{}); ok && len(servers) > 0 {
+					if srv, ok := servers[0].(map[string]interface{}); ok {
+						if addr, ok := srv["address"].(string); ok {
+							node.Address = addr
+						}
+						if port, ok := srv["port"].(float64); ok {
+							node.Port = int(port)
+						}
+						if pwd, ok := srv["password"].(string); ok {
+							node.Password = pwd
 						}
 					}
 				}

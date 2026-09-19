@@ -11,8 +11,7 @@ import (
 	"time"
 )
 
-// SingBoxSelfMark — системная метка обхода TProxy (0x00200000 = 2097152)[cite: 6]
-const SingBoxSelfMark = 0x00200000
+const SingBoxSelfMark = SelfMarkInt
 
 func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive func() bool) *http.Transport {
 	if mixedPort <= 0 {
