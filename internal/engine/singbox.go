@@ -81,7 +81,7 @@ func (s *SingBoxEngine) BuildConfig(cfg *config.CheburConfig, targetPath string)
 }
 
 func (s *SingBoxEngine) ValidateConfig(ctx context.Context, configPath string) error {
-	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	checkCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(checkCtx, "sing-box", "check", "-c", configPath)

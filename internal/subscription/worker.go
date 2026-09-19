@@ -87,7 +87,18 @@ func safeHost(rawURL string) string {
 }
 
 func parseDurationSafe(intervalStr string) time.Duration {
-	switch strings.ToLower(strings.TrimSpace(intervalStr)) {
+	clean := strings.ToLower(strings.TrimSpace(intervalStr))
+	switch clean {
+	case "1m":
+		return 1 * time.Minute
+	case "2m":
+		return 2 * time.Minute
+	case "5m":
+		return 5 * time.Minute
+	case "10m":
+		return 10 * time.Minute
+	case "30m":
+		return 30 * time.Minute
 	case "1h", "1":
 		return 1 * time.Hour
 	case "3h", "3":
@@ -99,8 +110,8 @@ func parseDurationSafe(intervalStr string) time.Duration {
 	case "24h", "24":
 		return 24 * time.Hour
 	default:
-		d, err := time.ParseDuration(intervalStr)
-		if err == nil && d >= time.Hour {
+		d, err := time.ParseDuration(clean)
+		if err == nil && d >= 1*time.Minute {
 			return d
 		}
 		return 24 * time.Hour
@@ -117,7 +128,7 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 	w.cancelMap = make(map[string]context.CancelFunc)
 
 	for _, sub := range subs {
-		if !sub.Enabled || sub.URL == "" {
+		if !sub.Enabled || strings.TrimSpace(sub.URL) == "" {
 			continue
 		}
 
@@ -126,6 +137,9 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 		subCtx, subCancel := context.WithCancel(ctx)
 		// Ключ включает имя и URL для исключения конфликтов коллизий
 		w.cancelMap[s.Name+"|"+s.URL] = subCancel
+
+		log.Printf("[subscription] Registered auto-update loop for %s (interval: %v, host: %s)",
+			s.Name, interval, safeHost(s.URL))
 
 		go func(targetSub config.SubscriptionConfig, d time.Duration) {
 			defer func() {
@@ -142,7 +156,8 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 				case <-subCtx.Done():
 					return
 				case <-ticker.C:
-					log.Printf("[subscription] Triggered auto-update for: %s (host: %s, interval: %v)", targetSub.Name, safeHost(targetSub.URL), d)
+					log.Printf("[subscription] Triggered auto-update for: %s (host: %s, interval: %v)",
+						targetSub.Name, safeHost(targetSub.URL), d)
 					onUpdate(targetSub)
 				}
 			}
@@ -368,11 +383,11 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON[cite: 11]
+	// 1. Попытка распарсить как Xray JSON[cite: 7]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.CompiledRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML[cite: 11]
+		// 2. Попытка распарсить как Clash YAML[cite: 7]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {

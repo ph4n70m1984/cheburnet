@@ -528,7 +528,7 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 	}
 
 	// Контекст привязан к caller ctx (мгновенно отменяется при graceful shutdown)
-	reloadCtx, cancelReload := context.WithTimeout(ctx, 8*time.Second)
+	reloadCtx, cancelReload := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelReload()
 
 	// 4. SafeReload ядра sing-box над кандидатом

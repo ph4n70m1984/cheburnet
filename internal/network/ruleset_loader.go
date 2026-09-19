@@ -38,6 +38,17 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	}
 }
 
+// HasCIDRSubnets проверяет, содержит ли удаленный репозиторий списки IPv4-подсетей для этого сервиса.
+// Чисто доменные сервисы (google_ai, youtube, russia_inside и др.) маршрутизируются через .srs правила.
+func HasCIDRSubnets(rulesetName string) bool {
+	switch strings.ToLower(strings.TrimSpace(rulesetName)) {
+	case "telegram", "discord", "meta", "twitter":
+		return true
+	default:
+		return false
+	}
+}
+
 func (l *CompressedRulesetLoader) getFileMutex(key string) *sync.Mutex {
 	m, _ := l.downloadMu.LoadOrStore(key, &sync.Mutex{})
 	return m.(*sync.Mutex)
@@ -50,6 +61,11 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 		return nil, nil
 	}
 
+	// Для чисто доменных правил не выполняем HTTP-запросы за подсетями
+	if !HasCIDRSubnets(normName) {
+		return nil, nil
+	}
+
 	targetGz := filepath.Join(l.storageDir, fmt.Sprintf("%s.txt.gz", normName))
 
 	mu := l.getFileMutex(normName)
@@ -59,7 +75,7 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 	// Если файла нет или он пустой — скачиваем
 	if stat, err := os.Stat(targetGz); os.IsNotExist(err) || (err == nil && stat.Size() <= 30) {
 		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
-			log.Printf("[ruleset] ERROR: Failed to download subnets for '%s': %v", normName, err)
+			log.Printf("[ruleset] WARN: Failed to download subnets for '%s': %v", normName, err)
 			return nil, nil
 		}
 	}
@@ -70,7 +86,7 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 // UpdateRuleset принудительно обновляет и упаковывает .txt.gz
 func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
 	normName := l.normalizeName(rulesetName)
-	if normName == "" {
+	if normName == "" || !HasCIDRSubnets(normName) {
 		return nil
 	}
 
