@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cheburnet/internal/network"
 )
 
 const (
@@ -69,20 +71,25 @@ type Manager struct {
 	targetArch    string
 }
 
-func NewManager(repo, currentVer, channel string) *Manager {
+func NewManager(repo, currentVer, channel string, mixedPort int, engineAliveChecker func() bool) *Manager {
 	if channel == "" {
 		channel = "release"
 	}
 	pkgMgr := detectPackageManager()
 	arch := detectTargetArch(pkgMgr)
 
+	transport := network.NewSmartTransport(30*time.Second, mixedPort, engineAliveChecker)
+
 	return &Manager{
 		githubRepo:    repo,
 		currentVer:    currentVer,
 		updateChannel: strings.ToLower(channel),
-		httpClient:    &http.Client{Timeout: 120 * time.Second},
-		pkgManager:    pkgMgr,
-		targetArch:    arch,
+		httpClient: &http.Client{
+			Timeout:   120 * time.Second,
+			Transport: transport,
+		},
+		pkgManager: pkgMgr,
+		targetArch: arch,
 	}
 }
 
@@ -101,7 +108,6 @@ func (m *Manager) GetUpdateChannel() string {
 	return m.updateChannel
 }
 
-// checkFreeSpaceBytes определяет доступный объём памяти (в байтах) через команду df с таймаутом
 func checkFreeSpaceBytes(path string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -132,7 +138,6 @@ func checkFreeSpaceBytes(path string) (uint64, error) {
 	return availKb * 1024, nil
 }
 
-// ensureSpace проверяет наличие необходимого свободного места на диске
 func ensureSpace(path string, requiredBytes uint64, description string) error {
 	free, err := checkFreeSpaceBytes(path)
 	if err != nil {
@@ -212,7 +217,6 @@ func detectTargetArch(pkgMgr string) string {
 	}
 }
 
-// semVerParts хранит числовые компоненты и пре-релизный ранг (0 = релиз, -1 = pre/beta)
 type semVerParts struct {
 	major      int
 	minor      int
@@ -232,7 +236,6 @@ func parseSemVerExtended(v string) semVerParts {
 		v = v[:idx]
 		res.isPre = true
 	} else if strings.Contains(strings.ToLower(v), "_p") {
-		// Обозначение патча в apk (1.2.3_p4)
 		v = strings.ReplaceAll(v, "_p", ".")
 	}
 
@@ -277,15 +280,14 @@ func isNewerVersion(remote, current string) bool {
 		return r.build > c.build
 	}
 
-	// Если основные числа равны: релиз (isPre=false) новее, чем бета (isPre=true)
 	if !r.isPre && c.isPre {
-		return true // 0.0.8.45 новее 0.0.8.45-beta.1
+		return true
 	}
 	if r.isPre && !c.isPre {
-		return false // 0.0.8.45-beta.1 старее стабильного 0.0.8.45
+		return false
 	}
 	if r.isPre && c.isPre {
-		return r.preRelease > c.preRelease // beta.2 новее beta.1
+		return r.preRelease > c.preRelease
 	}
 
 	return false
@@ -426,7 +428,6 @@ func (m *Manager) UpgradeCores(ctx context.Context, pkgs ...string) error {
 	return m.UpgradeSingBoxCore(ctx)
 }
 
-// fetchGitHubReleaseByChannel выполняет выборку и находит наивысшую доступную версию для заданного канала
 func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, pkgAsset releaseAsset, checksumsURL string, err error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", m.githubRepo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -457,7 +458,6 @@ func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, 
 
 	var targetRelease *githubReleaseItem
 
-	// Перебираем релизы и находим наибольшую версию среди подходящих по каналу
 	for i := range releases {
 		rel := &releases[i]
 		if rel.Draft {
@@ -467,14 +467,12 @@ func (m *Manager) fetchGitHubReleaseByChannel(ctx context.Context) (tag string, 
 		tagNameLower := strings.ToLower(rel.TagName)
 
 		if m.updateChannel == "release" {
-			// В стабильном канале исключаем pre-release и теги с бетой/rc
 			if rel.Prerelease || strings.Contains(tagNameLower, "beta") ||
 				strings.Contains(tagNameLower, "rc") || strings.Contains(tagNameLower, "dev") {
 				continue
 			}
 		}
 
-		// Выбираем релиз с наибольшей версией
 		if targetRelease == nil {
 			targetRelease = rel
 		} else if isNewerVersion(rel.TagName, targetRelease.TagName) {

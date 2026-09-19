@@ -122,40 +122,28 @@ func showHelp() {
 		"    get_system_info         Get device and OS specs (JSON)\n")
 }
 
-// setupBootstrapResolver конфигурирует net.DefaultResolver используя параметры bootstrap_dns
-// и dns_server из UCI, предотвращая сбои при блокировках жестко заданных IP.
+// setupBootstrapResolver конфигурирует net.DefaultResolver для Bootstrap DNS-запросов.
 func setupBootstrapResolver(cfg *config.CheburConfig) {
-	var candidates []string
+	endpoints := []string{"77.88.8.8:53", "8.8.8.8:53", "1.1.1.1:53"}
 
-	if cfg != nil {
-		if strings.TrimSpace(cfg.BootstrapDNS) != "" {
-			candidates = append(candidates, strings.TrimSpace(cfg.BootstrapDNS))
+	if cfg != nil && strings.TrimSpace(cfg.BootstrapDNS) != "" {
+		b := strings.TrimSpace(cfg.BootstrapDNS)
+		if !strings.Contains(b, ":") {
+			b += ":53"
 		}
-		if strings.TrimSpace(cfg.DNSServer) != "" && !strings.HasPrefix(cfg.DNSServer, "http") {
-			candidates = append(candidates, strings.TrimSpace(cfg.DNSServer))
-		}
+		endpoints = append([]string{b}, endpoints...)
 	}
 
-	if len(candidates) == 0 {
-		candidates = []string{"77.88.8.8", "1.1.1.1"}
-	}
-
-	var endpoints []string
-	for _, c := range candidates {
-		addr := c
-		if !strings.Contains(addr, ":") {
-			addr += ":53"
-		}
-		endpoints = append(endpoints, addr)
+	directDialer := &net.Dialer{
+		Timeout: 3 * time.Second,
 	}
 
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
 			var lastErr error
 			for _, ep := range endpoints {
-				conn, err := d.DialContext(ctx, "udp", ep)
+				conn, err := directDialer.DialContext(ctx, "udp", ep)
 				if err == nil {
 					return conn, nil
 				}
@@ -421,7 +409,6 @@ func getRealActiveNode(defaultTag string) string {
 	return defaultTag
 }
 
-// acquirePIDLock захватывает неблокирующую эксклюзивную блокировку файла PID (LOCK_EX | LOCK_NB).
 func acquirePIDLock(pidPath string) (*os.File, error) {
 	file, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -500,7 +487,18 @@ func runDaemon() {
 		initialConfig.UpdateChannel = "release"
 	}
 
-	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID)
+	state := config.NewStateManager(initialConfig)
+
+	// Быстрый локальный опрос состояния ядра для SmartTransport
+	engineAliveChecker := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		cfg := state.Get()
+		return engine.VerifyEngineAlive(ctx, &cfg) == nil
+	}
+
+	// Инициализируем subscription.Worker с передачей initialConfig.MixedPort
+	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID, initialConfig.MixedPort, engineAliveChecker)
 
 	switch initialConfig.SourceMode {
 	case "manual":
@@ -537,6 +535,11 @@ func runDaemon() {
 
 	log.Printf("[INFO] Total active nodes initialized: %d (source mode: %s)", len(initialConfig.Nodes), initialConfig.SourceMode)
 
+	// ВАЖНО: Фиксируем полученные ноды в StateManager перед запуском движка!
+	state.Update(func(c *config.CheburConfig) {
+		c.Nodes = initialConfig.Nodes
+	})
+
 	rulesLoader := network.NewCompressedRulesetLoader()
 	allRuleSets := collectAllRuleSets(initialConfig)
 
@@ -553,14 +556,13 @@ func runDaemon() {
 		log.Printf("[INFO] Total subnets loaded for direct routing: %d", len(allSubnets))
 	}
 
-	state := config.NewStateManager(initialConfig)
 	sbEngine := engine.NewSingBoxEngine()
 	hub := telemetry.NewHub()
 	healthTracker := engine.NewHealthTracker()
 	diagEngine := diagnostics.NewEngine(initialConfig.TProxyPort)
 	hub.SetDiagnosticsEngine(diagEngine)
 
-	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel)
+	updManager := updater.NewManager("ph4n70m1984/cheburnet", CheburVersion, initialConfig.UpdateChannel, initialConfig.MixedPort, engineAliveChecker)
 	rulesMgr := ruleset.NewManager(&diagReporterAdapter{diag: diagEngine}, initialConfig.MixedPort)
 
 	if len(initialConfig.CustomSRSRulesets) > 0 {
@@ -1045,13 +1047,26 @@ func (a *App) supervisorLoop(ctx context.Context) {
 
 func callAPI(method, endpoint string, body io.Reader) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest(method, "http://"+DefaultAPIBind+endpoint, body)
+	// Запросы шлем строго на петлю 127.0.0.1
+	req, err := http.NewRequest(method, "http://127.0.0.1:8088"+endpoint, body)
 	if err != nil {
 		fmt.Printf("Error creating request: %v\n", err)
 		return
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+
+	uciStorage := config.NewUCIStorage()
+	if cfg, err := uciStorage.Load(); err == nil && cfg != nil {
+		token := strings.TrimSpace(cfg.APIToken)
+		if token == "" {
+			token = strings.TrimSpace(cfg.ClashAPISecret)
+		}
+		if token != "" {
+			req.Header.Set("X-API-Token", token)
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 
 	resp, err := client.Do(req)

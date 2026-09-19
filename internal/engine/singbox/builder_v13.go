@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,7 +29,6 @@ func NewBuilderV13() *BuilderV13 {
 }
 
 func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
-	// Привязка контроллера ко всем интерфейсам (доступен локально демону и из LAN)
 	clashController := "0.0.0.0:9090"
 
 	bootstrapServer := cfg.BootstrapDNS
@@ -294,15 +294,18 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 	var allNodeTags []string
 	for _, node := range cfg.Nodes {
 		ob, err := b.buildNodeOutbound(node)
-		if err == nil {
-			outbounds = append(outbounds, ob)
-			allNodeTags = append(allNodeTags, node.Tag)
+		if err != nil {
+			log.Printf("[WARN] [builder] Skipped node '%s' (protocol: %s): %v", node.Tag, node.Protocol, err)
+			continue
 		}
+		outbounds = append(outbounds, ob)
+		allNodeTags = append(allNodeTags, node.Tag)
 	}
+
+	log.Printf("[INFO] [builder] Successfully compiled %d/%d nodes into sing-box outbounds", len(allNodeTags), len(cfg.Nodes))
 
 	activeOutboundTag := "direct-out"
 
-	// Параметры urltest по умолчанию из UCI (cheburnet.main)
 	globalURLTestInterval := strings.TrimSpace(cfg.URLTestInterval)
 	if globalURLTestInterval == "" {
 		globalURLTestInterval = "3m"
@@ -440,7 +443,7 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if activeOutboundTag != "direct-out" {
-		// Обязательный маршрут: весь FakeIP-пул перенаправляем в прокси
+		// Обязательный маршрут: весь FakeIP-пул перенаправляем в активный прокси-аутбаунд
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":   "route",
 			"inbound":  []string{"tproxy-in"},
@@ -675,53 +678,70 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 }
 
 func (b *BuilderV13) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
+
+	tag := strings.TrimSpace(node.Tag)
+	addr := strings.TrimSpace(node.Address)
+	if tag == "" || addr == "" || node.Port <= 0 {
+		return nil, fmt.Errorf("invalid node address or port: tag='%s', addr='%s', port=%d", tag, addr, node.Port)
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(node.Protocol))
+
 	out := map[string]interface{}{
-		"tag":         node.Tag,
-		"server":      node.Address,
+		"tag":         tag,
+		"server":      addr,
 		"server_port": node.Port,
 	}
 
-	switch node.Protocol {
-	case "vless":
+	switch proto {
+	case "vless", "vlite":
 		out["type"] = "vless"
-		out["uuid"] = node.UUID
+		out["uuid"] = strings.TrimSpace(node.UUID)
 		if node.Flow != "" {
-			out["flow"] = node.Flow
+			out["flow"] = strings.TrimSpace(node.Flow)
 		}
 
-		tlsMap := map[string]interface{}{
-			"enabled":     true,
-			"server_name": node.SNI,
-			"insecure":    node.Insecure,
-		}
-		if node.Fingerprint != "" {
-			tlsMap["utls"] = map[string]interface{}{
+		sec := strings.ToLower(strings.TrimSpace(node.Security))
+		// Включаем TLS, если указан reality, tls или задан SNI/PublicKey
+		if sec == "tls" || sec == "reality" || node.SNI != "" || node.PublicKey != "" {
+			tlsMap := map[string]interface{}{
 				"enabled":     true,
-				"fingerprint": node.Fingerprint,
+				"server_name": strings.TrimSpace(node.SNI),
+				"insecure":    node.Insecure,
 			}
-		}
-		if node.Security == "reality" {
-			realityMap := map[string]interface{}{
-				"enabled":    true,
-				"public_key": node.PublicKey,
-				"short_id":   node.ShortID,
+			if node.Fingerprint != "" {
+				tlsMap["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": strings.TrimSpace(node.Fingerprint),
+				}
 			}
-			tlsMap["reality"] = realityMap
+			if sec == "reality" || node.PublicKey != "" {
+				realityMap := map[string]interface{}{
+					"enabled":    true,
+					"public_key": strings.TrimSpace(node.PublicKey),
+					"short_id":   strings.TrimSpace(node.ShortID),
+				}
+				tlsMap["reality"] = realityMap
+			}
+			out["tls"] = tlsMap
 		}
-		out["tls"] = tlsMap
 
-		if node.Network == "ws" {
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "ws" {
 			out["transport"] = map[string]interface{}{
 				"type":    "ws",
 				"path":    node.Path,
 				"headers": map[string]string{"Host": node.Host},
 			}
-		} else if node.Network == "grpc" {
+		} else if netType == "grpc" {
 			out["transport"] = map[string]interface{}{
 				"type":         "grpc",
 				"service_name": node.Path,
 			}
-		} else if node.Network == "xhttp" || node.Network == "splithttp" {
+		} else if netType == "xhttp" || netType == "splithttp" {
 			path := node.Path
 			if path == "" {
 				path = "/"
@@ -737,9 +757,14 @@ func (b *BuilderV13) buildNodeOutbound(node *config.GenericNode) (map[string]int
 			out["transport"] = xhttpMap
 		}
 
-	case "hysteria2":
+	case "hysteria2", "hy2", "hysteria":
 		out["type"] = "hysteria2"
-		out["password"] = node.Password
+		password := node.Password
+		if password == "" {
+			password = node.UUID
+		}
+		out["password"] = strings.TrimSpace(password)
+
 		if node.PortRange != "" {
 			out["server_ports"] = strings.Split(node.PortRange, ",")
 		}
@@ -751,34 +776,38 @@ func (b *BuilderV13) buildNodeOutbound(node *config.GenericNode) (map[string]int
 		}
 		out["tls"] = map[string]interface{}{
 			"enabled":     true,
-			"server_name": node.SNI,
+			"server_name": strings.TrimSpace(node.SNI),
 			"insecure":    node.Insecure,
 		}
 
-	case "shadowsocks":
+	case "shadowsocks", "ss":
 		out["type"] = "shadowsocks"
-		out["method"] = node.Method
-		out["password"] = node.Password
+		out["method"] = strings.TrimSpace(node.Method)
+		out["password"] = strings.TrimSpace(node.Password)
 
 	case "trojan":
 		out["type"] = "trojan"
-		out["password"] = node.Password
+		out["password"] = strings.TrimSpace(node.Password)
 		out["tls"] = map[string]interface{}{
 			"enabled":     true,
-			"server_name": node.SNI,
+			"server_name": strings.TrimSpace(node.SNI),
 			"insecure":    node.Insecure,
 		}
 
-	case "socks":
+	case "socks", "socks5":
 		out["type"] = "socks"
-		out["version"] = node.SocksVersion
+		ver := node.SocksVersion
+		if ver == "" {
+			ver = "5"
+		}
+		out["version"] = ver
 		if node.Username != "" {
 			out["username"] = node.Username
 			out["password"] = node.Password
 		}
 
 	default:
-		return nil, fmt.Errorf("unsupported protocol: %s", node.Protocol)
+		return nil, fmt.Errorf("unsupported protocol '%s'", node.Protocol)
 	}
 
 	return out, nil

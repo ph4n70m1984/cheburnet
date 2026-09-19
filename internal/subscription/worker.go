@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/network"
 	"cheburnet/pkg/happ"
 	"cheburnet/pkg/uri"
 
@@ -28,17 +28,26 @@ import (
 const maxSubscriptionSize = 8 << 20 // 8 MiB лимит для embedded-устройств OpenWrt
 
 type Worker struct {
-	autoHWID   bool
-	customHWID string
-	mu         sync.Mutex
-	cancelMap  map[string]context.CancelFunc
+	autoHWID      bool
+	customHWID    string
+	mu            sync.Mutex
+	cancelMap     map[string]context.CancelFunc
+	client        *http.Client
+	isEngineAlive func() bool
 }
 
-func NewWorker(autoHWID bool, customHWID string) *Worker {
+func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveChecker func() bool) *Worker {
+	transport := network.NewSmartTransport(8*time.Second, mixedPort, engineAliveChecker)
+
 	return &Worker{
-		autoHWID:   autoHWID,
-		customHWID: customHWID,
-		cancelMap:  make(map[string]context.CancelFunc),
+		autoHWID:      autoHWID,
+		customHWID:    customHWID,
+		cancelMap:     make(map[string]context.CancelFunc),
+		isEngineAlive: engineAliveChecker,
+		client: &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: transport,
+		},
 	}
 }
 
@@ -196,7 +205,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		filterMode = "exclude"
 	}
 
-	// Гарантируем наличие скомпилированных регулярок
 	if len(sub.CompiledRegex) == 0 && len(sub.ExcludeRegex) > 0 {
 		sub.CompileFilters()
 	}
@@ -211,7 +219,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		}
 		body = decrypted
 	} else {
-		// 2. HTTP-запрос
+		// 2. HTTP-запрос через динамический SmartTransport
 		reqCtx, reqCancel := context.WithTimeout(ctx, 12*time.Second)
 		defer reqCancel()
 
@@ -227,7 +235,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Connection", "close")
 
 		if targetHWID != "" {
 			req.Header.Set("x-hwid", targetHWID)
@@ -235,31 +243,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			req.Header.Set("X-HWID", targetHWID)
 		}
 
-		dialer := &net.Dialer{
-			Timeout:   6 * time.Second,
-			KeepAlive: 0,
-			Resolver: &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 3 * time.Second}
-					conn, err := d.DialContext(ctx, "udp", "77.88.8.8:53")
-					if err != nil {
-						return d.DialContext(ctx, "udp", "8.8.8.8:53")
-					}
-					return conn, nil
-				},
-			},
-		}
-
-		client := &http.Client{
-			Transport: &http.Transport{
-				DialContext:           dialer.DialContext,
-				ResponseHeaderTimeout: 8 * time.Second,
-				DisableKeepAlives:     true,
-			},
-		}
-
-		resp, err := client.Do(req)
+		resp, err := w.client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("http fetch error: %w", err)
 		}
@@ -269,7 +253,7 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 			return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
 		}
 
-		// Читаем не более maxSubscriptionSize + 1 байт для детектирования переполнения RAM
+		// Читаем не более maxSubscriptionSize + 1 байт для защиты памяти OpenWrt
 		rawBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionSize+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body: %w", err)
