@@ -14,11 +14,16 @@ N="\033[0m"
 
 WORK_DIR=""
 SERVICE_STOPPED="0"
+DNS_BACKED_UP="0"
 
 cleanup() {
     stty echo 2>/dev/null || true
     printf "\n${R}[!] Прервано пользователем.${N}\n"
     [ -n "$WORK_DIR" ] && rm -rf "$WORK_DIR"
+    if [ "$DNS_BACKED_UP" = "1" ]; then
+        [ -f "/tmp/resolv.conf.bak" ] && mv -f "/tmp/resolv.conf.bak" "/tmp/resolv.conf" 2>/dev/null || true
+        [ -f "/tmp/resolv.conf.auto.bak" ] && mv -f "/tmp/resolv.conf.auto.bak" "/tmp/resolv.conf.auto" 2>/dev/null || true
+    fi
     if [ "$SERVICE_STOPPED" = "1" ]; then
         /etc/init.d/"$SERVICE_NAME" start >/dev/null 2>&1 || true
     fi
@@ -31,6 +36,10 @@ fail() {
     stty echo 2>/dev/null || true
     printf "${R}[!] Ошибка: %s${N}\n" "$1"
     [ -n "$WORK_DIR" ] && rm -rf "$WORK_DIR"
+    if [ "$DNS_BACKED_UP" = "1" ]; then
+        [ -f "/tmp/resolv.conf.bak" ] && mv -f "/tmp/resolv.conf.bak" "/tmp/resolv.conf" 2>/dev/null || true
+        [ -f "/tmp/resolv.conf.auto.bak" ] && mv -f "/tmp/resolv.conf.auto.bak" "/tmp/resolv.conf.auto" 2>/dev/null || true
+    fi
     [ "$SERVICE_STOPPED" = "1" ] && /etc/init.d/"$SERVICE_NAME" start >/dev/null 2>&1 || true
     exit 1
 }
@@ -59,11 +68,11 @@ read_input() {
 if command -v curl >/dev/null 2>&1; then
     FETCH_TYPE="curl"
     FETCH="curl -sSL --insecure --connect-timeout 15"
-    DOWNLOAD="curl -fsSL --insecure --connect-timeout 15 -o"
+    DOWNLOAD="curl -fL --insecure --connect-timeout 15 --retry 3 --retry-delay 2 -m 120 -o"
 elif command -v wget >/dev/null 2>&1; then
     FETCH_TYPE="wget"
     FETCH="wget -qO- --no-check-certificate --timeout=15"
-    DOWNLOAD="wget -q --no-check-certificate --timeout=15 -O"
+    DOWNLOAD="wget -q --no-check-certificate --timeout=120 --tries=3 -O"
 else
     fail "Не найден ни curl, ни wget. Установите один из них."
 fi
@@ -76,6 +85,26 @@ api_get() {
         esac
     else
         $FETCH "$1" 2>/dev/null
+    fi
+}
+
+setup_fallback_dns() {
+    if [ "$DNS_BACKED_UP" = "0" ]; then
+        [ -f /tmp/resolv.conf ] && cp -f /tmp/resolv.conf /tmp/resolv.conf.bak 2>/dev/null || true
+        [ -f /tmp/resolv.conf.auto ] && cp -f /tmp/resolv.conf.auto /tmp/resolv.conf.auto.bak 2>/dev/null || true
+        DNS_BACKED_UP="1"
+    fi
+
+    printf "nameserver 8.8.8.8\nnameserver 77.88.8.8\n" > /tmp/resolv.conf
+    printf "nameserver 8.8.8.8\nnameserver 77.88.8.8\n" > /tmp/resolv.conf.auto
+
+    if command -v uci >/dev/null 2>&1; then
+        while uci -q delete dhcp.@dnsmasq[0].server; do :; done
+        uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
+        uci add_list dhcp.@dnsmasq[0].server='77.88.8.8'
+        uci set dhcp.@dnsmasq[0].noresolv='1'
+        uci commit dhcp
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     fi
 }
 
@@ -158,6 +187,7 @@ stop_cheburnet_service() {
         SERVICE_STOPPED="1"
         sleep 1
     fi
+    setup_fallback_dns
 }
 
 # 4. Выбор канала обновлений для Chebur.NET
@@ -199,7 +229,6 @@ CHOICE_SB="${READ_VALUE:-1}"
 
 case "$CHOICE_SB" in
     1)
-        stop_cheburnet_service
         printf "${C}[*] Установка/обновление sing-box через %s...${N}\n" "$PKG_MANAGER"
         if [ "$PKG_MANAGER" = "apk" ]; then
             apk update && apk add --upgrade sing-box
@@ -302,15 +331,18 @@ if [ -n "$CURRENT_CHEBUR_VER" ] && [ "$CURRENT_CHEBUR_VER" = "$CHEBUR_CLEAN_VER"
 fi
 
 if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
+    # ШАГ 1: Скачивание (служба еще работает, сеть и резолвинг активны)
+    printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
+    $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
+
+    # ШАГ 2: Остановка службы перед установкой
     stop_cheburnet_service
 
     if [ -f "/etc/config/cheburnet" ]; then
         cp -f "/etc/config/cheburnet" "/tmp/cheburnet_config_backup"
     fi
 
-    printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
-    $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
-
+    # ШАГ 3: Установка пакета
     printf "${C}[*] Установка пакета Chebur.NET...${N}\n"
     if [ "$PKG_MANAGER" = "apk" ]; then
         if ! apk add --allow-untrusted --force-overwrite "/tmp/cheburnet.apk" 2>/dev/null; then
@@ -334,12 +366,17 @@ if command -v uci >/dev/null 2>&1 && [ -f "/etc/config/cheburnet" ]; then
     uci -q commit cheburnet || true
 fi
 
-# 9. Финализация прав, каталогов и запуск службы
+# 9. ШАГ 4: Финализация прав, каталогов и запуск/перезапуск службы
 mkdir -p /var/etc/cheburnet /var/run/cheburnet
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
 
 rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/
+
+if [ "$DNS_BACKED_UP" = "1" ]; then
+    [ -f "/tmp/resolv.conf.bak" ] && mv -f "/tmp/resolv.conf.bak" "/tmp/resolv.conf" 2>/dev/null || true
+    [ -f "/tmp/resolv.conf.auto.bak" ] && mv -f "/tmp/resolv.conf.auto.bak" "/tmp/resolv.conf.auto" 2>/dev/null || true
+fi
 
 /etc/init.d/cheburnet enable >/dev/null 2>&1 || true
 /etc/init.d/cheburnet restart >/dev/null 2>&1 || true
