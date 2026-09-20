@@ -24,6 +24,7 @@ import (
 	"cheburnet/internal/config"
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
+	"cheburnet/internal/engine/adaptive"
 	"cheburnet/internal/network"
 	"cheburnet/internal/ruleset"
 	"cheburnet/internal/service"
@@ -38,6 +39,9 @@ var (
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
 	DefaultAPIBind           = "0.0.0.0:8088"
 	PIDFile                  = "/var/run/cheburnetd.pid"
+
+	lastKnownActiveNode   string
+	lastKnownActiveNodeMu sync.RWMutex
 )
 
 type diagReporterAdapter struct {
@@ -81,21 +85,23 @@ func (a *diagReporterAdapter) ResolveProblem(id string) {
 }
 
 type App struct {
-	state         *config.StateManager
-	uciStorage    *config.UCIStorage
-	singboxEng    *engine.SingBoxEngine
-	activeEng     engine.Engine
-	hub           *telemetry.Hub
-	server        *api.Server
-	rulesLoader   *network.CompressedRulesetLoader
-	rulesCron     *network.RulesetCron
-	healthTracker *engine.HealthTracker
-	diagEngine    *diagnostics.DiagnosticsEngine
-	rulesMgr      *ruleset.Manager
-	updManager    *updater.Manager
-	subWorker     *subscription.Worker
-	mu            sync.RWMutex
-	engineOpMu    sync.Mutex
+	state          *config.StateManager
+	uciStorage     *config.UCIStorage
+	singboxEng     *engine.SingBoxEngine
+	activeEng      engine.Engine
+	hub            *telemetry.Hub
+	server         *api.Server
+	rulesLoader    *network.CompressedRulesetLoader
+	rulesCron      *network.RulesetCron
+	healthTracker  *engine.HealthTracker
+	diagEngine     *diagnostics.DiagnosticsEngine
+	rulesMgr       *ruleset.Manager
+	updManager     *updater.Manager
+	subWorker      *subscription.Worker
+	adaptiveWorker *adaptive.Worker
+	adaptiveProber *adaptive.Prober
+	mu             sync.RWMutex
+	engineOpMu     sync.Mutex
 }
 
 func showHelp() {
@@ -350,80 +356,48 @@ func loadDHCPLeasesMap() map[string]string {
 	return leases
 }
 
-func getRealActiveNode(defaultTag string) string {
-	client := &http.Client{Timeout: 800 * time.Millisecond}
-	urls := []string{
-		"http://127.0.0.1:9090/proxies",
-		"http://192.168.11.1:9090/proxies",
+func getRealActiveNode(clashSecret, fallback string) string {
+	lastKnownActiveNodeMu.RLock()
+	cached := lastKnownActiveNode
+	lastKnownActiveNodeMu.RUnlock()
+
+	if cached == "" {
+		cached = fallback
 	}
 
-	var resp *http.Response
-	var err error
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	for _, u := range urls {
-		r, e := client.Get(u)
-		if e == nil && r != nil && r.StatusCode == http.StatusOK {
-			resp = r
-			break
-		}
-		if r != nil {
-			_ = r.Body.Close()
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:9090/proxies/PROXY", nil)
+	if err != nil {
+		return cached
 	}
 
-	if resp == nil {
-		return defaultTag
+	if secret := strings.TrimSpace(clashSecret); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return cached
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Proxies map[string]struct {
-			Type string `json:"type"`
-			Now  string `json:"now"`
-		} `json:"proxies"`
+		Now string `json:"now"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Now != "" {
+		lastKnownActiveNodeMu.Lock()
+		lastKnownActiveNode = result.Now
+		lastKnownActiveNodeMu.Unlock()
+		return result.Now
 	}
 
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return defaultTag
-	}
-
-	resolveTarget := func(nodeName string) string {
-		curr := nodeName
-		visited := make(map[string]bool)
-		for i := 0; i < 4; i++ {
-			if curr == "" || visited[curr] {
-				break
-			}
-			visited[curr] = true
-			if group, exists := result.Proxies[curr]; exists && group.Now != "" && group.Now != curr {
-				curr = group.Now
-			} else {
-				break
-			}
-		}
-		return curr
-	}
-
-	for _, name := range []string{"PROXY", "proxy", "auto", "AUTO", "auto-out"} {
-		if group, ok := result.Proxies[name]; ok && group.Now != "" {
-			resolved := resolveTarget(group.Now)
-			if resolved != "" {
-				return resolved
-			}
-		}
-	}
-
-	for _, p := range result.Proxies {
-		typ := strings.ToLower(p.Type)
-		if (typ == "urltest" || typ == "selector") && p.Now != "" {
-			resolved := resolveTarget(p.Now)
-			if resolved != "" {
-				return resolved
-			}
-		}
-	}
-
-	return defaultTag
+	return cached
 }
 
 func acquirePIDLock(pidPath string) (*os.File, error) {
@@ -460,12 +434,10 @@ func acquirePIDLock(pidPath string) (*os.File, error) {
 }
 
 func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config.SubscriptionConfig) {
-	// 1. Единая нормализация имени (исключаем спецсимволы, переносы строк и пробелы)
 	cleanName := strings.TrimSpace(targetSub.Name)
 	cleanName = strings.ReplaceAll(cleanName, "\n", "")
 	cleanName = strings.ReplaceAll(cleanName, "\r", "")
 
-	// Санитизация URL для логов: выводим только схему и хост (без токенов, HWID и секретов в query/path)
 	logHost := "unknown-host"
 	if u, err := url.Parse(targetSub.URL); err == nil && u.Host != "" {
 		logHost = u.Host
@@ -473,18 +445,15 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 
 	log.Printf("[subscription-loop] Triggered auto-update for: %s (host: %s)", cleanName, logHost)
 
-	// Передаем нормализованную структуру воркеру, чтобы генерация тегов [Name] была консистентна
 	normalizedSub := targetSub
 	normalizedSub.Name = cleanName
 
-	// 2. Скачиваем ноды свежей подписки
 	freshNodes, err := a.subWorker.FetchNodes(ctx, normalizedSub)
 	if err != nil {
 		log.Printf("[subscription-loop] ERROR: Failed to auto-update %s: %v (keeping current nodes)", cleanName, err)
 		return
 	}
 
-	// Защита от пустого ответа
 	if len(freshNodes) == 0 {
 		log.Printf("[subscription-loop] WARN: Subscription %s returned 0 nodes, keeping existing pool intact", cleanName)
 		return
@@ -493,16 +462,13 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
 
-	// 3. Создаем изолированного кандидата конфигурации
 	candidate := a.state.Clone()
 
-	// Префикс строится строго из cleanName
 	prefix := ""
 	if cleanName != "" {
 		prefix = fmt.Sprintf("[%s]", cleanName)
 	}
 
-	// Отфильтровываем старые ноды обновляемой подписки
 	var updatedNodes []*config.GenericNode
 	for _, n := range candidate.Nodes {
 		if n == nil {
@@ -514,7 +480,6 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 		updatedNodes = append(updatedNodes, n)
 	}
 
-	// Вливаем свежие ноды
 	updatedNodes = append(updatedNodes, freshNodes...)
 	candidate.Nodes = updatedNodes
 
@@ -527,19 +492,20 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 		return
 	}
 
-	// Контекст привязан к caller ctx (мгновенно отменяется при graceful shutdown)
 	reloadCtx, cancelReload := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelReload()
 
-	// 4. SafeReload ядра sing-box над кандидатом
 	if err := engine.SafeReload(reloadCtx, eng, candidate, RuntimeConfigPathSingBox); err != nil {
 		log.Printf("[subscription-loop] ERROR: Engine rejected updated nodes for %s: %v (state kept intact)", cleanName, err)
 		return
 	}
 
-	// 5. Фиксация в памяти с явным логированием ошибки на случай изменения контракта StateManager
 	if _, err := a.state.Commit(candidate, false); err != nil {
 		log.Printf("[subscription-loop] WARN: Commit state returned unexpected error: %v", err)
+	}
+
+	if a.adaptiveWorker != nil {
+		a.adaptiveWorker.Trigger()
 	}
 
 	log.Printf("[subscription-loop] SUCCESS: Updated %s. Active pool: %d nodes", cleanName, len(candidate.Nodes))
@@ -684,18 +650,24 @@ func runDaemon() {
 		}
 	}
 
+	// Инициализация на адаптивния модул и работника
+	prober := adaptive.NewProber("http://127.0.0.1:9090", initialConfig.ClashAPISecret)
+	adaptiveWorker := adaptive.NewWorker(state, prober)
+
 	app := &App{
-		state:         state,
-		uciStorage:    uciStorage,
-		singboxEng:    sbEngine,
-		activeEng:     sbEngine,
-		hub:           hub,
-		rulesLoader:   rulesLoader,
-		healthTracker: healthTracker,
-		diagEngine:    diagEngine,
-		rulesMgr:      rulesMgr,
-		updManager:    updManager,
-		subWorker:     subWorker,
+		state:          state,
+		uciStorage:     uciStorage,
+		singboxEng:     sbEngine,
+		activeEng:      sbEngine,
+		hub:            hub,
+		rulesLoader:    rulesLoader,
+		healthTracker:  healthTracker,
+		diagEngine:     diagEngine,
+		rulesMgr:       rulesMgr,
+		updManager:     updManager,
+		subWorker:      subWorker,
+		adaptiveWorker: adaptiveWorker,
+		adaptiveProber: prober,
 	}
 
 	sourceIface := initialConfig.SourceIface
@@ -733,7 +705,6 @@ func runDaemon() {
 	app.rulesCron.Start(daemonCtx)
 	diagEngine.StartBackgroundLoop(daemonCtx)
 
-	// Запуск фоновых циклов автообновления подписок по расписанию[cite: 1]
 	subWorker.StartSubscriptionLoops(daemonCtx, initialConfig.Subscriptions, func(targetSub config.SubscriptionConfig) {
 		app.handleSubscriptionAutoUpdate(daemonCtx, targetSub)
 	})
@@ -750,13 +721,16 @@ func runDaemon() {
 		},
 	)
 
+	// Стартиране на фоновия адаптивен работник
+	go adaptiveWorker.Start(daemonCtx)
+
 	go hub.Run(daemonCtx, app.getCurrentEngine, func() string {
 		cfg := app.state.Get()
 		fallback := ""
 		if len(cfg.Nodes) > 0 {
 			fallback = cfg.Nodes[0].Tag
 		}
-		return getRealActiveNode(fallback)
+		return getRealActiveNode(cfg.ClashAPISecret, fallback)
 	})
 
 	srv := api.NewServer(
@@ -804,6 +778,8 @@ func runDaemon() {
 			}
 		},
 	)
+	srv.SetAdaptiveWorker(adaptiveWorker)
+	srv.SetAdaptiveProber(prober) // Свързване на адаптивния модул към API
 	app.server = srv
 
 	go func() {
@@ -863,16 +839,13 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
 
-	// 1. Сохраняем снимок текущей конфигурации для отката[cite: 13]
 	previousConfig := a.state.Get()
 
-	// 2. Вычитываем конфигурацию из UCI[cite: 13]
 	diskCfg, err := a.uciStorage.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load uci config on reload: %w", err)
 	}
 
-	// 3. Формируем кандидата[cite: 13]
 	candidate := *diskCfg
 	candidate.Nodes = previousConfig.Nodes
 
@@ -908,7 +881,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("no active engine")
 	}
 
-	// ФАЗА 1: Валидация и перевод ядра sing-box на конфигурацию кандидата[cite: 13]
 	if err := engine.SafeReload(ctx, eng, &candidate, targetPath); err != nil {
 		log.Printf("[ERROR] SafeReload candidate aborted: sing-box rejected candidate config: %v (nftables kept untouched)", err)
 		return fmt.Errorf("candidate engine reload rejected: %w", err)
@@ -936,12 +908,10 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return
 	}
 
-	// ФАЗА 2: Применение правил nftables под параметры кандидата[cite: 13]
 	sIface, subnets, fullProxyIPs, tproxyPort, isGlobal := prepareNFTParams(&candidate)
 	if err := network.ApplyNFTRules([]string{sIface}, subnets, fullProxyIPs, tproxyPort, isGlobal); err != nil {
 		log.Printf("[CRITICAL] ApplyNFTRules failed for candidate: %v. Initiating ROLLBACK to previous stable configuration...", err)
 
-		// ROLLBACK ШАГ 1: Откатываем ядро sing-box на previousConfig[cite: 13]
 		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelRollback()
 
@@ -952,7 +922,6 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 			log.Printf("[INFO] Rollback engine SafeReload to previous configuration SUCCESS.")
 		}
 
-		// ROLLBACK ШАГ 2: Восстанавливаем правила nftables для previousConfig[cite: 13]
 		prevIface, prevSubnets, prevFullProxy, prevPort, prevGlobal := prepareNFTParams(&previousConfig)
 		if prevNFTErr := network.ApplyNFTRules([]string{prevIface}, prevSubnets, prevFullProxy, prevPort, prevGlobal); prevNFTErr != nil {
 			log.Printf("[EMERGENCY] Rollback ApplyNFTRules to previous state FAILED: %v", prevNFTErr)
@@ -963,16 +932,18 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		return fmt.Errorf("nftables setup failed: %w (rollback executed)", err)
 	}
 
-	// ФАЗА 3: Успешный коммит транзакции в память StateManager[cite: 13]
 	if _, err := a.state.Commit(&candidate, false); err != nil {
 		log.Printf("[WARN] State committed to memory, but persistence returned: %v", err)
 	}
 
-	// Актуализируем фоновые циклы обновления подписок с новыми параметрами[cite: 1]
 	if a.subWorker != nil && len(candidate.Subscriptions) > 0 {
 		a.subWorker.StartSubscriptionLoops(ctx, candidate.Subscriptions, func(targetSub config.SubscriptionConfig) {
 			a.handleSubscriptionAutoUpdate(ctx, targetSub)
 		})
+	}
+
+	if a.adaptiveWorker != nil {
+		a.adaptiveWorker.Trigger()
 	}
 
 	log.Printf("[INFO] Reload synchronized: sing-box core and nftables are aligned (global: %v, tproxy_port: %d)", isGlobal, candidate.TProxyPort)

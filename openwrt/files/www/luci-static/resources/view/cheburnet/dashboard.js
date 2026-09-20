@@ -31,6 +31,7 @@ return view.extend({
         var hosts = (data && data[0]) ? data[0] : {};
         var daemonStatus = (data && data[2]) ? data[2] : {};
         var hasPublicSub = !!(daemonStatus.features && daemonStatus.features.public_sub);
+        var hasAdaptiveProbe = !!(daemonStatus.features && daemonStatus.features.adaptive_probe);
 
         var m = new form.Map('cheburnet', _('Chebur.NET'),
             _('Управление прозрачным проксированием трафика на базе Sing-box'));
@@ -505,7 +506,18 @@ return view.extend({
         o = s.taboption('general', form.ListValue, 'config_type', _('Тип конфигурации'));
         o.value('urltest', 'URLTest (Автовыбор по задержке)');
         o.value('manual', 'Manual (Ручной выбор ноды)');
+        if (hasAdaptiveProbe) {
+            o.value('adaptive', _('Adaptive (Автовыбор Jitter + Скорость)'));
+        }
         o.default = 'urltest';
+
+        o = s.taboption('general', form.ListValue, 'adaptive_interval', _('Интервал адаптивного замера'));
+        o.depends('config_type', 'adaptive');
+        o.value('1m', _('Каждую минуту (1 мин)'));
+        o.value('3m', _('Каждые 3 минуты (3 мин)'));
+        o.value('5m', _('Каждые 5 минут (5 мин)'));
+        o.value('10m', _('Каждые 10 минут (10 мин)'));
+        o.default = '3m';
 
         o = s.taboption('general', form.ListValue, 'source_mode', _('Источник серверов'));
         o.value('subscription', _('По ссылкам подписок (URL)'));
@@ -848,7 +860,6 @@ return view.extend({
         o.rows = 4;
         o.modalonly = true;
 
-        // Оборачивание секций 2, 3, 4 и 5 в аккордеоны без разрушения CBA-привязок
         return m.render().then(function(mapNode) {
             var sections = mapNode.querySelectorAll('.cbi-section');
             sections.forEach(function(secNode) {

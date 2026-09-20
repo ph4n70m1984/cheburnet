@@ -30,7 +30,6 @@ func NewBuilder() *Builder {
 	}
 }
 
-// cleanTokens экспортируется на уровне пакета singbox для всех билдеров
 func cleanTokens(items []string) []string {
 	var res []string
 	for _, item := range items {
@@ -48,7 +47,6 @@ func cleanTokens(items []string) []string {
 	return res
 }
 
-// detectSingBoxVersion определяет версию локального бинарника sing-box
 func detectSingBoxVersion() (major, minor, patch int) {
 	binPath := "/usr/bin/sing-box"
 	if _, err := os.Stat(binPath); err != nil {
@@ -411,6 +409,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	activeOutboundTag := "direct-out"
 
+	configType := strings.ToLower(strings.TrimSpace(cfg.ConfigType))
+	if configType == "" {
+		configType = "urltest"
+	}
+
 	globalURLTestInterval := strings.TrimSpace(cfg.URLTestInterval)
 	if globalURLTestInterval == "" {
 		globalURLTestInterval = "3m"
@@ -423,7 +426,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	globalURLTestURL := strings.TrimSpace(cfg.URLTestURL)
 	if globalURLTestURL == "" {
-		globalURLTestURL = "https://www.gstatic.com/generate_204"
+		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
 	}
 
 	if len(cfg.Groups) > 0 {
@@ -466,17 +469,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         targetURL,
 				"interval":                    interval,
 				"tolerance":                   tolerance,
-				"idle_timeout":                "30m",
 				"interrupt_exist_connections": false,
 			})
 
-			selectorList := append([]string{urltestTag}, validGrpNodes...)
-			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       grp.Tag,
-				"outbounds": selectorList,
-				"default":   urltestTag,
-			})
+			if configType == "urltest" {
+				selectorList := append([]string{urltestTag}, validGrpNodes...)
+				outbounds = append(outbounds, map[string]interface{}{
+					"type":      "selector",
+					"tag":       grp.Tag,
+					"outbounds": selectorList,
+					"default":   urltestTag,
+				})
+			} else {
+				outbounds = append(outbounds, map[string]interface{}{
+					"type":      "selector",
+					"tag":       grp.Tag,
+					"outbounds": validGrpNodes,
+					"default":   validGrpNodes[0],
+				})
+			}
 
 			if activeOutboundTag == "direct-out" {
 				activeOutboundTag = grp.Tag
@@ -486,6 +497,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		urltestTag := "auto"
 		selectorTag := "PROXY"
 
+		// urltest ВСЕГДА присутствует в ядре для автоматического наполнения истории задержек в Clash API
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":                        "urltest",
 			"tag":                         urltestTag,
@@ -493,17 +505,26 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"url":                         globalURLTestURL,
 			"interval":                    globalURLTestInterval,
 			"tolerance":                   globalURLTestTolerance,
-			"idle_timeout":                "30m",
 			"interrupt_exist_connections": false,
 		})
 
-		selectorList := append([]string{urltestTag}, allNodeTags...)
-		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "selector",
-			"tag":       selectorTag,
-			"outbounds": selectorList,
-			"default":   urltestTag,
-		})
+		if configType == "urltest" {
+			selectorList := append([]string{urltestTag}, allNodeTags...)
+			outbounds = append(outbounds, map[string]interface{}{
+				"type":      "selector",
+				"tag":       selectorTag,
+				"outbounds": selectorList,
+				"default":   urltestTag,
+			})
+		} else {
+			// В адаптивном режиме PROXY содержит только реальные узлы и переключается cheburnetd
+			outbounds = append(outbounds, map[string]interface{}{
+				"type":      "selector",
+				"tag":       selectorTag,
+				"outbounds": allNodeTags,
+				"default":   allNodeTags[0],
+			})
+		}
 
 		activeOutboundTag = selectorTag
 	}
@@ -581,6 +602,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					continue
 				}
 
+				targetOutbound := rp.Outbound
+				if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
+					targetOutbound = "PROXY"
+				}
+
 				totalPolicySubnets := append([]string(nil), cleanTokens(rp.Subnets)...)
 				var policyRuleSets []string
 				hasPolicyTelegram := false
@@ -608,7 +634,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 						"action":   "route",
 						"inbound":  []string{"tproxy-in"},
 						"ip_cidr":  totalPolicySubnets,
-						"outbound": rp.Outbound,
+						"outbound": targetOutbound,
 					})
 				}
 
@@ -618,7 +644,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 						"action":        "route",
 						"inbound":       []string{"tproxy-in"},
 						"domain_suffix": rpDomains,
-						"outbound":      rp.Outbound,
+						"outbound":      targetOutbound,
 					})
 				}
 
@@ -626,7 +652,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					routeRules = append(routeRules, map[string]interface{}{
 						"action":   "route",
 						"inbound":  []string{"tproxy-in"},
-						"outbound": rp.Outbound,
+						"outbound": targetOutbound,
 						"rule_set": policyRuleSets,
 					})
 				}
@@ -845,7 +871,6 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			// Протокол xhttp поддерживается только в extended/lx сборках sing-box, пропускаем узел
 			return nil, fmt.Errorf("skipped: transport '%s' is only supported by extended/lx sing-box builds", netType)
 		}
 

@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cheburnet/internal/config"
 	"cheburnet/internal/engine"
+	"cheburnet/internal/engine/adaptive"
 	"cheburnet/pkg/uri"
 
 	"github.com/gofiber/fiber/v2"
@@ -22,13 +25,17 @@ import (
 
 const TargetConfigPath = "/tmp/run/cheburnet/sing-box.json"
 
+var (
+	lastActiveNode   string
+	lastActiveNodeMu sync.RWMutex
+)
+
 type DelayResult struct {
 	Delay   *int   `json:"delay"`
 	Status  string `json:"status,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
-// clashRequest выполняет HTTP-запрос к Clash API ядра с авторизацией через Bearer, если секрет задан
 func (s *Server) clashRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	targetURL := "http://127.0.0.1:9090" + path
 	var bodyReader io.Reader
@@ -53,9 +60,16 @@ func (s *Server) clashRequest(ctx context.Context, method, path string, body []b
 	return s.clashClient.Do(req)
 }
 
-// getRealActiveNode опрашивает sing-box Clash API для определения текущего активного аутбаунда
 func (s *Server) getRealActiveNode(ctx context.Context, defaultTag string) string {
-	reqCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	lastActiveNodeMu.RLock()
+	cached := lastActiveNode
+	lastActiveNodeMu.RUnlock()
+
+	if cached == "" {
+		cached = defaultTag
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/PROXY", nil)
@@ -63,7 +77,7 @@ func (s *Server) getRealActiveNode(ctx context.Context, defaultTag string) strin
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		return defaultTag
+		return cached
 	}
 	defer resp.Body.Close()
 
@@ -71,13 +85,15 @@ func (s *Server) getRealActiveNode(ctx context.Context, defaultTag string) strin
 		Now string `json:"now"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil && result.Now != "" {
+		lastActiveNodeMu.Lock()
+		lastActiveNode = result.Now
+		lastActiveNodeMu.Unlock()
 		return result.Now
 	}
 
-	return defaultTag
+	return cached
 }
 
-// handleStatus возвращает текущий статус ядра, количество нод, внешний IP, активную ноду и флаги возможностей
 func (s *Server) handleStatus(c *fiber.Ctx) error {
 	cfg := s.state.Get()
 
@@ -98,7 +114,11 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 
 	activeNode := "auto"
 	if len(cfg.Nodes) > 0 {
-		activeNode = s.getRealActiveNode(c.Context(), "auto")
+		fallback := "auto"
+		if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "urltest" {
+			fallback = cfg.Nodes[0].Tag
+		}
+		activeNode = s.getRealActiveNode(c.Context(), fallback)
 	}
 
 	return c.JSON(fiber.Map{
@@ -109,15 +129,23 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 		"custom_hwid": cfg.CustomHWID,
 		"outbound_ip": outboundIP,
 		"features": fiber.Map{
-			"public_sub": HasPublicSubFeature,
+			"public_sub":     HasPublicSubFeature,
+			"adaptive_probe": adaptive.IsEnabled(),
 		},
 	})
 }
 
-// handleGetNodes возвращает список серверов вместе с виртуальной нодой auto, задержками и статусом
 func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	cfg := s.state.Get()
-	activeNode := s.getRealActiveNode(c.Context(), "auto")
+
+	fallback := "auto"
+	isURLTest := strings.ToLower(strings.TrimSpace(cfg.ConfigType)) == "urltest" || cfg.ConfigType == ""
+	isAdaptive := strings.ToLower(strings.TrimSpace(cfg.ConfigType)) == "adaptive"
+
+	if !isURLTest && len(cfg.Nodes) > 0 {
+		fallback = cfg.Nodes[0].Tag
+	}
+	activeNode := s.getRealActiveNode(c.Context(), fallback)
 
 	type nodeView struct {
 		Tag      string `json:"tag"`
@@ -132,7 +160,7 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	latencies := make(map[string]int)
 	bestLatency := 0
 
-	reqCtx, cancel := context.WithTimeout(c.Context(), 600*time.Millisecond)
+	reqCtx, cancel := context.WithTimeout(c.Context(), 1500*time.Millisecond)
 	defer cancel()
 
 	if resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies", nil); err == nil && resp.StatusCode == http.StatusOK {
@@ -158,21 +186,9 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 		_ = resp.Body.Close()
 	}
 
-	if bestLatency == 0 {
-		minDelay := 999999
-		for _, d := range latencies {
-			if d > 0 && d < minDelay {
-				minDelay = d
-			}
-		}
-		if minDelay < 999999 {
-			bestLatency = minDelay
-		}
-	}
-
 	var res []nodeView
 
-	if len(cfg.Nodes) > 0 {
+	if len(cfg.Nodes) > 0 && isURLTest {
 		autoStatus := "● Доступен"
 		if bestLatency == 0 {
 			autoStatus = "● Ожидание"
@@ -189,6 +205,14 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 
 	for _, n := range cfg.Nodes {
 		d := latencies[n.Tag]
+
+		// Если в адаптивном режиме ядро не заполняет history, берем реальный RTT из Prober
+		if d == 0 && isAdaptive && s.adaptiveProber != nil {
+			if m := s.adaptiveProber.GetNodeMetric(n.Tag); m != nil && m.RTT > 0 {
+				d = int(m.RTT.Milliseconds())
+			}
+		}
+
 		status := "● Доступен"
 		if d == 0 {
 			status = "● Ожидание"
@@ -208,7 +232,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	return c.JSON(res)
 }
 
-// handleSelectNode переключает ноду в sing-box на лету через Clash API
 func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 	var req struct {
 		Tag string `json:"tag"`
@@ -217,9 +240,12 @@ func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "tag is required"})
 	}
 
-	payload, _ := json.Marshal(map[string]string{
+	payload, err := json.Marshal(map[string]string{
 		"name": req.Tag,
 	})
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "marshal payload failed"})
+	}
 
 	reqCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
 	defer cancel()
@@ -234,13 +260,16 @@ func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": fmt.Sprintf("sing-box returned code %d", resp.StatusCode)})
 	}
 
+	lastActiveNodeMu.Lock()
+	lastActiveNode = req.Tag
+	lastActiveNodeMu.Unlock()
+
 	return c.JSON(fiber.Map{
 		"status":      "ok",
 		"active_node": req.Tag,
 	})
 }
 
-// handleAddNode добавляет одиночную ноду по ссылке с валидацией через кандидата
 func (s *Server) handleAddNode(c *fiber.Ctx) error {
 	var req struct {
 		URI string `json:"uri"`
@@ -267,7 +296,6 @@ func (s *Server) handleAddNode(c *fiber.Ctx) error {
 		}
 	}
 
-	// Фиксируем стейт только после успешного SafeReload (строка 271)
 	committed, err := s.state.Commit(candidate, false)
 	if err != nil {
 		log.Printf("[WARN] State commit warning: %v", err)
@@ -276,9 +304,7 @@ func (s *Server) handleAddNode(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"status": "ok", "node": node, "total_nodes": len(committed.Nodes)})
 }
 
-// handleUpdateSubscriptions обновляет все сохраненные подписки по модели Two-Phase Commit
 func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
-	// 1. Создаем изолированного кандидата конфигурации
 	candidate := s.state.Clone()
 
 	uciStorage := config.NewUCIStorage()
@@ -311,18 +337,14 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 
 	candidate.Nodes = allNodes
 
-	// 2. SafeReload выполняется строго над кандидатом
 	eng := s.getEngine()
 	if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
 		log.Printf("[api] update subscriptions reload error: %v", err)
-		// Состояние s.state НЕ затронуто, старые рабочие ноды сохранены
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to safely apply updated subscriptions: " + err.Error(),
 		})
 	}
 
-	// 3. Только после успешного старта процесса фиксируем новое состояние (строка 321)
-	// persistUCI: false — динамические узлы подписок сохраняются в RAM, сберегая флеш
 	committed, err := s.state.Commit(candidate, false)
 	if err != nil {
 		log.Printf("[WARN] State commit warning: %v", err)
@@ -333,6 +355,10 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 		s.rulesCron.SetInterval(committed.RulesetUpdateInterval)
 	}
 
+	if s.adaptiveWorker != nil {
+		s.adaptiveWorker.Trigger()
+	}
+
 	return c.JSON(fiber.Map{
 		"status":         "ok",
 		"total_nodes":    len(committed.Nodes),
@@ -341,7 +367,6 @@ func (s *Server) handleUpdateSubscriptions(c *fiber.Ctx) error {
 	})
 }
 
-// handleAddSource универсально добавляет подписку или ноду с валидацией кандидата до коммита
 func (s *Server) handleAddSource(c *fiber.Ctx) error {
 	var req struct {
 		Type      string `json:"type"`
@@ -411,7 +436,6 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "type must be 'subscription' or 'node'"})
 	}
 
-	// Валидируем и перезагружаем ядро над кандидатом
 	eng := s.getEngine()
 	if err := engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -419,7 +443,6 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		})
 	}
 
-	// Сохраняем в UCI и фиксируем стейт только после успешного применения ядром
 	if subToAdd != nil {
 		_ = uci.AddSubscription(*subToAdd)
 	}
@@ -427,10 +450,13 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 		_ = uci.AddManualNode(manualNodeToAdd)
 	}
 
-	// Фиксируем обновленное состояние (строка 422)
 	committed, err := s.state.Commit(candidate, false)
 	if err != nil {
 		log.Printf("[WARN] State commit warning: %v", err)
+	}
+
+	if s.adaptiveWorker != nil {
+		s.adaptiveWorker.Trigger()
 	}
 
 	return c.JSON(fiber.Map{
@@ -439,7 +465,6 @@ func (s *Server) handleAddSource(c *fiber.Ctx) error {
 	})
 }
 
-// handleReloadConfig считывает конфигурацию с диска и применяет через кандидата
 func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 	defer cancel()
@@ -491,7 +516,6 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 		_ = eng.Stop()
 	}
 
-	// Фиксируем новое состояние после прохождения SafeReload (строка 484)
 	committed, err := s.state.Commit(candidate, false)
 	if err != nil {
 		log.Printf("[WARN] State commit warning: %v", err)
@@ -500,6 +524,10 @@ func (s *Server) handleReloadConfig(c *fiber.Ctx) error {
 	if s.rulesCron != nil {
 		s.rulesCron.UpdateRulesets(committed.RuleSets)
 		s.rulesCron.SetInterval(committed.RulesetUpdateInterval)
+	}
+
+	if s.adaptiveWorker != nil {
+		s.adaptiveWorker.Trigger()
 	}
 
 	return c.JSON(fiber.Map{
@@ -551,17 +579,54 @@ func (s *Server) handlePerformUpdate(c *fiber.Ctx) error {
 	})
 }
 
-// handleProxyDelay обрабатывает замер задержки для серверов и транслирует пинг активной ноды для auto
 func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
-	name := c.Params("name")
-	testURL := c.Query("url", "https://www.gstatic.com/generate_204")
-	timeout := c.Query("timeout", "3000")
+	rawName := c.Params("name")
 
-	if strings.EqualFold(name, "auto") {
-		reqCtx, cancel := context.WithTimeout(c.Context(), 1*time.Second)
+	name, err := url.PathUnescape(rawName)
+	if err != nil || name == "" {
+		name = rawName
+	}
+	if unquoted, err := url.QueryUnescape(name); err == nil && unquoted != "" {
+		name = unquoted
+	}
+
+	// 1. Если адаптивный пробер уже имеет актуальный замер для этой ноды — отдаем моментально
+	if s.adaptiveProber != nil {
+		if m := s.adaptiveProber.GetNodeMetric(name); m != nil && m.RTT > 0 {
+			d := int(m.RTT.Milliseconds())
+			return c.JSON(DelayResult{
+				Delay:  &d,
+				Status: "ok",
+			})
+		}
+	}
+
+	cfg := s.state.Get()
+	testURL := c.Query("url", "")
+	if testURL == "" {
+		testURL = cfg.URLTestURL
+	}
+	if testURL == "" {
+		testURL = "http://cp.cloudflare.com/generate_204"
+	}
+
+	timeoutParam := c.Query("timeout", "4000")
+	tVal, err := strconv.Atoi(timeoutParam)
+	if err != nil || tVal < 1500 {
+		timeoutParam = "4000"
+		tVal = 4000
+	}
+
+	if strings.EqualFold(name, "auto") || strings.EqualFold(name, "proxy") {
+		reqCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
 		defer cancel()
 
-		resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/auto", nil)
+		targetGroup := "auto"
+		if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "urltest" {
+			targetGroup = "PROXY"
+		}
+
+		resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/"+targetGroup, nil)
 		if err == nil && resp.StatusCode == http.StatusOK {
 			var groupData struct {
 				Now string `json:"now"`
@@ -570,9 +635,9 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 				_ = resp.Body.Close()
 
 				escapedTarget := url.PathEscape(groupData.Now)
-				delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeout)
+				delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedTarget, url.QueryEscape(testURL), timeoutParam)
 
-				dCtx, dCancel := context.WithTimeout(c.Context(), 3*time.Second)
+				dCtx, dCancel := context.WithTimeout(c.Context(), time.Duration(tVal+1500)*time.Millisecond)
 				defer dCancel()
 
 				if dResp, dErr := s.clashRequest(dCtx, http.MethodGet, delayPath, nil); dErr == nil {
@@ -594,9 +659,9 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 	}
 
 	escapedName := url.PathEscape(name)
-	delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeout)
+	delayPath := fmt.Sprintf("/proxies/%s/delay?url=%s&timeout=%s", escapedName, url.QueryEscape(testURL), timeoutParam)
 
-	reqCtx, cancel := context.WithTimeout(c.Context(), 4*time.Second)
+	reqCtx, cancel := context.WithTimeout(c.Context(), time.Duration(tVal+1500)*time.Millisecond)
 	defer cancel()
 
 	resp, err := s.clashRequest(reqCtx, http.MethodGet, delayPath, nil)

@@ -12,6 +12,7 @@ import (
 	"cheburnet/internal/config"
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
+	"cheburnet/internal/engine/adaptive"
 	"cheburnet/internal/network"
 	"cheburnet/internal/service"
 	"cheburnet/internal/subscription"
@@ -26,18 +27,28 @@ import (
 type ActionCallback func(action string) error
 
 type Server struct {
-	app         *fiber.App
-	pubSub      *publicSubController
-	state       *config.StateManager
-	hub         *telemetry.Hub
-	subWorker   *subscription.Worker
-	updater     *updater.Manager
-	getEngine   func() engine.Engine
-	rulesCron   *network.RulesetCron
-	diagEngine  *diagnostics.DiagnosticsEngine
-	onAction    ActionCallback
-	ipifyClient *http.Client
-	clashClient *http.Client
+	app            *fiber.App
+	pubSub         *publicSubController
+	state          *config.StateManager
+	hub            *telemetry.Hub
+	subWorker      *subscription.Worker
+	updater        *updater.Manager
+	getEngine      func() engine.Engine
+	rulesCron      *network.RulesetCron
+	diagEngine     *diagnostics.DiagnosticsEngine
+	adaptiveWorker *adaptive.Worker
+	adaptiveProber *adaptive.Prober
+	onAction       ActionCallback
+	ipifyClient    *http.Client
+	clashClient    *http.Client
+}
+
+func (s *Server) SetAdaptiveWorker(w *adaptive.Worker) {
+	s.adaptiveWorker = w
+}
+
+func (s *Server) SetAdaptiveProber(p *adaptive.Prober) {
+	s.adaptiveProber = p
 }
 
 func NewServer(
@@ -79,12 +90,12 @@ func NewServer(
 		},
 		clashClient: &http.Client{
 			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				MaxIdleConnsPerHost: 5,
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 50,
 				IdleConnTimeout:     60 * time.Second,
 				DisableKeepAlives:   false,
 			},
-			Timeout: 4 * time.Second,
+			Timeout: 6 * time.Second,
 		},
 	}
 
@@ -92,7 +103,6 @@ func NewServer(
 	return s
 }
 
-// authRequired проверяет наличие и валидность api_token для мутирующих запросов
 func (s *Server) authRequired() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		cfg := s.state.Get()
@@ -104,7 +114,6 @@ func (s *Server) authRequired() fiber.Handler {
 			})
 		}
 
-		// 1. Проверка заголовка Authorization: Bearer <token>
 		authHeader := c.Get("Authorization")
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
@@ -113,12 +122,10 @@ func (s *Server) authRequired() fiber.Handler {
 			}
 		}
 
-		// 2. Проверка кастомного заголовка X-API-Token
 		if c.Get("X-API-Token") == expectedToken {
 			return c.Next()
 		}
 
-		// 3. Проверка query-параметра ?token= (необходимо для WebSocket)
 		if c.Query("token") == expectedToken {
 			return c.Next()
 		}
@@ -132,7 +139,6 @@ func (s *Server) authRequired() fiber.Handler {
 func (s *Server) setupRoutes() {
 	setupMetrics(s.app)
 
-	// Защита от DNS Rebinding и CSRF: ограничиваем Origin локальной сетью
 	s.app.Use(cors.New(cors.Config{
 		AllowOriginsFunc: func(origin string) bool {
 			if origin == "" {
@@ -155,8 +161,10 @@ func (s *Server) setupRoutes() {
 
 	api := s.app.Group("/api/v1")
 
-	// --- ОТКРЫТЫЕ READ-ONLY ЭНДПОИНТЫ ДЛЯ СИСТЕМЫ МОНИТОРИНГА И СТАТУСА ---
+	// Открытые эндпоинты статуса и мониторинга для LuCI
 	api.Get("/status", s.handleStatus)
+	api.Get("/nodes", s.handleGetNodes)
+	api.Get("/proxies/:name/delay", s.handleProxyDelay)
 	api.Get("/diagnostics", func(c *fiber.Ctx) error {
 		if s.diagEngine != nil {
 			return c.JSON(s.diagEngine.Snapshot())
@@ -167,7 +175,7 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	// --- ЗАЩИЩЕННЫЕ ЭНДПОИНТЫ УПРАВЛЕНИЯ, МУТАЦИЙ И ОБНОВЛЕНИЯ ---
+	// Защищенные эндпоинты мутаций
 	auth := s.authRequired()
 
 	api.Post("/engine/switch", auth, func(c *fiber.Ctx) error {
@@ -204,16 +212,13 @@ func (s *Server) setupRoutes() {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	api.Get("/nodes", auth, s.handleGetNodes)
 	api.Post("/nodes", auth, s.handleAddNode)
 	api.Post("/nodes/add", auth, s.handleAddNode)
 	api.Post("/nodes/select", auth, s.handleSelectNode)
 	api.Post("/source", auth, s.handleAddSource)
 	api.Post("/sources/add", auth, s.handleAddSource)
 	api.Post("/subscriptions/update", auth, s.handleUpdateSubscriptions)
-	api.Get("/proxies/:name/delay", auth, s.handleProxyDelay)
 
-	// --- ЗАЩИЩЕННЫЙ WEBSOCKET КАНАЛ ТЕЛЕМЕТРИИ ---
 	s.app.Use("/ws", auth, func(c *fiber.Ctx) error {
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()

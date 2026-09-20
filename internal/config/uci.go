@@ -28,8 +28,6 @@ func sanitizeToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// parseTextLines производит строгий парсинг многострочных списков,
-// удаляя комментарии (#, //) и разделяя токены по \n, \r, пробелам, табуляциям и запятым.
 func parseTextLines(raw string) []string {
 	var result []string
 	scanner := bufio.NewScanner(strings.NewReader(raw))
@@ -96,7 +94,6 @@ type uciCache struct {
 	rawShow string
 }
 
-// loadUCICache корректно парсит вывод uci show, поддерживая значения с многострочными переводами строк
 func loadUCICache(packageName string) (*uciCache, error) {
 	out, err := exec.Command("uci", "-q", "show", packageName).Output()
 	if err != nil {
@@ -120,7 +117,6 @@ func loadUCICache(packageName string) (*uciCache, error) {
 		if inMultiLine {
 			currentVal.WriteString("\n")
 			currentVal.WriteString(line)
-			// Проверяем завершение кавычки в конце строки
 			trimmed := strings.TrimRight(line, " \t\r")
 			if strings.HasSuffix(trimmed, "'") || strings.HasSuffix(trimmed, "\"") {
 				inMultiLine = false
@@ -144,7 +140,6 @@ func loadUCICache(packageName string) (*uciCache, error) {
 		k := strings.TrimSpace(parts[0])
 		v := parts[1]
 
-		// Если значение начинается с кавычки, но не заканчивается ей на той же строке
 		vTrimmed := strings.TrimSpace(v)
 		if (strings.HasPrefix(vTrimmed, "'") && !strings.HasSuffix(vTrimmed[1:], "'")) ||
 			(strings.HasPrefix(vTrimmed, "\"") && !strings.HasSuffix(vTrimmed[1:], "\"")) {
@@ -195,11 +190,9 @@ func (c *uciCache) getInt(key string, def int) int {
 	return val
 }
 
-// getList объединяет значения как из списков list key 'val', так и из одиночных многострочных option key 'val1\nval2'
 func (c *uciCache) getList(key string) []string {
 	var result []string
 
-	// 1. Проверяем элементы list
 	if list, ok := c.lists[key]; ok && len(list) > 0 {
 		for _, item := range list {
 			tokens := parseTextLines(item)
@@ -207,13 +200,11 @@ func (c *uciCache) getList(key string) []string {
 		}
 	}
 
-	// 2. Проверяем одиночные параметры option с многострочным текстом
 	if val, ok := c.scalars[key]; ok && strings.TrimSpace(val) != "" {
 		tokens := parseTextLines(val)
 		result = append(result, tokens...)
 	}
 
-	// Дедупликация с сохранением порядка
 	if len(result) > 0 {
 		seen := make(map[string]bool)
 		unique := make([]string, 0, len(result))
@@ -239,6 +230,8 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		Engine:                cache.get("cheburnet.main.engine", "sing-box"),
 		RoutingMode:           cache.get("cheburnet.main.routing_mode", "rules"),
 		SourceMode:            cache.get("cheburnet.main.source_mode", "subscription"),
+		ConfigType:            cache.get("cheburnet.main.config_type", "urltest"),
+		AdaptiveInterval:      cache.get("cheburnet.main.adaptive_interval", "3m"),
 		AutoHWID:              cache.get("cheburnet.main.auto_hwid", "1") == "1",
 		CustomHWID:            cache.get("cheburnet.main.custom_hwid", ""),
 		RulesetUpdateInterval: cache.get("cheburnet.main.ruleset_update_interval", "72h"),
@@ -306,8 +299,6 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 	}
 
 	cfg.CustomSRSRulesets = parseCustomSRSRules(cache.getList("cheburnet.main.custom_srs_rulesets"))
-
-	// Поддержка как list custom_domains, так и option custom_domains с многострочным вводом
 	cfg.CustomDomains = cache.getList("cheburnet.main.custom_domains")
 	cfg.CustomSubnets = cache.getList("cheburnet.main.custom_subnets")
 	cfg.CustomPorts = cache.getList("cheburnet.main.custom_ports")
@@ -325,6 +316,8 @@ func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
 		{"set", fmt.Sprintf("cheburnet.main.engine=%s", cfg.Engine)},
 		{"set", fmt.Sprintf("cheburnet.main.routing_mode=%s", cfg.RoutingMode)},
 		{"set", fmt.Sprintf("cheburnet.main.source_mode=%s", cfg.SourceMode)},
+		{"set", fmt.Sprintf("cheburnet.main.config_type=%s", cfg.ConfigType)},
+		{"set", fmt.Sprintf("cheburnet.main.adaptive_interval=%s", cfg.AdaptiveInterval)},
 		{"set", fmt.Sprintf("cheburnet.main.tproxy_port=%d", cfg.TProxyPort)},
 		{"set", fmt.Sprintf("cheburnet.main.dns_port=%d", cfg.DNSPort)},
 		{"set", fmt.Sprintf("cheburnet.main.mixed_port=%d", cfg.MixedPort)},

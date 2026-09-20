@@ -77,7 +77,6 @@ type SubscriptionConfig struct {
 	UpdateInterval string           `json:"update_interval,omitempty"` // "1h", "3h", "6h", "12h", "24h"
 }
 
-// CompileFilters компилирует регулярные выражения один раз для переиспользования воркером
 func (s *SubscriptionConfig) CompileFilters() {
 	s.CompiledRegex = make([]*regexp.Regexp, 0, len(s.ExcludeRegex))
 	for _, p := range s.ExcludeRegex {
@@ -102,6 +101,8 @@ type CheburConfig struct {
 	Engine                string               `json:"engine"`       // Всегда "sing-box"
 	RoutingMode           string               `json:"routing_mode"` // "rules" или "global"
 	SourceMode            string               `json:"source_mode"`
+	ConfigType            string               `json:"config_type"`       // "urltest", "manual", "adaptive"
+	AdaptiveInterval      string               `json:"adaptive_interval"` // "1m", "3m", "5m", "10m"
 	AutoHWID              bool                 `json:"auto_hwid"`
 	CustomHWID            string               `json:"custom_hwid"`
 	AutoUpdate            bool                 `json:"auto_update"`
@@ -132,12 +133,11 @@ type CheburConfig struct {
 	ClientPolicies        []ClientPolicy       `json:"client_policies"`     // Правила маршрутизации по клиентам
 	RoutePolicies         []RoutePolicy        `json:"route_policies"`      // Секции маршрутизации по сервисам
 
-	// Безопасность и внешний сервер подписок для Happ
-	PublicSubEnabled bool   `json:"public_sub_enabled"` // Включение отдельного HTTP-сервера подписки
-	PublicSubPort    int    `json:"public_sub_port"`    // Порт публичного сервера (по умолчанию 9443)
-	PublicSubToken   string `json:"public_sub_token"`   // Секретный токен для доступа к /sub/:token
-	ClashAPISecret   string `json:"clash_api_secret"`   // Секретный токен для внешнего контроллера Clash API
-	APIToken         string `json:"api_token"`          // Токен доступа к защищенным эндпоинтам демона
+	PublicSubEnabled bool   `json:"public_sub_enabled"`
+	PublicSubPort    int    `json:"public_sub_port"`
+	PublicSubToken   string `json:"public_sub_token"`
+	ClashAPISecret   string `json:"clash_api_secret"`
+	APIToken         string `json:"api_token"`
 }
 
 func (c *CheburConfig) Clone() *CheburConfig {
@@ -165,7 +165,6 @@ func (c *CheburConfig) Clone() *CheburConfig {
 	if c.LocalListFiles != nil {
 		cp.LocalListFiles = append([]string(nil), c.LocalListFiles...)
 	}
-
 	if c.CustomSRSRulesets != nil {
 		cp.CustomSRSRulesets = append([]CustomSRSRule(nil), c.CustomSRSRulesets...)
 	}
