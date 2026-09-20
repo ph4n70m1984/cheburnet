@@ -293,11 +293,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	major, minor, _ := detectSingBoxVersion()
-
 	var allNodeTags []string
 	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutboundWithVersion(node, major, minor)
+		ob, err := b.buildNodeOutbound(node)
 		if err != nil {
 			log.Printf("[WARN] [builder_v14] Skipped node '%s' (protocol: %s): %v", node.Tag, node.Protocol, err)
 			continue
@@ -696,11 +694,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 }
 
 func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
-	major, minor, _ := detectSingBoxVersion()
-	return b.buildNodeOutboundWithVersion(node, major, minor)
-}
-
-func (b *BuilderV14) buildNodeOutboundWithVersion(node *config.GenericNode, sbMajor, sbMinor int) (map[string]interface{}, error) {
 	if node == nil {
 		return nil, fmt.Errorf("node is nil")
 	}
@@ -764,22 +757,8 @@ func (b *BuilderV14) buildNodeOutboundWithVersion(node *config.GenericNode, sbMa
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			if sbMajor < 1 || (sbMajor == 1 && sbMinor < 13) {
-				return nil, fmt.Errorf("unsupported transport 'xhttp': current sing-box is %d.%d (requires >= 1.13)", sbMajor, sbMinor)
-			}
-			path := node.Path
-			if path == "" {
-				path = "/"
-			}
-			xhttpMap := map[string]interface{}{
-				"type": "xhttp",
-				"path": path,
-				"mode": "auto",
-			}
-			if node.Host != "" {
-				xhttpMap["host"] = node.Host
-			}
-			out["transport"] = xhttpMap
+			// Протокол xhttp поддерживается только в extended/lx сборках sing-box, пропускаем узел
+			return nil, fmt.Errorf("skipped: transport '%s' is only supported by extended/lx sing-box builds", netType)
 		}
 
 	case "hysteria2", "hy2", "hysteria":

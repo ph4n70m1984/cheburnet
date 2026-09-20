@@ -30,6 +30,7 @@ func NewBuilder() *Builder {
 	}
 }
 
+// cleanTokens экспортируется на уровне пакета singbox для всех билдеров
 func cleanTokens(items []string) []string {
 	var res []string
 	for _, item := range items {
@@ -47,8 +48,13 @@ func cleanTokens(items []string) []string {
 	return res
 }
 
+// detectSingBoxVersion определяет версию локального бинарника sing-box
 func detectSingBoxVersion() (major, minor, patch int) {
-	out, err := exec.Command("sing-box", "version").Output()
+	binPath := "/usr/bin/sing-box"
+	if _, err := os.Stat(binPath); err != nil {
+		binPath = "sing-box"
+	}
+	out, err := exec.Command(binPath, "version").Output()
 	if err != nil {
 		return 1, 12, 0
 	}
@@ -392,11 +398,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	major, minor, _ := detectSingBoxVersion()
-
 	var allNodeTags []string
 	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutbound(node, major, minor)
+		ob, err := b.buildNodeOutbound(node)
 		if err == nil {
 			outbounds = append(outbounds, ob)
 			allNodeTags = append(allNodeTags, node.Tag)
@@ -792,7 +796,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.Rename(tmpPath, outputPath)
 }
 
-func (b *Builder) buildNodeOutbound(node *config.GenericNode, sbMajor, sbMinor int) (map[string]interface{}, error) {
+func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
 	out := map[string]interface{}{
 		"tag":         node.Tag,
 		"server":      node.Address,
@@ -841,22 +845,8 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode, sbMajor, sbMinor i
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			if sbMajor < 1 || (sbMajor == 1 && sbMinor < 13) {
-				return nil, fmt.Errorf("unsupported transport 'xhttp': current sing-box is %d.%d (requires >= 1.13)", sbMajor, sbMinor)
-			}
-			path := node.Path
-			if path == "" {
-				path = "/"
-			}
-			xhttpMap := map[string]interface{}{
-				"type": "xhttp",
-				"path": path,
-				"mode": "auto",
-			}
-			if node.Host != "" {
-				xhttpMap["host"] = node.Host
-			}
-			out["transport"] = xhttpMap
+			// Протокол xhttp поддерживается только в extended/lx сборках sing-box, пропускаем узел
+			return nil, fmt.Errorf("skipped: transport '%s' is only supported by extended/lx sing-box builds", netType)
 		}
 
 	case "hysteria2":
