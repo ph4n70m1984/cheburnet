@@ -28,10 +28,13 @@ func sanitizeToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// parseTextLines производит строгий парсинг многострочных списков,
+// удаляя комментарии (#, //) и разделяя токены по \n, \r, пробелам, табуляциям и запятым.
 func parseTextLines(raw string) []string {
 	var result []string
-	for _, line := range strings.Split(raw, "\n") {
-		line = strings.TrimSpace(line)
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if idx := strings.Index(line, "//"); idx != -1 {
 			line = strings.TrimSpace(line[:idx])
 		}
@@ -39,7 +42,7 @@ func parseTextLines(raw string) []string {
 			line = strings.TrimSpace(line[:idx])
 		}
 		parts := strings.FieldsFunc(line, func(r rune) bool {
-			return r == ' ' || r == ',' || r == '\t'
+			return r == ' ' || r == ',' || r == '\t' || r == '\r' || r == '\n'
 		})
 		for _, p := range parts {
 			clean := sanitizeToken(p)
@@ -93,6 +96,7 @@ type uciCache struct {
 	rawShow string
 }
 
+// loadUCICache корректно парсит вывод uci show, поддерживая значения с многострочными переводами строк
 func loadUCICache(packageName string) (*uciCache, error) {
 	out, err := exec.Command("uci", "-q", "show", packageName).Output()
 	if err != nil {
@@ -106,29 +110,70 @@ func loadUCICache(packageName string) (*uciCache, error) {
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(out))
+	var currentKey string
+	var currentVal strings.Builder
+	inMultiLine := false
+
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := scanner.Text()
+
+		if inMultiLine {
+			currentVal.WriteString("\n")
+			currentVal.WriteString(line)
+			// Проверяем завершение кавычки в конце строки
+			trimmed := strings.TrimRight(line, " \t\r")
+			if strings.HasSuffix(trimmed, "'") || strings.HasSuffix(trimmed, "\"") {
+				inMultiLine = false
+				storeUCIEntry(cache, currentKey, currentVal.String())
+				currentKey = ""
+				currentVal.Reset()
+			}
 			continue
 		}
-		parts := strings.SplitN(line, "=", 2)
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		parts := strings.SplitN(trimmed, "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		k := strings.TrimSpace(parts[0])
-		v := sanitizeToken(parts[1])
 
-		if idx := strings.Index(k, "["); idx != -1 && strings.HasSuffix(k, "]") {
-			baseKey := k[:idx]
-			if v != "" {
-				cache.lists[baseKey] = append(cache.lists[baseKey], v)
-			}
-		} else {
-			cache.scalars[k] = v
+		k := strings.TrimSpace(parts[0])
+		v := parts[1]
+
+		// Если значение начинается с кавычки, но не заканчивается ей на той же строке
+		vTrimmed := strings.TrimSpace(v)
+		if (strings.HasPrefix(vTrimmed, "'") && !strings.HasSuffix(vTrimmed[1:], "'")) ||
+			(strings.HasPrefix(vTrimmed, "\"") && !strings.HasSuffix(vTrimmed[1:], "\"")) {
+			inMultiLine = true
+			currentKey = k
+			currentVal.WriteString(v)
+			continue
 		}
+
+		storeUCIEntry(cache, k, v)
+	}
+
+	if inMultiLine && currentKey != "" {
+		storeUCIEntry(cache, currentKey, currentVal.String())
 	}
 
 	return cache, nil
+}
+
+func storeUCIEntry(cache *uciCache, k, rawVal string) {
+	v := sanitizeToken(rawVal)
+	if idx := strings.Index(k, "["); idx != -1 && strings.HasSuffix(k, "]") {
+		baseKey := k[:idx]
+		if v != "" {
+			cache.lists[baseKey] = append(cache.lists[baseKey], v)
+		}
+	} else {
+		cache.scalars[k] = v
+	}
 }
 
 func (c *uciCache) get(key, def string) string {
@@ -150,28 +195,37 @@ func (c *uciCache) getInt(key string, def int) int {
 	return val
 }
 
+// getList объединяет значения как из списков list key 'val', так и из одиночных многострочных option key 'val1\nval2'
 func (c *uciCache) getList(key string) []string {
+	var result []string
+
+	// 1. Проверяем элементы list
 	if list, ok := c.lists[key]; ok && len(list) > 0 {
-		clean := make([]string, 0, len(list))
 		for _, item := range list {
-			token := sanitizeToken(item)
-			if token != "" {
-				clean = append(clean, token)
-			}
+			tokens := parseTextLines(item)
+			result = append(result, tokens...)
 		}
-		return clean
 	}
+
+	// 2. Проверяем одиночные параметры option с многострочным текстом
 	if val, ok := c.scalars[key]; ok && strings.TrimSpace(val) != "" {
-		fields := strings.Fields(val)
-		clean := make([]string, 0, len(fields))
-		for _, f := range fields {
-			token := sanitizeToken(f)
-			if token != "" {
-				clean = append(clean, token)
+		tokens := parseTextLines(val)
+		result = append(result, tokens...)
+	}
+
+	// Дедупликация с сохранением порядка
+	if len(result) > 0 {
+		seen := make(map[string]bool)
+		unique := make([]string, 0, len(result))
+		for _, item := range result {
+			if !seen[item] {
+				seen[item] = true
+				unique = append(unique, item)
 			}
 		}
-		return clean
+		return unique
 	}
+
 	return nil
 }
 
@@ -246,28 +300,22 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 
 	rawRuleSets := cache.getList("cheburnet.main.rulesets")
 	if len(rawRuleSets) > 0 {
-		cleanSets := make([]string, 0, len(rawRuleSets))
-		for _, rs := range rawRuleSets {
-			c := sanitizeToken(rs)
-			if c != "" {
-				cleanSets = append(cleanSets, c)
-			}
-		}
-		cfg.RuleSets = cleanSets
+		cfg.RuleSets = rawRuleSets
 	} else {
 		cfg.RuleSets = []string{"russia_inside", "youtube", "meta", "telegram", "google_ai"}
 	}
 
 	cfg.CustomSRSRulesets = parseCustomSRSRules(cache.getList("cheburnet.main.custom_srs_rulesets"))
-	cfg.CustomDomains = parseTextLines(cache.get("cheburnet.main.custom_domains", ""))
-	cfg.CustomSubnets = parseTextLines(cache.get("cheburnet.main.custom_subnets", ""))
-	cfg.CustomPorts = parseTextLines(cache.get("cheburnet.main.custom_ports", ""))
+
+	// Поддержка как list custom_domains, так и option custom_domains с многострочным вводом
+	cfg.CustomDomains = cache.getList("cheburnet.main.custom_domains")
+	cfg.CustomSubnets = cache.getList("cheburnet.main.custom_subnets")
+	cfg.CustomPorts = cache.getList("cheburnet.main.custom_ports")
 	cfg.LocalListFiles = cache.getList("cheburnet.main.local_list_files")
 
 	return cfg, nil
 }
 
-// SaveCoreSettings фиксирует на диске только структурные и системные параметры, исключая перезапись динамических серверов
 func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("cannot persist nil config")

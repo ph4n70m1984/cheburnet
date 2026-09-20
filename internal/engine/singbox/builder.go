@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,6 +28,46 @@ func NewBuilder() *Builder {
 		rulesLoader:    network.NewCompressedRulesetLoader(),
 		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
+}
+
+func cleanTokens(items []string) []string {
+	var res []string
+	for _, item := range items {
+		lines := strings.FieldsFunc(item, func(r rune) bool {
+			return r == '\n' || r == '\r' || r == ' ' || r == '\t' || r == ','
+		})
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			l = strings.Trim(l, "'\"`")
+			if l != "" {
+				res = append(res, l)
+			}
+		}
+	}
+	return res
+}
+
+func detectSingBoxVersion() (major, minor, patch int) {
+	out, err := exec.Command("sing-box", "version").Output()
+	if err != nil {
+		return 1, 12, 0
+	}
+
+	fields := strings.Fields(string(out))
+	if len(fields) >= 3 {
+		rawVer := strings.TrimPrefix(fields[2], "v")
+		parts := strings.Split(rawVer, ".")
+		if len(parts) >= 2 {
+			major, _ = strconv.Atoi(parts[0])
+			minor, _ = strconv.Atoi(parts[1])
+			if len(parts) >= 3 {
+				subParts := strings.Split(parts[2], "-")
+				patch, _ = strconv.Atoi(subParts[0])
+			}
+			return major, minor, patch
+		}
+	}
+	return 1, 12, 0
 }
 
 func loadDHCPLeasesMap() map[string]string {
@@ -52,12 +94,7 @@ func parsePortsAndRanges(rawPorts []string) ([]uint16, []string) {
 	var singlePorts []uint16
 	var portRanges []string
 
-	for _, p := range rawPorts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-
+	for _, p := range cleanTokens(rawPorts) {
 		if strings.Contains(p, ":") || strings.Contains(p, "-") {
 			normalized := strings.ReplaceAll(p, "-", ":")
 			parts := strings.Split(normalized, ":")
@@ -141,7 +178,6 @@ func mapToSRSName(rs string) string {
 }
 
 func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
-	// Привязка контроллера ко всем интерфейсам (доступен как для 127.0.0.1, так и для LAN)
 	clashController := "0.0.0.0:9090"
 
 	remoteDNSType := "udp"
@@ -231,6 +267,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	dnsRuleSetList := append([]string(nil), allRuleSets...)
 	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
 
+	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
+
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
@@ -238,10 +276,10 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	} else {
 		var fakeipDomains []string
-		fakeipDomains = append(fakeipDomains, cfg.CustomDomains...)
+		fakeipDomains = append(fakeipDomains, cleanCustomDomains...)
 		for _, rp := range cfg.RoutePolicies {
 			if rp.Enabled && len(rp.Domains) > 0 {
-				fakeipDomains = append(fakeipDomains, rp.Domains...)
+				fakeipDomains = append(fakeipDomains, cleanTokens(rp.Domains)...)
 			}
 		}
 
@@ -354,18 +392,21 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
+	major, minor, _ := detectSingBoxVersion()
+
 	var allNodeTags []string
 	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutbound(node)
+		ob, err := b.buildNodeOutbound(node, major, minor)
 		if err == nil {
 			outbounds = append(outbounds, ob)
 			allNodeTags = append(allNodeTags, node.Tag)
+		} else {
+			log.Printf("[builder] WARN: Skipping node '%s': %v", node.Tag, err)
 		}
 	}
 
 	activeOutboundTag := "direct-out"
 
-	// Значения параметров urltest по умолчанию из секции config.main
 	globalURLTestInterval := strings.TrimSpace(cfg.URLTestInterval)
 	if globalURLTestInterval == "" {
 		globalURLTestInterval = "3m"
@@ -383,6 +424,20 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
+			var validGrpNodes []string
+			for _, gn := range grp.Nodes {
+				for _, at := range allNodeTags {
+					if gn == at {
+						validGrpNodes = append(validGrpNodes, gn)
+						break
+					}
+				}
+			}
+
+			if len(validGrpNodes) == 0 {
+				continue
+			}
+
 			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
 
 			interval := grp.Interval
@@ -403,7 +458,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":                        "urltest",
 				"tag":                         urltestTag,
-				"outbounds":                   grp.Nodes,
+				"outbounds":                   validGrpNodes,
 				"url":                         targetURL,
 				"interval":                    interval,
 				"tolerance":                   tolerance,
@@ -411,7 +466,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"interrupt_exist_connections": false,
 			})
 
-			selectorList := append([]string{urltestTag}, grp.Nodes...)
+			selectorList := append([]string{urltestTag}, validGrpNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":      "selector",
 				"tag":       grp.Tag,
@@ -503,7 +558,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if activeOutboundTag != "direct-out" {
-		// Обязательный маршрут: весь FakeIP-пул перенаправляем в прокси
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":   "route",
 			"inbound":  []string{"tproxy-in"},
@@ -523,7 +577,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					continue
 				}
 
-				totalPolicySubnets := append([]string(nil), rp.Subnets...)
+				totalPolicySubnets := append([]string(nil), cleanTokens(rp.Subnets)...)
 				var policyRuleSets []string
 				hasPolicyTelegram := false
 
@@ -554,11 +608,12 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					})
 				}
 
-				if len(rp.Domains) > 0 {
+				rpDomains := cleanTokens(rp.Domains)
+				if len(rpDomains) > 0 {
 					routeRules = append(routeRules, map[string]interface{}{
 						"action":        "route",
 						"inbound":       []string{"tproxy-in"},
-						"domain_suffix": rp.Domains,
+						"domain_suffix": rpDomains,
 						"outbound":      rp.Outbound,
 					})
 				}
@@ -573,7 +628,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 			}
 
-			totalSubnets := append([]string(nil), cfg.CustomSubnets...)
+			totalSubnets := append([]string(nil), cleanTokens(cfg.CustomSubnets)...)
 			var defaultRuleSets []string
 			hasDiscord := false
 			hasTelegram := false
@@ -638,11 +693,11 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 			}
 
-			if len(cfg.CustomDomains) > 0 {
+			if len(cleanCustomDomains) > 0 {
 				routeRules = append(routeRules, map[string]interface{}{
 					"action":        "route",
 					"inbound":       []string{"tproxy-in"},
-					"domain_suffix": cfg.CustomDomains,
+					"domain_suffix": cleanCustomDomains,
 					"outbound":      activeOutboundTag,
 				})
 			}
@@ -721,7 +776,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		"default_mark":            2097152,
 	}
 
-	// Экономия памяти и CPU роутера
 	data, err := json.Marshal(sbConfig)
 	if err != nil {
 		return fmt.Errorf("marshal sing-box config: %w", err)
@@ -738,7 +792,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.Rename(tmpPath, outputPath)
 }
 
-func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
+func (b *Builder) buildNodeOutbound(node *config.GenericNode, sbMajor, sbMinor int) (map[string]interface{}, error) {
 	out := map[string]interface{}{
 		"tag":         node.Tag,
 		"server":      node.Address,
@@ -774,18 +828,22 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 		}
 		out["tls"] = tlsMap
 
-		if node.Network == "ws" {
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "ws" || netType == "websocket" {
 			out["transport"] = map[string]interface{}{
 				"type":    "ws",
 				"path":    node.Path,
 				"headers": map[string]string{"Host": node.Host},
 			}
-		} else if node.Network == "grpc" {
+		} else if netType == "grpc" {
 			out["transport"] = map[string]interface{}{
 				"type":         "grpc",
 				"service_name": node.Path,
 			}
-		} else if node.Network == "xhttp" || node.Network == "splithttp" {
+		} else if netType == "xhttp" || netType == "splithttp" {
+			if sbMajor < 1 || (sbMajor == 1 && sbMinor < 13) {
+				return nil, fmt.Errorf("unsupported transport 'xhttp': current sing-box is %d.%d (requires >= 1.13)", sbMajor, sbMinor)
+			}
 			path := node.Path
 			if path == "" {
 				path = "/"
