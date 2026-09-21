@@ -120,6 +120,10 @@ func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason s
 	c.groupSwitchMu.Lock()
 	defer c.groupSwitchMu.Unlock()
 
+	if c.prober == nil {
+		return ErrClashAPINotConfigured
+	}
+
 	c.mu.RLock()
 	current := c.activeGroup
 	targetNodes := c.classifiedPool[targetGroup]
@@ -134,14 +138,8 @@ func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason s
 	}
 
 	bestNodeTag := targetNodes[0].Tag
-	if c.prober != nil {
-		if cachedBest := c.prober.getCachedNode(targetNodes); cachedBest != nil {
-			bestNodeTag = cachedBest.Tag
-		}
-	}
-
-	if c.prober == nil {
-		return ErrClashAPINotConfigured
+	if cachedBest := c.prober.getCachedNode(targetNodes); cachedBest != nil {
+		bestNodeTag = cachedBest.Tag
 	}
 
 	switchCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
