@@ -44,6 +44,21 @@ var (
 	lastKnownActiveNodeMu sync.RWMutex
 )
 
+func initTimezone() {
+	if tzBytes, err := os.ReadFile("/etc/TZ"); err == nil {
+		tzStr := strings.TrimSpace(string(tzBytes))
+		if tzStr != "" {
+			_ = os.Setenv("TZ", tzStr)
+			if loc, locErr := time.LoadLocation(tzStr); locErr == nil {
+				time.Local = loc
+			} else {
+				// Если zoneinfo отсутствует в OpenWrt, парсим смещение вручную
+				time.Local = time.FixedZone(tzStr, 3*3600)
+			}
+		}
+	}
+}
+
 type diagReporterAdapter struct {
 	diag *diagnostics.DiagnosticsEngine
 }
@@ -179,6 +194,8 @@ func isMixedProxyAlive(mixedPort int) bool {
 }
 
 func main() {
+	initTimezone()
+
 	if len(os.Args) < 2 {
 		showHelp()
 		os.Exit(0)

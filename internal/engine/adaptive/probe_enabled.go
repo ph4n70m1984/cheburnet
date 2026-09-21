@@ -213,7 +213,12 @@ func (p *Prober) doProbe(ctx context.Context, nodes []*config.GenericNode) *Node
 	observePhase("l3", time.Since(startL3))
 
 	p.updateCache(winner)
-	p.logSelection(winner, "L3-winner")
+
+	stage := "L3-winner"
+	if winner.L3Score <= 0 {
+		stage = "L2-fallback"
+	}
+	p.logSelection(winner, stage)
 	return winner
 }
 
@@ -445,6 +450,11 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 	valid := make([]*NodeMetrics, 0, len(candidates))
 	sem := make(chan struct{}, l2Concurrency)
 
+	baseURL := strings.TrimRight(p.clashAPI, "/")
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		baseURL = "http://" + baseURL
+	}
+
 	for _, cand := range candidates {
 		wg.Add(1)
 		go func(c *NodeMetrics) {
@@ -457,17 +467,37 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 				return
 			}
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://cp.cloudflare.com/generate_204", nil)
+			// Запрашиваем реальный L7 RTT через ядро sing-box для конкретной ноды
+			testEndpoint := fmt.Sprintf("%s/proxies/%s/delay?url=http://cp.cloudflare.com/generate_204&timeout=2500",
+				baseURL, url.PathEscape(c.Tag))
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, testEndpoint, nil)
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", probeUserAgent)
 
-			start := time.Now()
-			resp, err := p.probeClient.Do(req)
-			if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent) {
-				_ = resp.Body.Close()
-				c.HTTPRTT = time.Since(start)
+			p.mu.RLock()
+			sec := p.secret
+			p.mu.RUnlock()
+			if sec != "" {
+				req.Header.Set("Authorization", "Bearer "+sec)
+			}
+
+			resp, err := p.apiClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				return // Узел не смог прокачать трафик или упал по таймауту в sing-box
+			}
+
+			var res struct {
+				Delay int `json:"delay"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Delay > 0 {
+				c.HTTPRTT = time.Duration(res.Delay) * time.Millisecond
 
 				mu.Lock()
 				valid = append(valid, c)
@@ -490,6 +520,7 @@ func (p *Prober) benchmarkLevel3Speed(ctx context.Context, finalists []*NodeMetr
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	// По умолчанию лучший — первый по результатам L2 (минимальный HTTP RTT)
 	bestNode := finalists[0]
 	maxL3Score := -1.0
 
@@ -498,7 +529,8 @@ func (p *Prober) benchmarkLevel3Speed(ctx context.Context, finalists []*NodeMetr
 		go func(c *NodeMetrics) {
 			defer wg.Done()
 
-			tCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			// Увеличиваем таймаут до 2500ms, чтобы отдаленные ноды успевали поднять TLS
+			tCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 			defer cancel()
 
 			req, err := http.NewRequestWithContext(tCtx, http.MethodGet, "https://speed.cloudflare.com/__down?bytes=262144", nil)
@@ -540,8 +572,9 @@ func (p *Prober) benchmarkLevel3Speed(ctx context.Context, finalists []*NodeMetr
 
 	wg.Wait()
 
+	// Если ни один узел не отдал байты (блокировка эндпоинта или таймаут)
 	if maxL3Score <= 0 {
-		log.Printf("[adaptive] WARN: all L3 speed tests failed or timed out, keeping best L2 node '%s'", bestNode.Tag)
+		log.Printf("[adaptive] WARN: all L3 speed tests failed, falling back to L2 winner '%s'", bestNode.Tag)
 	}
 
 	return bestNode
