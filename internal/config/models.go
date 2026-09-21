@@ -5,35 +5,39 @@ import (
 	"strings"
 )
 
+// MainSelectorTag задает имя главного селектора прокси в sing-box.
+// Используется синхронно во всех билдерах (v12/v13/v14), StateController и AdaptiveWorker[cite: 10, 11].
+const MainSelectorTag = "PROXY"
+
 type ClientMode string
 
 const (
-	ClientModeRules     ClientMode = "rules"      // По спискам (стандартная фильтрация)
-	ClientModeFullProxy ClientMode = "full_proxy" // Всё в прокси (любой трафик в туннель)
-	ClientModeDirect    ClientMode = "direct"     // Прямой доступ (мимо всех прокси)
+	ClientModeRules     ClientMode = "rules"
+	ClientModeFullProxy ClientMode = "full_proxy"
+	ClientModeDirect    ClientMode = "direct"
 )
 
 type ClientPolicy struct {
 	Name    string     `json:"name"`
-	Target  string     `json:"target"` // IP или MAC
+	Target  string     `json:"target"`
 	Mode    ClientMode `json:"mode"`
 	Enabled bool       `json:"enabled"`
 }
 
 type RoutePolicy struct {
-	Name     string   `json:"name"`      // Название секции (например "ai" или "youtube")
-	Enabled  bool     `json:"enabled"`   // Включено/выключено
-	RuleSets []string `json:"rule_sets"` // Списки правил (.srs), например "google_ai"
-	Domains  []string `json:"domains"`   // Пользовательские домены
-	Subnets  []string `json:"subnets"`   // Пользовательские подсети
-	Outbound string   `json:"outbound"`  // Тег ноды выхода (например "RU-001-1 (vless)" или "AUTO")
+	Name     string   `json:"name"`
+	Enabled  bool     `json:"enabled"`
+	RuleSets []string `json:"rule_sets"`
+	Domains  []string `json:"domains"`
+	Subnets  []string `json:"subnets"`
+	Outbound string   `json:"outbound"`
 }
 
 type GenericNode struct {
 	Tag          string `json:"tag"`
 	Address      string `json:"address"`
 	Port         int    `json:"port"`
-	Protocol     string `json:"protocol"` // "vless", "shadowsocks", "trojan", "socks", "hysteria2"
+	Protocol     string `json:"protocol"`
 	Method       string `json:"method,omitempty"`
 	UUID         string `json:"uuid,omitempty"`
 	Password     string `json:"password,omitempty"`
@@ -71,10 +75,10 @@ type SubscriptionConfig struct {
 	UserAgent      string           `json:"user_agent"`
 	HWID           string           `json:"hwid,omitempty"`
 	Enabled        bool             `json:"enabled"`
-	FilterMode     string           `json:"filter_mode,omitempty"`     // "exclude" (Blacklist) или "include" (Whitelist)
-	ExcludeRegex   []string         `json:"exclude_regex,omitempty"`   // Регулярные выражения фильтра
-	CompiledRegex  []*regexp.Regexp `json:"-"`                         // Скомпилированные RegExp, не сериализуются в JSON
-	UpdateInterval string           `json:"update_interval,omitempty"` // "1h", "3h", "6h", "12h", "24h"
+	FilterMode     string           `json:"filter_mode,omitempty"`
+	ExcludeRegex   []string         `json:"exclude_regex,omitempty"`
+	CompiledRegex  []*regexp.Regexp `json:"-"`
+	UpdateInterval string           `json:"update_interval,omitempty"`
 }
 
 func (s *SubscriptionConfig) CompileFilters() {
@@ -93,21 +97,28 @@ func (s *SubscriptionConfig) CompileFilters() {
 type CustomSRSRule struct {
 	Name           string `json:"name"`
 	URL            string `json:"url"`
-	DownloadDetour string `json:"download_detour"` // "direct" или "proxy"
+	DownloadDetour string `json:"download_detour"`
 	Enabled        bool   `json:"enabled"`
 }
 
+type NodeFilterGroup struct {
+	Name     string   `json:"name"`
+	Regex    []string `json:"regex"`
+	Priority int      `json:"priority"`
+	Enabled  bool     `json:"enabled"`
+}
+
 type CheburConfig struct {
-	Engine                string               `json:"engine"`       // Всегда "sing-box"
-	RoutingMode           string               `json:"routing_mode"` // "rules" или "global"
+	Engine                string               `json:"engine"`
+	RoutingMode           string               `json:"routing_mode"`
 	SourceMode            string               `json:"source_mode"`
-	ConfigType            string               `json:"config_type"`       // "urltest", "manual", "adaptive"
-	AdaptiveInterval      string               `json:"adaptive_interval"` // "1m", "3m", "5m", "10m"
+	ConfigType            string               `json:"config_type"`
+	AdaptiveInterval      string               `json:"adaptive_interval"`
 	AutoHWID              bool                 `json:"auto_hwid"`
 	CustomHWID            string               `json:"custom_hwid"`
 	AutoUpdate            bool                 `json:"auto_update"`
-	UpdateChannel         string               `json:"update_channel"`          // "release" или "beta"
-	RulesetUpdateInterval string               `json:"ruleset_update_interval"` // "24h", "72h", "168h"
+	UpdateChannel         string               `json:"update_channel"`
+	RulesetUpdateInterval string               `json:"ruleset_update_interval"`
 	TProxyPort            int                  `json:"tproxy_port"`
 	DNSPort               int                  `json:"dns_port"`
 	MixedPort             int                  `json:"mixed_port"`
@@ -117,21 +128,28 @@ type CheburConfig struct {
 	BootstrapDNS          string               `json:"bootstrap_dns"`
 	DNSTTL                int                  `json:"dns_ttl"`
 	EnableYACD            bool                 `json:"enable_yacd"`
-	URLTestInterval       string               `json:"urltest_interval"`  // Интервал тестирования задержки (например, "3m")
-	URLTestTolerance      int                  `json:"urltest_tolerance"` // Допуск задержки в миллисекундах (например, 50)
-	URLTestURL            string               `json:"urltest_url"`       // URL проверки доступности (generate_204)
+	URLTestInterval       string               `json:"urltest_interval"`
+	URLTestTolerance      int                  `json:"urltest_tolerance"`
+	URLTestURL            string               `json:"urltest_url"`
 	Nodes                 []*GenericNode       `json:"nodes"`
 	Groups                []*BalancingGroup    `json:"groups"`
 	Subscriptions         []SubscriptionConfig `json:"subscriptions"`
 	ManualNodes           []string             `json:"manual_nodes"`
 	RuleSets              []string             `json:"rule_sets"`
-	CustomSRSRulesets     []CustomSRSRule      `json:"custom_srs_rulesets"` // Пользовательские бинарные SRS
-	CustomDomains         []string             `json:"custom_domains"`      // Введенные вручную домены
-	CustomSubnets         []string             `json:"custom_subnets"`      // Введенные вручную IP/CIDR
-	CustomPorts           []string             `json:"custom_ports"`        // Введенные вручную порты и диапазоны
-	LocalListFiles        []string             `json:"local_list_files"`    // Пути к .lst файлам на роутере
-	ClientPolicies        []ClientPolicy       `json:"client_policies"`     // Правила маршрутизации по клиентам
-	RoutePolicies         []RoutePolicy        `json:"route_policies"`      // Секции маршрутизации по сервисам
+	CustomSRSRulesets     []CustomSRSRule      `json:"custom_srs_rulesets"`
+	CustomDomains         []string             `json:"custom_domains"`
+	CustomSubnets         []string             `json:"custom_subnets"`
+	CustomPorts           []string             `json:"custom_ports"`
+	LocalListFiles        []string             `json:"local_list_files"`
+	ClientPolicies        []ClientPolicy       `json:"client_policies"`
+	RoutePolicies         []RoutePolicy        `json:"route_policies"`
+
+	NodeGroups         []NodeFilterGroup `json:"node_groups"`
+	ActiveGroup        string            `json:"active_group"`
+	AutoFallbackLTE    bool              `json:"auto_fallback_lte"`
+	ScheduleLTEEnabled bool              `json:"schedule_lte_enabled"`
+	ScheduleLTEStart   string            `json:"schedule_lte_start"`
+	ScheduleLTEEnd     string            `json:"schedule_lte_end"`
 
 	PublicSubEnabled bool   `json:"public_sub_enabled"`
 	PublicSubPort    int    `json:"public_sub_port"`
@@ -144,7 +162,6 @@ func (c *CheburConfig) Clone() *CheburConfig {
 	if c == nil {
 		return nil
 	}
-
 	cp := *c
 
 	if c.ManualNodes != nil {
@@ -224,6 +241,17 @@ func (c *CheburConfig) Clone() *CheburConfig {
 				rpCopy.Subnets = append([]string(nil), rp.Subnets...)
 			}
 			cp.RoutePolicies[i] = rpCopy
+		}
+	}
+
+	if c.NodeGroups != nil {
+		cp.NodeGroups = make([]NodeFilterGroup, len(c.NodeGroups))
+		for i, ng := range c.NodeGroups {
+			ngCopy := ng
+			if ng.Regex != nil {
+				ngCopy.Regex = append([]string(nil), ng.Regex...)
+			}
+			cp.NodeGroups[i] = ngCopy
 		}
 	}
 

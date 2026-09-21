@@ -33,7 +33,7 @@ const (
 	l4MaxLossRate   = 0.34
 	l4Concurrency   = 20
 	l2Concurrency   = 5
-	speedChunkSize  = 256 * 1024 // 256 KB
+	speedChunkSize  = 256 * 1024
 )
 
 var (
@@ -69,11 +69,11 @@ type NodeMetrics struct {
 	Tag        string        `json:"tag"`
 	Address    string        `json:"address"`
 	Port       int           `json:"port"`
-	RTT        time.Duration `json:"rtt_l4"`     // L4 TCP Handshake RTT
-	HTTPRTT    time.Duration `json:"rtt_http"`   // L7 HTTP Response RTT
-	Jitter     time.Duration `json:"jitter"`     // RFC 3550 Jitter
-	LossRate   float64       `json:"loss_rate"`  // 0.0 - 1.0
-	Throughput float64       `json:"throughput"` // Байт/сек
+	RTT        time.Duration `json:"rtt_l4"`
+	HTTPRTT    time.Duration `json:"rtt_http"`
+	Jitter     time.Duration `json:"jitter"`
+	LossRate   float64       `json:"loss_rate"`
+	Throughput float64       `json:"throughput"`
 	L1Score    float64       `json:"l1_score"`
 	L3Score    float64       `json:"l3_score"`
 	IsFallback bool          `json:"is_fallback"`
@@ -239,7 +239,6 @@ func (p *Prober) SwitchOutbound(ctx context.Context, selector, nodeTag string) e
 	}
 	endpoint := fmt.Sprintf("%s/proxies/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(selector))
 
-	// Корректный JSON маршалинг с сохранением валидного UTF-8 для sing-box (без некорректных \U escape-последовательностей)
 	payload, err := json.Marshal(map[string]string{
 		"name": nodeTag,
 	})

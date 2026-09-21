@@ -489,6 +489,7 @@ return view.extend({
         s.addremove = false;
 
         s.tab('general', _('Прокси и ядро'));
+        s.tab('sentinel', _('Защита от глушения (LTE / Блокировки)'));
         s.tab('routing_rules', _('Маршрутизация списков'));
         s.tab('dns_settings', _('Настройки DNS и сети'));
 
@@ -542,9 +543,9 @@ return view.extend({
 
         o = s.taboption('general', form.Value, 'urltest_url', _('URLTest ссылка для проверки'));
         o.depends('config_type', 'urltest');
+        o.value('http://cp.cloudflare.com/generate_204', 'Cloudflare 204');
         o.value('https://www.gstatic.com/generate_204', 'Google 204');
-        o.value('https://cp.cloudflare.com/generate_204', 'Cloudflare 204');
-        o.default = 'https://www.gstatic.com/generate_204';
+        o.default = 'http://cp.cloudflare.com/generate_204';
 
         o = s.taboption('general', form.Flag, 'auto_hwid', _('Автоматический HWID (MAC-bound)'));
         o.default = '1';
@@ -595,6 +596,34 @@ return view.extend({
             });
         };
 
+        // --- ВКЛАДКА ЗАЩИТЫ ОТ ГЛУШЕНИЯ И БЕЛЫХ СПИСКОВ (SENTINEL) ---
+        o = s.taboption('sentinel', form.ListValue, 'active_group', _('Принудительная группа нод'));
+        o.description = _('Ручной выбор группы серверов отключает автоматический переход (Auto-Fallback) до сброса параметра в "Все доступные серверы (auto)".');
+        o.value('auto', _('Все доступные серверы (auto)'));
+        o.value('general', _('Обычные (Экономия трафика / День)'));
+        o.value('lte', _('LTE / Белые списки (Ночь / Блокировки)'));
+        o.value('game', _('Игровые (Низкий RTT)'));
+        o.default = 'auto';
+
+        o = s.taboption('sentinel', form.Flag, 'auto_fallback_lte', _('Аварийный переход на LTE при глушении (Sentinel)'));
+        o.description = _('Двухканальное зондирование: автоматически переключает маршрут на серверы белых списков (LTE), когда внешний интернет блокируют.');
+        o.default = '1';
+
+        o = s.taboption('sentinel', form.Flag, 'schedule_lte_enabled', _('Переключение на LTE по расписанию'));
+        o.description = _('Принудительно переключает на LTE-группу в заданный промежуток времени (например, при ночных глушениях). Переход по расписанию срабатывает мгновенно.');
+        o.default = '0';
+
+        o = s.taboption('sentinel', form.Value, 'schedule_lte_start', _('Время начала LTE (ЧЧ:ММ)'));
+        o.depends('schedule_lte_enabled', '1');
+        o.placeholder = '21:00';
+        o.default = '21:00';
+
+        o = s.taboption('sentinel', form.Value, 'schedule_lte_end', _('Время окончания LTE (ЧЧ:ММ)'));
+        o.depends('schedule_lte_enabled', '1');
+        o.placeholder = '07:00';
+        o.default = '07:00';
+
+        // --- ВКЛАДКА МАРШРУТИЗАЦИИ СПИСКОВ ---
         o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
         o.value('24h', _('24 часа (каждый день)'));
         o.value('72h', _('72 часа (раз в 3 дня)'));
@@ -617,6 +646,7 @@ return view.extend({
         o = s.taboption('routing_rules', form.TextValue, 'custom_ports', _('Список портов'));
         o.rows = 4;
 
+        // --- ВКЛАДКА НАСТРОЕК DNS ---
         o = s.taboption('dns_settings', form.ListValue, 'dns_protocol', _('Протокол DNS'));
         o.value('doh', 'DoH');
         o.value('dot', 'DoT');
@@ -730,7 +760,37 @@ return view.extend({
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg/apk.');
         o.default = '0';
 
-        // --- 3. СЕКЦИЯ ПОДПИСОК ---
+        // --- 3. СЕКЦИЯ ГРУПП КЛАССИФИКАЦИИ СЕРВЕРОВ (NODE GROUPS) ---
+        var groupSec = m.section(form.GridSection, 'node_group', _('Группы классификации серверов (Node Groups)'));
+        groupSec.anonymous = true;
+        groupSec.addremove = true;
+        groupSec.sortable = true;
+
+        o = groupSec.option(form.Flag, 'enabled', _('Вкл'));
+        o.default = '1';
+        o.editable = true;
+
+        o = groupSec.option(form.Value, 'name', _('Имя группы'));
+        o.placeholder = 'lte / game / message';
+        o.validate = function(section_id, value) {
+            if (!value || !/^[a-z0-9_-]{1,32}$/.test(value)) {
+                return _('Имя группы должно содержать от 1 до 32 символов (строчные латинские буквы, цифры, тире или подчёркивание)');
+            }
+            return true;
+        };
+        o.editable = true;
+
+        o = groupSec.option(form.Value, 'priority', _('Приоритет'));
+        o.datatype = 'integer';
+        o.default = '50';
+        o.editable = true;
+        o.description = _('Чем выше число, тем раньше проверяются регулярные выражения группы.');
+
+        o = groupSec.option(form.DynamicList, 'regex', _('Регулярные выражения (RegExp)'));
+        o.placeholder = '(?i)(lte|white|ru-direct)';
+        o.editable = true;
+
+        // --- 4. СЕКЦИЯ ПОДПИСОК ---
         var subSec = m.section(form.GridSection, 'subscription', _('Таблица ссылок подписок'));
         subSec.anonymous = true;
         subSec.addremove = true;
@@ -778,7 +838,7 @@ return view.extend({
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
         o.modalonly = true;
 
-        // --- 4. СЕКЦИЯ ПОЛИТИК УСТРОЙСТВ ---
+        // --- 5. СЕКЦИЯ ПОЛИТИК УСТРОЙСТВ ---
         var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'));
         clientSec.anonymous = true;
         clientSec.addremove = true;
@@ -808,7 +868,7 @@ return view.extend({
         o.default = 'rules';
         o.editable = true;
 
-        // --- 5. СЕКЦИЯ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
+        // --- 6. СЕКЦИЯ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
         var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'));
         routeSec.anonymous = true;
         routeSec.addremove = true;
@@ -880,12 +940,7 @@ return view.extend({
                     ])
                 ]);
 
-                if (!isMain) {
-                    details.open = false;
-                } else {
-                    details.open = false;
-                }
-
+                details.open = false;
                 titleEl.style.display = 'none';
 
                 var bodyWrapper = E('div', { 'style': 'margin-top: 10px;' });

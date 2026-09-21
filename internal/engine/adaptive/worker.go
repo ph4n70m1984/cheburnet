@@ -12,13 +12,15 @@ import (
 type Worker struct {
 	state       *config.StateManager
 	prober      *Prober
+	controller  *StateController
 	triggerChan chan struct{}
 }
 
-func NewWorker(state *config.StateManager, prober *Prober) *Worker {
+func NewWorker(state *config.StateManager, prober *Prober, controller *StateController) *Worker {
 	return &Worker{
 		state:       state,
 		prober:      prober,
+		controller:  controller,
 		triggerChan: make(chan struct{}, 1),
 	}
 }
@@ -31,7 +33,6 @@ func parseInterval(raw string, def time.Duration) time.Duration {
 	return d
 }
 
-// Trigger форсирует немедленный запуск замера (например, после reload из LuCI)
 func (w *Worker) Trigger() {
 	select {
 	case w.triggerChan <- struct{}{}:
@@ -39,17 +40,16 @@ func (w *Worker) Trigger() {
 	}
 }
 
-// Start запускает цикл супервизора, полностью синхронизированный с состоянием UCI
 func (w *Worker) Start(ctx context.Context) {
 	if !IsEnabled() {
 		return
 	}
 
-	// Пауза перед первым прогоном после запуска демона
+	log.Println("[adaptive-worker] Supervisor started. Waiting 5s for engine warm-up...")
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 	}
 
 	w.checkAndSwitch(ctx)
@@ -73,19 +73,47 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 func (w *Worker) checkAndSwitch(ctx context.Context) {
-	cfg := w.state.Get()
-
-	// Работаем строго тогда, когда в UCI выбран режим 'adaptive'
-	if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "adaptive" || len(cfg.Nodes) == 0 {
+	if w.prober == nil {
 		return
 	}
 
-	best := w.prober.SelectBestNode(ctx, cfg.Nodes)
+	cfg := w.state.Get()
+	if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "adaptive" {
+		return
+	}
+
+	groupName, groupNodes := w.controller.GetActiveGroupNodes()
+	if len(groupNodes) == 0 {
+		return
+	}
+
+	w.prober.SetSecret(cfg.ClashAPISecret)
+
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	best := w.prober.SelectBestNode(probeCtx, groupNodes)
 	if best == nil || best.Tag == "" {
 		return
 	}
 
-	if err := w.prober.SwitchOutbound(ctx, "PROXY", best.Tag); err != nil {
+	w.controller.groupSwitchMu.Lock()
+	defer w.controller.groupSwitchMu.Unlock()
+
+	currentGrp, _ := w.controller.GetActiveGroupNodes()
+	if currentGrp != groupName {
+		log.Printf("[adaptive-worker] Aborting: group transitioned during probe (%s -> %s)", groupName, currentGrp)
+		return
+	}
+
+	switchCtx, cancelSwitch := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancelSwitch()
+
+	if err := w.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, best.Tag); err != nil {
 		log.Printf("[adaptive-worker] Failed to switch outbound to '%s': %v", best.Tag, err)
+	} else {
+		w.controller.mu.Lock()
+		w.controller.lastActiveNode = best.Tag
+		w.controller.mu.Unlock()
 	}
 }

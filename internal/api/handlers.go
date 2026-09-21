@@ -72,7 +72,7 @@ func (s *Server) getRealActiveNode(ctx context.Context, defaultTag string) strin
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/PROXY", nil)
+	resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/"+config.MainSelectorTag, nil)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			_ = resp.Body.Close()
@@ -122,12 +122,13 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{
-		"engine":      "sing-box",
-		"nodes_count": len(cfg.Nodes),
-		"active_node": activeNode,
-		"auto_hwid":   cfg.AutoHWID,
-		"custom_hwid": cfg.CustomHWID,
-		"outbound_ip": outboundIP,
+		"engine":       "sing-box",
+		"nodes_count":  len(cfg.Nodes),
+		"active_node":  activeNode,
+		"active_group": cfg.ActiveGroup,
+		"auto_hwid":    cfg.AutoHWID,
+		"custom_hwid":  cfg.CustomHWID,
+		"outbound_ip":  outboundIP,
 		"features": fiber.Map{
 			"public_sub":     HasPublicSubFeature,
 			"adaptive_probe": adaptive.IsEnabled(),
@@ -206,7 +207,6 @@ func (s *Server) handleGetNodes(c *fiber.Ctx) error {
 	for _, n := range cfg.Nodes {
 		d := latencies[n.Tag]
 
-		// Если в адаптивном режиме ядро не заполняет history, берем реальный RTT из Prober
 		if d == 0 && isAdaptive && s.adaptiveProber != nil {
 			if m := s.adaptiveProber.GetNodeMetric(n.Tag); m != nil && m.RTT > 0 {
 				d = int(m.RTT.Milliseconds())
@@ -250,7 +250,7 @@ func (s *Server) handleSelectNode(c *fiber.Ctx) error {
 	reqCtx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
 	defer cancel()
 
-	resp, err := s.clashRequest(reqCtx, http.MethodPut, "/proxies/PROXY", payload)
+	resp, err := s.clashRequest(reqCtx, http.MethodPut, "/proxies/"+config.MainSelectorTag, payload)
 	if err != nil {
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to reach sing-box API: " + err.Error()})
 	}
@@ -590,7 +590,6 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 		name = unquoted
 	}
 
-	// 1. Если адаптивный пробер уже имеет актуальный замер для этой ноды — отдаем моментально
 	if s.adaptiveProber != nil {
 		if m := s.adaptiveProber.GetNodeMetric(name); m != nil && m.RTT > 0 {
 			d := int(m.RTT.Milliseconds())
@@ -623,7 +622,7 @@ func (s *Server) handleProxyDelay(c *fiber.Ctx) error {
 
 		targetGroup := "auto"
 		if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "urltest" {
-			targetGroup = "PROXY"
+			targetGroup = config.MainSelectorTag
 		}
 
 		resp, err := s.clashRequest(reqCtx, http.MethodGet, "/proxies/"+targetGroup, nil)

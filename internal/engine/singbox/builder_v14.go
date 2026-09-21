@@ -394,9 +394,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	} else if len(allNodeTags) > 0 {
 		urltestTag := "auto"
-		selectorTag := "PROXY"
+		selectorTag := config.MainSelectorTag
 
-		// urltest ВСЕГДА присутствует в ядре для автоматического наполнения истории задержек в Clash API
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":                        "urltest",
 			"tag":                         urltestTag,
@@ -416,7 +415,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"default":   urltestTag,
 			})
 		} else {
-			// В адаптивном режиме PROXY содержит только реальные узлы и переключается cheburnetd
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":      "selector",
 				"tag":       selectorTag,
@@ -502,8 +500,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				}
 
 				targetOutbound := rp.Outbound
-				if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
-					targetOutbound = "PROXY"
+				if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, config.MainSelectorTag)) && configType != "urltest" {
+					targetOutbound = config.MainSelectorTag
 				}
 
 				totalPolicySubnets := append([]string(nil), cleanTokens(rp.Subnets)...)

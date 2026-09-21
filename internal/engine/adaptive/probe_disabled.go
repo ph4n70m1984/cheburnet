@@ -12,6 +12,10 @@ import (
 
 var ErrClashAPINotConfigured = errors.New("clash api endpoint is not configured")
 
+func IsEnabled() bool {
+	return false
+}
+
 type NodeMetrics struct {
 	Tag        string        `json:"tag"`
 	Address    string        `json:"address"`
@@ -28,10 +32,6 @@ type NodeMetrics struct {
 
 type Prober struct{}
 
-func IsEnabled() bool {
-	return false
-}
-
 func NewProber(clashAPI string, secret string) *Prober {
 	_, _ = clashAPI, secret
 	return &Prober{}
@@ -40,6 +40,10 @@ func NewProber(clashAPI string, secret string) *Prober {
 func (p *Prober) SetSecret(secret string) {}
 
 func (p *Prober) GetNodeMetric(tag string) *NodeMetrics {
+	return nil
+}
+
+func (p *Prober) getCachedNode(nodes []*config.GenericNode) *NodeMetrics {
 	return nil
 }
 

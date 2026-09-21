@@ -28,6 +28,15 @@ func sanitizeToken(s string) string {
 	return strings.TrimSpace(s)
 }
 
+func unquoteUCIValue(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && ((s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"')) {
+		s = s[1 : len(s)-1]
+	}
+	s = strings.ReplaceAll(s, "'\\''", "'")
+	return strings.TrimSpace(s)
+}
+
 func parseTextLines(raw string) []string {
 	var result []string
 	scanner := bufio.NewScanner(strings.NewReader(raw))
@@ -220,6 +229,69 @@ func (c *uciCache) getList(key string) []string {
 	return nil
 }
 
+func (u *UCIStorage) parseNodeGroupSections(rawShow string) []NodeFilterGroup {
+	var groups []NodeFilterGroup
+	secMap := make(map[string]*NodeFilterGroup)
+	scanner := bufio.NewScanner(strings.NewReader(rawShow))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "cheburnet.@node_group[") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		keyParts := strings.Split(parts[0], ".")
+		if len(keyParts) < 3 {
+			continue
+		}
+
+		secID := keyParts[1]
+		val := parts[1]
+
+		if _, ok := secMap[secID]; !ok {
+			secMap[secID] = &NodeFilterGroup{
+				Enabled:  true,
+				Priority: 0,
+			}
+		}
+
+		propName := keyParts[2]
+		if idx := strings.Index(propName, "["); idx != -1 {
+			propName = propName[:idx]
+		}
+
+		cleanVal := sanitizeToken(val)
+
+		switch propName {
+		case "name":
+			secMap[secID].Name = cleanVal
+		case "priority":
+			if p, err := strconv.Atoi(cleanVal); err == nil {
+				secMap[secID].Priority = p
+			}
+		case "enabled":
+			secMap[secID].Enabled = (cleanVal == "1" || strings.EqualFold(cleanVal, "true"))
+		case "regex":
+			cleanRegex := unquoteUCIValue(val)
+			if cleanRegex != "" {
+				secMap[secID].Regex = append(secMap[secID].Regex, cleanRegex)
+			}
+		}
+	}
+
+	for _, g := range secMap {
+		if g.Name != "" && g.Enabled && len(g.Regex) > 0 {
+			groups = append(groups, *g)
+		}
+	}
+	return groups
+}
+
 func (u *UCIStorage) Load() (*CheburConfig, error) {
 	cache, err := loadUCICache("cheburnet")
 	if err != nil {
@@ -249,7 +321,13 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 
 		URLTestInterval:  cache.get("cheburnet.main.urltest_interval", "3m"),
 		URLTestTolerance: cache.getInt("cheburnet.main.urltest_tolerance", 50),
-		URLTestURL:       cache.get("cheburnet.main.urltest_url", "https://www.gstatic.com/generate_204"),
+		URLTestURL:       cache.get("cheburnet.main.urltest_url", "http://cp.cloudflare.com/generate_204"),
+
+		ActiveGroup:        cache.get("cheburnet.main.active_group", "auto"),
+		AutoFallbackLTE:    cache.get("cheburnet.main.auto_fallback_lte", "0") == "1",
+		ScheduleLTEEnabled: cache.get("cheburnet.main.schedule_lte_enabled", "0") == "1",
+		ScheduleLTEStart:   cache.get("cheburnet.main.schedule_lte_start", "21:00"),
+		ScheduleLTEEnd:     cache.get("cheburnet.main.schedule_lte_end", "07:00"),
 
 		PublicSubEnabled: cache.get("cheburnet.main.public_sub_enabled", "0") == "1",
 		PublicSubPort:    cache.getInt("cheburnet.main.public_sub_port", 9443),
@@ -266,6 +344,7 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		cfg.APIToken = generatedToken
 	}
 
+	cfg.NodeGroups = u.parseNodeGroupSections(cache.rawShow)
 	cfg.Subscriptions = u.parseSubscriptionSections(cache.rawShow)
 
 	if len(cfg.Subscriptions) == 0 {

@@ -85,23 +85,24 @@ func (a *diagReporterAdapter) ResolveProblem(id string) {
 }
 
 type App struct {
-	state          *config.StateManager
-	uciStorage     *config.UCIStorage
-	singboxEng     *engine.SingBoxEngine
-	activeEng      engine.Engine
-	hub            *telemetry.Hub
-	server         *api.Server
-	rulesLoader    *network.CompressedRulesetLoader
-	rulesCron      *network.RulesetCron
-	healthTracker  *engine.HealthTracker
-	diagEngine     *diagnostics.DiagnosticsEngine
-	rulesMgr       *ruleset.Manager
-	updManager     *updater.Manager
-	subWorker      *subscription.Worker
-	adaptiveWorker *adaptive.Worker
-	adaptiveProber *adaptive.Prober
-	mu             sync.RWMutex
-	engineOpMu     sync.Mutex
+	state           *config.StateManager
+	uciStorage      *config.UCIStorage
+	singboxEng      *engine.SingBoxEngine
+	activeEng       engine.Engine
+	hub             *telemetry.Hub
+	server          *api.Server
+	rulesLoader     *network.CompressedRulesetLoader
+	rulesCron       *network.RulesetCron
+	healthTracker   *engine.HealthTracker
+	diagEngine      *diagnostics.DiagnosticsEngine
+	rulesMgr        *ruleset.Manager
+	updManager      *updater.Manager
+	subWorker       *subscription.Worker
+	adaptiveWorker  *adaptive.Worker
+	adaptiveProber  *adaptive.Prober
+	stateController *adaptive.StateController
+	mu              sync.RWMutex
+	engineOpMu      sync.Mutex
 }
 
 func showHelp() {
@@ -368,7 +369,7 @@ func getRealActiveNode(clashSecret, fallback string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:9090/proxies/PROXY", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:9090/proxies/"+config.MainSelectorTag, nil)
 	if err != nil {
 		return cached
 	}
@@ -502,6 +503,11 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 
 	if _, err := a.state.Commit(candidate, false); err != nil {
 		log.Printf("[subscription-loop] WARN: Commit state returned unexpected error: %v", err)
+	}
+
+	if a.stateController != nil {
+		a.stateController.UpdatePool(candidate)
+		a.stateController.Reassert(ctx)
 	}
 
 	if a.adaptiveWorker != nil {
@@ -650,24 +656,30 @@ func runDaemon() {
 		}
 	}
 
-	// Инициализация на адаптивния модул и работника
 	prober := adaptive.NewProber("http://127.0.0.1:9090", initialConfig.ClashAPISecret)
-	adaptiveWorker := adaptive.NewWorker(state, prober)
+	if prober != nil {
+		prober.SetSecret(initialConfig.ClashAPISecret)
+	}
+
+	stateController := adaptive.NewStateController(state, prober)
+	adaptiveWorker := adaptive.NewWorker(state, prober, stateController)
+	sentinel := adaptive.NewCensorshipSentinel(state, stateController, initialConfig.MixedPort)
 
 	app := &App{
-		state:          state,
-		uciStorage:     uciStorage,
-		singboxEng:     sbEngine,
-		activeEng:      sbEngine,
-		hub:            hub,
-		rulesLoader:    rulesLoader,
-		healthTracker:  healthTracker,
-		diagEngine:     diagEngine,
-		rulesMgr:       rulesMgr,
-		updManager:     updManager,
-		subWorker:      subWorker,
-		adaptiveWorker: adaptiveWorker,
-		adaptiveProber: prober,
+		state:           state,
+		uciStorage:      uciStorage,
+		singboxEng:      sbEngine,
+		activeEng:       sbEngine,
+		hub:             hub,
+		rulesLoader:     rulesLoader,
+		healthTracker:   healthTracker,
+		diagEngine:      diagEngine,
+		rulesMgr:        rulesMgr,
+		updManager:      updManager,
+		subWorker:       subWorker,
+		adaptiveWorker:  adaptiveWorker,
+		adaptiveProber:  prober,
+		stateController: stateController,
 	}
 
 	sourceIface := initialConfig.SourceIface
@@ -721,8 +733,8 @@ func runDaemon() {
 		},
 	)
 
-	// Стартиране на фоновия адаптивен работник
 	go adaptiveWorker.Start(daemonCtx)
+	go sentinel.Start(daemonCtx)
 
 	go hub.Run(daemonCtx, app.getCurrentEngine, func() string {
 		cfg := app.state.Get()
@@ -779,7 +791,7 @@ func runDaemon() {
 		},
 	)
 	srv.SetAdaptiveWorker(adaptiveWorker)
-	srv.SetAdaptiveProber(prober) // Свързване на адаптивния модул към API
+	srv.SetAdaptiveProber(prober)
 	app.server = srv
 
 	go func() {
@@ -800,6 +812,10 @@ func runDaemon() {
 				if err := app.reloadActiveEngine(daemonCtx); err != nil {
 					log.Printf("[ERROR] SIGHUP soft reload failed: %v", err)
 				} else {
+					cfg := app.state.Get()
+					app.stateController.UpdatePool(&cfg)
+					app.stateController.Reassert(daemonCtx)
+					app.adaptiveWorker.Trigger()
 					log.Println("[INFO] SIGHUP soft reload completed successfully.")
 				}
 			}()
@@ -940,6 +956,11 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 		a.subWorker.StartSubscriptionLoops(ctx, candidate.Subscriptions, func(targetSub config.SubscriptionConfig) {
 			a.handleSubscriptionAutoUpdate(ctx, targetSub)
 		})
+	}
+
+	if a.stateController != nil {
+		a.stateController.UpdatePool(&candidate)
+		a.stateController.Reassert(ctx)
 	}
 
 	if a.adaptiveWorker != nil {
