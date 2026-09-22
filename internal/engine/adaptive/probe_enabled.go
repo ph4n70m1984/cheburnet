@@ -189,21 +189,24 @@ func (p *Prober) doProbe(ctx context.Context, nodes []*config.GenericNode) *Node
 	}
 
 	startL2 := time.Now()
-	top5 := p.filterLevel2HTTP(ctx, l4Candidates)
+	topL2 := p.filterLevel2HTTP(ctx, l4Candidates)
 	observePhase("l2", time.Since(startL2))
 
-	if len(top5) == 0 {
+	// Если ни один узел из кандидатов не прошел проверку через ядро sing-box
+	if len(topL2) == 0 {
 		winner := l4Candidates[0]
+		winner.IsFallback = true
 		p.logSelection(winner, "L1-fallback")
 		return winner
 	}
-	if len(top5) == 1 {
-		p.updateCache(top5[0])
-		p.logSelection(top5[0], "L2-single")
-		return top5[0]
+
+	if len(topL2) == 1 {
+		p.updateCache(topL2[0])
+		p.logSelection(topL2[0], "L2-single")
+		return topL2[0]
 	}
 
-	top3 := top5
+	top3 := topL2
 	if len(top3) > 3 {
 		top3 = top3[:3]
 	}
@@ -216,7 +219,7 @@ func (p *Prober) doProbe(ctx context.Context, nodes []*config.GenericNode) *Node
 
 	stage := "L3-winner"
 	if winner.L3Score <= 0 {
-		stage = "L2-fallback"
+		stage = "L2-winner"
 	}
 	p.logSelection(winner, stage)
 	return winner
@@ -372,8 +375,9 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 		return results[i].L1Score < results[j].L1Score
 	})
 
-	if len(results) > 5 {
-		return results[:5]
+	// Передаем в L2 до 15 кандидатов, чтобы исключить вытеснение живых нод быстрыми зомби-портами
+	if len(results) > 15 {
+		return results[:15]
 	}
 	return results
 }
@@ -467,7 +471,6 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 				return
 			}
 
-			// Запрашиваем реальный L7 RTT через ядро sing-box для конкретной ноды
 			testEndpoint := fmt.Sprintf("%s/proxies/%s/delay?url=http://cp.cloudflare.com/generate_204&timeout=2500",
 				baseURL, url.PathEscape(c.Tag))
 
@@ -490,7 +493,7 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				return // Узел не смог прокачать трафик или упал по таймауту в sing-box
+				return
 			}
 
 			var res struct {
@@ -517,65 +520,6 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 }
 
 func (p *Prober) benchmarkLevel3Speed(ctx context.Context, finalists []*NodeMetrics) *NodeMetrics {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	// По умолчанию лучший — первый по результатам L2 (минимальный HTTP RTT)
-	bestNode := finalists[0]
-	maxL3Score := -1.0
-
-	for _, cand := range finalists {
-		wg.Add(1)
-		go func(c *NodeMetrics) {
-			defer wg.Done()
-
-			// Увеличиваем таймаут до 2500ms, чтобы отдаленные ноды успевали поднять TLS
-			tCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
-			defer cancel()
-
-			req, err := http.NewRequestWithContext(tCtx, http.MethodGet, "https://speed.cloudflare.com/__down?bytes=262144", nil)
-			if err != nil {
-				return
-			}
-			req.Header.Set("User-Agent", probeUserAgent)
-
-			start := time.Now()
-			resp, err := p.probeClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-
-			lr := io.LimitReader(resp.Body, speedChunkSize)
-			n, copyErr := io.Copy(io.Discard, lr)
-			if copyErr != nil && copyErr != io.EOF {
-				return
-			}
-
-			dur := time.Since(start).Seconds()
-			if dur > 0 && n > 0 {
-				c.Throughput = float64(n) / dur
-
-				latencyPenalty := 1.0 + (float64(c.HTTPRTT.Milliseconds()) / 100.0)
-				c.L3Score = c.Throughput / latencyPenalty
-
-				mu.Lock()
-				p.latestPool[c.Tag] = c
-				if c.L3Score > maxL3Score {
-					maxL3Score = c.L3Score
-					bestNode = c
-				}
-				mu.Unlock()
-			}
-		}(cand)
-	}
-
-	wg.Wait()
-
-	// Если ни один узел не отдал байты (блокировка эндпоинта или таймаут)
-	if maxL3Score <= 0 {
-		log.Printf("[adaptive] WARN: all L3 speed tests failed, falling back to L2 winner '%s'", bestNode.Tag)
-	}
-
-	return bestNode
+	// Возвращаем лучшую ноду по подтвержденному L2 HTTP RTT
+	return finalists[0]
 }

@@ -17,11 +17,10 @@ import (
 )
 
 const (
-	RulesetDir = "/tmp/cheburnet/rulesets"
-	BackupDir  = "/tmp/cheburnet/rulesets/backup"
+	RulesetDir = "/etc/config/cheburnet/rulesets"
+	BackupDir  = "/etc/config/cheburnet/rulesets/backup"
 )
 
-// DiagnosticReporter позволяет избежать циклического импорта diagnostics
 type DiagnosticReporter interface {
 	ReportProblem(id, component, severity, message, action string, recoverable bool)
 	ResolveProblem(id string)
@@ -46,7 +45,6 @@ func NewManager(diag DiagnosticReporter, socksPort int) *Manager {
 	}
 }
 
-// MapToSRSName нормализует системные теги к именам файлов релиза itdoginfo
 func MapToSRSName(name string) string {
 	clean := strings.ToLower(strings.TrimSpace(name))
 	switch clean {
@@ -59,23 +57,36 @@ func MapToSRSName(name string) string {
 	}
 }
 
-// FetchSystemRuleSet скачивает выбранные системные категории (telegram, meta и др.) в /tmp/cheburnet/rulesets
 func (m *Manager) FetchSystemRuleSet(ruleSetName string) (string, error) {
 	srsName := MapToSRSName(ruleSetName)
 	if srsName == "" {
 		return "", fmt.Errorf("empty ruleset name")
 	}
 
-	fileName := fmt.Sprintf("%s.srs", srsName)
-	targetPath := filepath.Join(RulesetDir, fileName)
+	rawURL := fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName)
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(rawURL)))[:12]
+	hashedFileName := fmt.Sprintf("srs_%s.srs", hash)
+	hashedPath := filepath.Join(RulesetDir, hashedFileName)
+	systemPath := filepath.Join(RulesetDir, fmt.Sprintf("%s.srs", srsName))
 
-	// Если файл уже скачан и не пустой — отдаем локальный путь без повторного скачивания
-	if stat, err := os.Stat(targetPath); err == nil && stat.Size() > 0 {
-		return targetPath, nil
+	// 1. Проверяем наличие по хешированному пути, куда скачивает FetchRuleSet
+	if stat, err := os.Stat(hashedPath); err == nil && stat.Size() > 0 {
+		if _, sErr := os.Stat(systemPath); sErr != nil {
+			_ = copyFile(hashedPath, systemPath)
+		}
+		return hashedPath, nil
 	}
 
-	rawURL := fmt.Sprintf("https://github.com/itdoginfo/allow-domains/releases/latest/download/%s.srs", srsName)
-	return m.FetchRuleSet(srsName, rawURL, "direct")
+	// 2. Проверяем наличие по системному имени
+	if stat, err := os.Stat(systemPath); err == nil && stat.Size() > 0 {
+		return systemPath, nil
+	}
+
+	path, err := m.FetchRuleSet(srsName, rawURL, "direct")
+	if err == nil && path != "" {
+		_ = copyFile(path, systemPath)
+	}
+	return path, err
 }
 
 func (m *Manager) SyncAll(rules []config.CustomSRSRule) map[string]string {
@@ -86,6 +97,16 @@ func (m *Manager) SyncAll(rules []config.CustomSRSRule) map[string]string {
 			continue
 		}
 		tag := fmt.Sprintf("custom-srs-%d", idx+1)
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(r.URL)))[:12]
+		fileName := fmt.Sprintf("srs_%s.srs", hash)
+		targetPath := filepath.Join(RulesetDir, fileName)
+
+		// Кэш для пользовательских правил: исключаем повторный запрос при релоаде
+		if stat, err := os.Stat(targetPath); err == nil && stat.Size() > 0 {
+			resolvedPaths[tag] = targetPath
+			continue
+		}
+
 		log.Printf("[ruleset] Starting fetch for '%s' (%s) -> %s", r.Name, r.DownloadDetour, r.URL)
 
 		path, err := m.FetchRuleSet(r.Name, r.URL, r.DownloadDetour)

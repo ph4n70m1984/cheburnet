@@ -54,12 +54,14 @@ func VerifyTraffic(ctx context.Context, cfg *config.CheburConfig) error {
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
 		},
-		Timeout: 4 * time.Second,
+		Timeout: 3500 * time.Millisecond,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.gstatic.com/generate_204", nil)
+	// Используем стабильный Cloudflare 204 вместо подверженного блокировкам gstatic
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://cp.cloudflare.com/generate_204", nil)
 	if err != nil {
 		return err
 	}

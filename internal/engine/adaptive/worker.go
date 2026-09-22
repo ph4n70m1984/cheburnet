@@ -89,7 +89,8 @@ func (w *Worker) checkAndSwitch(ctx context.Context) {
 
 	w.prober.SetSecret(cfg.ClashAPISecret)
 
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Увеличиваем лимит времени на воронку замеров до 10 секунд
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	best := w.prober.SelectBestNode(probeCtx, groupNodes)

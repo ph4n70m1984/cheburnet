@@ -1205,7 +1205,11 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				log.Printf("[supervisor] L2 Warning: Proxy traffic test failed (%d/2): %v", l2Failures, err)
 				if l2Failures >= 2 {
 					l2Failures = 0
-					triggerRestart("L2_TRAFFIC_DEAD")
+					log.Printf("[supervisor] Proxy traffic dead, triggering adaptive failover to next node...")
+					if a.adaptiveWorker != nil {
+						a.adaptiveWorker.Trigger() // Даем команду воркеру срочно сменить ноду
+					}
+					//triggerRestart("L2_TRAFFIC_DEAD")
 				}
 			} else {
 				if l2Failures > 0 {

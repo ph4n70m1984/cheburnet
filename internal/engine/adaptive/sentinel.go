@@ -258,7 +258,23 @@ func (s *CensorshipSentinel) tick(ctx context.Context) {
 
 	wg.Wait()
 
-	isCensored := (foreignDirectDead && domesticDirectAlive) || tunnelForeignDead
+	// Защита от ложного срабатывания при отключенном кабеле (WAN Down)
+	if !domesticDirectAlive {
+		return
+	}
+
+	currentGroup, _ := s.controller.GetActiveGroupNodes()
+
+	var isCensored bool
+	if currentGroup == "lte" {
+		// В группе LTE остаемся ТОЛЬКО пока прямой зарубежный трафик заблокирован.
+		// Если прямой доступ восстановился — цензура снята, возвращаемся в general.
+		isCensored = foreignDirectDead
+	} else {
+		// В группе general фиксируем цензуру, только если зарубежный канал заблокирован И туннель не работает.
+		isCensored = foreignDirectDead && tunnelForeignDead
+	}
+
 	s.evaluateHysteresis(ctx, isCensored)
 }
 
