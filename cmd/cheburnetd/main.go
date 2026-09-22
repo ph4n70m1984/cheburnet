@@ -159,6 +159,7 @@ type App struct {
 	subWorker       *subscription.Worker
 	adaptiveWorker  *adaptive.Worker
 	adaptiveProber  *adaptive.Prober
+	sentinel        *adaptive.CensorshipSentinel
 	stateController *adaptive.StateController
 	mu              sync.RWMutex
 	engineOpMu      sync.Mutex
@@ -779,6 +780,7 @@ func runDaemon() {
 		subWorker:       subWorker,
 		adaptiveWorker:  adaptiveWorker,
 		adaptiveProber:  prober,
+		sentinel:        sentinel,
 		stateController: stateController,
 	}
 
@@ -907,15 +909,26 @@ func runDaemon() {
 
 	for sig := range sigChan {
 		if sig == syscall.SIGHUP {
-			log.Println("[INFO] Received SIGHUP: executing soft reload...")
 			go func() {
-				if err := app.reloadActiveEngine(daemonCtx); err != nil {
+				// Защита от наложения параллельных reload-запросов
+				if !app.engineOpMu.TryLock() {
+					log.Println("[engine-reload] SIGHUP skipped: reload operation is already in progress")
+					return
+				}
+				defer app.engineOpMu.Unlock()
+
+				log.Println("[INFO] Received SIGHUP: executing soft reload...")
+				if err := app.reloadActiveEngineLocked(daemonCtx); err != nil {
 					log.Printf("[ERROR] SIGHUP soft reload failed: %v", err)
 				} else {
 					cfg := app.state.Get()
-					app.stateController.UpdatePool(&cfg)
-					app.stateController.Reassert(daemonCtx)
-					app.adaptiveWorker.Trigger()
+					if app.stateController != nil {
+						app.stateController.UpdatePool(&cfg)
+						app.stateController.Reassert(daemonCtx)
+					}
+					if app.adaptiveWorker != nil {
+						app.adaptiveWorker.Trigger()
+					}
 					log.Println("[INFO] SIGHUP soft reload completed successfully.")
 				}
 			}()
@@ -954,7 +967,10 @@ func (a *App) getCurrentEngine() engine.Engine {
 func (a *App) reloadActiveEngine(ctx context.Context) error {
 	a.engineOpMu.Lock()
 	defer a.engineOpMu.Unlock()
+	return a.reloadActiveEngineLocked(ctx)
+}
 
+func (a *App) reloadActiveEngineLocked(ctx context.Context) error {
 	previousConfig := a.state.Get()
 
 	diskCfg, err := a.uciStorage.Load()
@@ -1141,19 +1157,20 @@ func (a *App) stopActiveEngine() {
 func (a *App) supervisorLoop(ctx context.Context) {
 	backoffDelays := []time.Duration{
 		0 * time.Second,
-		5 * time.Second,
-		15 * time.Second,
+		3 * time.Second,
+		10 * time.Second,
+		20 * time.Second,
 		30 * time.Second,
-		60 * time.Second,
 	}
-	const faultCooldown = 5 * time.Minute
-	const l1Interval = 10 * time.Second
-	const l2Interval = 60 * time.Second
+	const faultCooldown = 3 * time.Minute
+	const l1Interval = 5 * time.Second
+	const l2Interval = 15 * time.Second
 
 	l1Failures := 0
-	l2Failures := 0
+	generalConsecutiveFails := 0
 	restartAttempts := 0
 	isInFaultState := false
+	lastGeneralProbeTime := time.Now()
 
 	l1Ticker := time.NewTicker(l1Interval)
 	l2Ticker := time.NewTicker(l2Interval)
@@ -1225,7 +1242,7 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				continue
 			}
 
-			healthCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			healthCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			err := engine.VerifyEngineAlive(healthCtx, &cfg)
 			cancel()
 
@@ -1256,7 +1273,7 @@ func (a *App) supervisorLoop(ctx context.Context) {
 					log.Printf("[supervisor] L1 INFO: Engine %s local health recovered", eng.Name())
 					l1Failures = 0
 				}
-				if restartAttempts > 0 && l2Failures == 0 {
+				if restartAttempts > 0 {
 					restartAttempts = 0
 					isInFaultState = false
 				}
@@ -1268,18 +1285,23 @@ func (a *App) supervisorLoop(ctx context.Context) {
 			cfg := a.state.Get()
 			a.mu.RUnlock()
 
-			if eng == nil || len(cfg.Nodes) == 0 {
+			if eng == nil || len(cfg.Nodes) == 0 || l1Failures > 0 {
 				continue
 			}
 
-			if l1Failures > 0 {
-				continue
-			}
-
-			trafficCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			// Быстрая проверка L2 трафика (таймаут 2.5 сек)
+			trafficCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 			startTraffic := time.Now()
 			err := engine.VerifyTraffic(trafficCtx, &cfg)
 			cancel()
+
+			// Если первый тест упал — делаем мгновенный подтверждающий ретест через 800 мс (не ждем 30 секунд!)
+			if err != nil {
+				time.Sleep(800 * time.Millisecond)
+				retestCtx, retestCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+				err = engine.VerifyTraffic(retestCtx, &cfg)
+				retestCancel()
+			}
 
 			e2eOk := (err == nil)
 			latency := time.Since(startTraffic).Milliseconds()
@@ -1290,24 +1312,58 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				}
 			}
 
+			currentGrp, _ := a.stateController.GetActiveGroupNodes()
+
 			if err != nil {
-				l2Failures++
-				log.Printf("[supervisor] L2 Warning: Proxy traffic test failed (%d/2): %v", l2Failures, err)
-				if l2Failures >= 2 {
-					l2Failures = 0
-					log.Printf("[supervisor] Proxy traffic dead, triggering adaptive failover to next node...")
-					if a.adaptiveWorker != nil {
-						a.adaptiveWorker.Trigger()
+				activeTag := getRealActiveNode(cfg.ClashAPISecret, "")
+				log.Printf("[supervisor] Proxy traffic confirmed DEAD on node '%s' (%v). Invalidate & instant switch...", activeTag, err)
+
+				if a.adaptiveProber != nil && activeTag != "" {
+					a.adaptiveProber.InvalidateNode(activeTag)
+				}
+
+				if currentGrp == "general" {
+					generalConsecutiveFails++
+					log.Printf("[supervisor] Fail %d/2 in 'general'. Triggering next candidate...", generalConsecutiveFails)
+
+					// Уже после 2 сбоев подряд в general сразу уходим в надежный LTE-пул
+					if generalConsecutiveFails >= 2 && a.stateController != nil {
+						log.Printf("[supervisor] Failover: Group 'general' failed twice, switching to 'lte' pool immediately")
+						_ = a.stateController.SwitchGroup(ctx, "lte", "general_pool_failed")
+						generalConsecutiveFails = 0
+						// ГАРАНТИЯ DWELL TIME: засекаем точку старта работы в LTE
+						lastGeneralProbeTime = time.Now()
 					}
 				}
+
+				if a.adaptiveWorker != nil {
+					a.adaptiveWorker.Trigger()
+				}
 			} else {
-				if l2Failures > 0 {
-					log.Printf("[supervisor] L2 INFO: Proxy traffic pipeline restored")
-					l2Failures = 0
+				if currentGrp == "general" {
+					generalConsecutiveFails = 0
 				}
 				if restartAttempts > 0 && l1Failures == 0 {
 					restartAttempts = 0
 					isInFaultState = false
+				}
+
+				// Фоновая проверка восстановления пула general:
+				// Запускается ТОЛЬКО после 150 секунд непрерывной стабильной работы в LTE
+				if currentGrp == "lte" && time.Since(lastGeneralProbeTime) > 150*time.Second {
+					lastGeneralProbeTime = time.Now()
+					if a.stateController != nil {
+						ok, winnerNodeTag := a.stateController.CheckGroupHealth(ctx, "general")
+						if ok && winnerNodeTag != "" {
+							log.Printf("[supervisor] Recovery: Functional node confirmed in 'general' pool ('%s'), returning [lte -> general]", winnerNodeTag)
+							// Переключаемся сразу на проверенный узел, а не вслепую на начало списка
+							if switchErr := a.stateController.SwitchGroup(ctx, "general", "general_recovered", winnerNodeTag); switchErr == nil {
+								if a.adaptiveWorker != nil {
+									a.adaptiveWorker.Trigger()
+								}
+							}
+						}
+					}
 				}
 			}
 		}

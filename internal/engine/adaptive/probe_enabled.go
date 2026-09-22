@@ -25,15 +25,16 @@ import (
 )
 
 const (
-	defaultCacheTTL = 5 * time.Minute
-	globalProbeTTL  = 10 * time.Second
-	probeUserAgent  = "CheburNET-Probe/1.0"
-	l4Timeout       = 600 * time.Millisecond
-	l4Attempts      = 2
-	l4MaxLossRate   = 0.34
-	l4Concurrency   = 20
-	l2Concurrency   = 5
-	speedChunkSize  = 256 * 1024
+	defaultCacheTTL   = 5 * time.Minute
+	globalProbeTTL    = 8 * time.Second
+	probeUserAgent    = "CheburNET-Probe/1.0"
+	l4Timeout         = 450 * time.Millisecond
+	l4Attempts        = 2
+	l4MaxLossRate     = 0.34
+	l4Concurrency     = 25
+	l2Concurrency     = 25
+	failedNodeCoolTTL = 5 * time.Minute
+	speedChunkSize    = 256 * 1024
 )
 
 var (
@@ -88,6 +89,8 @@ type Prober struct {
 	lastResult  *NodeMetrics
 	lastAt      time.Time
 	latestPool  map[string]*NodeMetrics
+	failedPool  map[string]time.Time
+	fallbackIdx int
 	mu          sync.RWMutex
 	sf          singleflight.Group
 }
@@ -103,9 +106,9 @@ func NewProber(clashAPI string, secret string) *Prober {
 
 	apiTransport := &http.Transport{
 		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 1500 * time.Millisecond,
 		DialContext: (&net.Dialer{
-			Timeout: 1 * time.Second,
+			Timeout: 1500 * time.Millisecond,
 		}).DialContext,
 	}
 
@@ -114,6 +117,7 @@ func NewProber(clashAPI string, secret string) *Prober {
 		secret:     secret,
 		cacheTTL:   defaultCacheTTL,
 		latestPool: make(map[string]*NodeMetrics),
+		failedPool: make(map[string]time.Time),
 		probeClient: &http.Client{
 			Timeout:   3 * time.Second,
 			Transport: probeTransport,
@@ -141,33 +145,98 @@ func (p *Prober) GetNodeMetric(tag string) *NodeMetrics {
 	return nil
 }
 
+func (p *Prober) getActiveSelectorOutbounds(ctx context.Context) map[string]struct{} {
+	p.mu.RLock()
+	clashAPI := p.clashAPI
+	sec := p.secret
+	p.mu.RUnlock()
+
+	if strings.TrimSpace(clashAPI) == "" {
+		return nil
+	}
+
+	baseURL := strings.TrimRight(clashAPI, "/")
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		baseURL = "http://" + baseURL
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/proxies/"+config.MainSelectorTag, nil)
+	if err != nil {
+		return nil
+	}
+	if sec != "" {
+		req.Header.Set("Authorization", "Bearer "+sec)
+	}
+
+	resp, err := p.apiClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var res struct {
+		All []string `json:"all"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil || len(res.All) == 0 {
+		return nil
+	}
+
+	out := make(map[string]struct{}, len(res.All))
+	for _, tag := range res.All {
+		out[tag] = struct{}{}
+	}
+	return out
+}
+
 func (p *Prober) SelectBestNode(parentCtx context.Context, nodes []*config.GenericNode) *NodeMetrics {
 	if len(nodes) == 0 {
 		return nil
 	}
-	if len(nodes) == 1 {
+
+	ctx, cancel := context.WithTimeout(parentCtx, globalProbeTTL)
+	defer cancel()
+
+	availableTags := p.getActiveSelectorOutbounds(ctx)
+	validNodes := make([]*config.GenericNode, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		if availableTags != nil {
+			if _, exists := availableTags[n.Tag]; !exists {
+				continue
+			}
+		}
+		validNodes = append(validNodes, n)
+	}
+
+	if len(validNodes) == 0 {
+		validNodes = nodes
+	}
+
+	if len(validNodes) == 1 {
 		return &NodeMetrics{
-			Tag:        nodes[0].Tag,
-			Address:    nodes[0].Address,
-			Port:       nodes[0].Port,
+			Tag:        validNodes[0].Tag,
+			Address:    validNodes[0].Address,
+			Port:       validNodes[0].Port,
 			IsFallback: false,
 		}
 	}
 
-	if cached := p.getCachedNode(nodes); cached != nil {
+	if cached := p.getCachedNode(validNodes); cached != nil {
 		return cached
 	}
 
 	v, _, _ := p.sf.Do("probe_best_node", func() (interface{}, error) {
-		if cached := p.getCachedNode(nodes); cached != nil {
+		if cached := p.getCachedNode(validNodes); cached != nil {
 			return cached, nil
 		}
 
-		ctx, cancel := context.WithTimeout(parentCtx, globalProbeTTL)
-		defer cancel()
-
 		startTotal := time.Now()
-		res := p.doProbe(ctx, nodes)
+		res := p.doProbe(ctx, validNodes)
 		observePhase("total", time.Since(startTotal))
 
 		return res, nil
@@ -176,7 +245,7 @@ func (p *Prober) SelectBestNode(parentCtx context.Context, nodes []*config.Gener
 	if res, ok := v.(*NodeMetrics); ok && res != nil {
 		return res
 	}
-	return p.fallbackNode(nodes)
+	return p.fallbackNode(validNodes)
 }
 
 func (p *Prober) doProbe(ctx context.Context, nodes []*config.GenericNode) *NodeMetrics {
@@ -192,12 +261,9 @@ func (p *Prober) doProbe(ctx context.Context, nodes []*config.GenericNode) *Node
 	topL2 := p.filterLevel2HTTP(ctx, l4Candidates)
 	observePhase("l2", time.Since(startL2))
 
-	// Если ни один узел из кандидатов не прошел проверку через ядро sing-box
 	if len(topL2) == 0 {
-		winner := l4Candidates[0]
-		winner.IsFallback = true
-		p.logSelection(winner, "L1-fallback")
-		return winner
+		log.Printf("[adaptive] WARN: all candidate nodes failed L2 HTTP delay test, falling back to next node")
+		return p.fallbackNode(nodes)
 	}
 
 	if len(topL2) == 1 {
@@ -281,6 +347,9 @@ func (p *Prober) getCachedNode(nodes []*config.GenericNode) *NodeMetrics {
 	defer p.mu.RUnlock()
 
 	if p.lastResult != nil && time.Since(p.lastAt) < p.cacheTTL {
+		if failTime, isFailed := p.failedPool[p.lastResult.Tag]; isFailed && time.Since(failTime) < failedNodeCoolTTL {
+			return nil
+		}
 		for _, n := range nodes {
 			if n.Tag == p.lastResult.Tag && n.Address == p.lastResult.Address && n.Port == p.lastResult.Port {
 				return p.lastResult
@@ -291,41 +360,51 @@ func (p *Prober) getCachedNode(nodes []*config.GenericNode) *NodeMetrics {
 }
 
 func (p *Prober) fallbackNode(nodes []*config.GenericNode) *NodeMetrics {
-	var result *NodeMetrics
-	var stage string
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	p.mu.RLock()
-	if p.lastResult != nil {
-		for _, n := range nodes {
-			if n.Tag == p.lastResult.Tag && n.Address == p.lastResult.Address && n.Port == p.lastResult.Port {
-				res := *p.lastResult
-				res.IsFallback = true
-				result = &res
-				stage = "cached-fallback"
-				break
-			}
-		}
+	nLen := len(nodes)
+	if nLen == 0 {
+		return nil
 	}
-	p.mu.RUnlock()
 
-	if result == nil {
-		result = &NodeMetrics{
-			Tag:        nodes[0].Tag,
-			Address:    nodes[0].Address,
-			Port:       nodes[0].Port,
+	now := time.Now()
+	for i := 0; i < nLen; i++ {
+		idx := (p.fallbackIdx + i) % nLen
+		candidate := nodes[idx]
+
+		if failTime, failed := p.failedPool[candidate.Tag]; failed && now.Sub(failTime) < failedNodeCoolTTL {
+			continue
+		}
+
+		p.fallbackIdx = (idx + 1) % nLen
+		res := &NodeMetrics{
+			Tag:        candidate.Tag,
+			Address:    candidate.Address,
+			Port:       candidate.Port,
 			IsFallback: true,
 		}
-		stage = "zero-fallback"
+		p.logSelection(res, "roundrobin-fallback")
+		return res
 	}
 
-	p.logSelection(result, stage)
-	return result
+	p.fallbackIdx = (p.fallbackIdx + 1) % nLen
+	fallbackNode := nodes[p.fallbackIdx%nLen]
+	res := &NodeMetrics{
+		Tag:        fallbackNode.Tag,
+		Address:    fallbackNode.Address,
+		Port:       fallbackNode.Port,
+		IsFallback: true,
+	}
+	p.logSelection(res, "forced-fallback")
+	return res
 }
 
 func (p *Prober) updateCache(m *NodeMetrics) {
 	p.mu.Lock()
 	p.lastResult = m
 	p.lastAt = time.Now()
+	delete(p.failedPool, m.Tag)
 	p.mu.Unlock()
 }
 
@@ -334,6 +413,14 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 	var mu sync.Mutex
 	results := make([]*NodeMetrics, 0, len(nodes))
 	sem := make(chan struct{}, l4Concurrency)
+
+	now := time.Now()
+	p.mu.RLock()
+	failedCopy := make(map[string]time.Time, len(p.failedPool))
+	for k, v := range p.failedPool {
+		failedCopy[k] = v
+	}
+	p.mu.RUnlock()
 
 	for _, n := range nodes {
 		wg.Add(1)
@@ -344,6 +431,26 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
+				return
+			}
+
+			if failTime, failed := failedCopy[node.Tag]; failed && now.Sub(failTime) < failedNodeCoolTTL {
+				return
+			}
+
+			proto := strings.ToLower(node.Protocol)
+			if proto == "hysteria2" || proto == "tuic" || proto == "hysteria" {
+				m := &NodeMetrics{
+					Tag:     node.Tag,
+					Address: node.Address,
+					Port:    node.Port,
+					RTT:     40 * time.Millisecond,
+					L1Score: 40.0,
+				}
+				mu.Lock()
+				results = append(results, m)
+				p.latestPool[node.Tag] = m
+				mu.Unlock()
 				return
 			}
 
@@ -361,6 +468,14 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 					(2.0 * float64(metrics.Jitter.Milliseconds())) +
 					(metrics.LossRate * 150.0)
 
+				p.mu.RLock()
+				prevMetric, hadPrev := p.latestPool[node.Tag]
+				p.mu.RUnlock()
+
+				if hadPrev && prevMetric != nil && prevMetric.HTTPRTT == 0 {
+					metrics.L1Score += 1000.0
+				}
+
 				mu.Lock()
 				results = append(results, metrics)
 				p.latestPool[node.Tag] = metrics
@@ -375,9 +490,8 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 		return results[i].L1Score < results[j].L1Score
 	})
 
-	// Передаем в L2 до 15 кандидатов, чтобы исключить вытеснение живых нод быстрыми зомби-портами
-	if len(results) > 15 {
-		return results[:15]
+	if len(results) > 35 {
+		return results[:35]
 	}
 	return results
 }
@@ -471,7 +585,7 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 				return
 			}
 
-			testEndpoint := fmt.Sprintf("%s/proxies/%s/delay?url=http://cp.cloudflare.com/generate_204&timeout=2500",
+			testEndpoint := fmt.Sprintf("%s/proxies/%s/delay?url=http://cp.cloudflare.com/generate_204&timeout=1600",
 				baseURL, url.PathEscape(c.Tag))
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, testEndpoint, nil)
@@ -488,11 +602,13 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 
 			resp, err := p.apiClient.Do(req)
 			if err != nil {
+				c.HTTPRTT = 0
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
+				c.HTTPRTT = 0
 				return
 			}
 
@@ -506,6 +622,8 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 				valid = append(valid, c)
 				p.latestPool[c.Tag] = c
 				mu.Unlock()
+			} else {
+				c.HTTPRTT = 0
 			}
 		}(cand)
 	}
@@ -520,6 +638,28 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 }
 
 func (p *Prober) benchmarkLevel3Speed(ctx context.Context, finalists []*NodeMetrics) *NodeMetrics {
-	// Возвращаем лучшую ноду по подтвержденному L2 HTTP RTT
 	return finalists[0]
+}
+
+func (p *Prober) InvalidateNode(tag string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.failedPool[tag] = time.Now()
+	if p.lastResult != nil && p.lastResult.Tag == tag {
+		p.lastResult = nil
+	}
+	if m, ok := p.latestPool[tag]; ok {
+		m.HTTPRTT = 0
+	}
+}
+
+// IsNodeFailed проверяет, находится ли нода в кулдауне после сбоя
+func (p *Prober) IsNodeFailed(tag string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if failTime, ok := p.failedPool[tag]; ok {
+		return time.Since(failTime) < failedNodeCoolTTL
+	}
+	return false
 }

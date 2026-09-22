@@ -116,7 +116,7 @@ func (c *StateController) GetActiveGroupNodes() (string, []*config.GenericNode) 
 	return grp, out
 }
 
-func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason string) error {
+func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason string, preferredNode ...string) error {
 	c.groupSwitchMu.Lock()
 	defer c.groupSwitchMu.Unlock()
 
@@ -137,21 +137,9 @@ func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason s
 		return fmt.Errorf("cannot switch to empty group '%s'", targetGroup)
 	}
 
-	bestNodeTag := targetNodes[0].Tag
-	if cachedBest := c.prober.getCachedNode(targetNodes); cachedBest != nil {
-		bestNodeTag = cachedBest.Tag
-	}
-
-	switchCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-	defer cancel()
-
-	if err := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, bestNodeTag); err != nil {
-		return fmt.Errorf("switch outbound failed: %w", err)
-	}
-
+	// 1. Атомарно переключаем группу
 	c.mu.Lock()
 	c.activeGroup = targetGroup
-	c.lastActiveNode = bestNodeTag
 	c.mu.Unlock()
 
 	sentinelStateGauge.WithLabelValues(current).Set(0)
@@ -159,10 +147,89 @@ func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason s
 	sentinelSwitchesTotal.WithLabelValues(current, targetGroup, reason).Inc()
 	sentinelLastSwitchTimestamp.WithLabelValues(current, targetGroup).Set(float64(time.Now().Unix()))
 
-	log.Printf("[controller] GROUP SWITCH [%s -> %s] reason=%s active_node='%s'",
-		current, targetGroup, reason, bestNodeTag)
+	// 2. Если передан явно проверенный победитель — применяем строго его
+	var switchedNode string
+	var lastErr error
 
+	if len(preferredNode) > 0 && strings.TrimSpace(preferredNode[0]) != "" {
+		pref := strings.TrimSpace(preferredNode[0])
+		switchCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+		if err := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, pref); err == nil {
+			switchedNode = pref
+		} else {
+			lastErr = err
+		}
+		cancel()
+	}
+
+	// 3. Если приоритетный узел не задан или дал сбой, перебираем ноды группы, исключая failedPool
+	if switchedNode == "" {
+		for _, n := range targetNodes {
+			if c.prober.IsNodeFailed(n.Tag) {
+				continue
+			}
+
+			switchCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+			err := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, n.Tag)
+			cancel()
+			if err == nil {
+				switchedNode = n.Tag
+				break
+			}
+			lastErr = err
+		}
+	}
+
+	if switchedNode != "" {
+		c.mu.Lock()
+		c.lastActiveNode = switchedNode
+		c.mu.Unlock()
+		log.Printf("[controller] GROUP SWITCH [%s -> %s] reason=%s active_node='%s'",
+			current, targetGroup, reason, switchedNode)
+		return nil
+	}
+
+	log.Printf("[controller] GROUP SWITCH [%s -> %s] reason=%s (warning: immediate selector switch failed: %v, adaptive probe will resolve)",
+		current, targetGroup, reason, lastErr)
 	return nil
+}
+
+func (c *StateController) CheckGroupHealth(ctx context.Context, groupName string) (bool, string) {
+	if c.prober == nil {
+		return false, ""
+	}
+
+	c.mu.RLock()
+	nodes := c.classifiedPool[groupName]
+	c.mu.RUnlock()
+
+	if len(nodes) == 0 {
+		return false, ""
+	}
+
+	var candidates []*config.GenericNode
+	for _, n := range nodes {
+		if !c.prober.IsNodeFailed(n.Tag) {
+			candidates = append(candidates, n)
+		}
+		if len(candidates) >= 6 {
+			break
+		}
+	}
+
+	if len(candidates) == 0 {
+		return false, ""
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 3500*time.Millisecond)
+	defer cancel()
+
+	best := c.prober.SelectBestNode(probeCtx, candidates)
+	if best != nil && best.HTTPRTT > 0 {
+		return true, best.Tag
+	}
+
+	return false, ""
 }
 
 func (c *StateController) Reassert(ctx context.Context) {
