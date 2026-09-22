@@ -39,6 +39,7 @@ var (
 	RuntimeConfigPathSingBox = "/tmp/run/cheburnet/sing-box.json"
 	DefaultAPIBind           = "0.0.0.0:8088"
 	PIDFile                  = "/var/run/cheburnetd.pid"
+	PersistentNodesCachePath = "/etc/cheburnet/nodes_cache.json"
 
 	lastKnownActiveNode   string
 	lastKnownActiveNodeMu sync.RWMutex
@@ -57,6 +58,49 @@ func initTimezone() {
 			}
 		}
 	}
+}
+
+func saveNodesCache(nodes []*config.GenericNode) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	if err := os.MkdirAll("/etc/cheburnet", 0755); err != nil {
+		return fmt.Errorf("mkdir /etc/cheburnet: %w", err)
+	}
+
+	data, err := json.MarshalIndent(nodes, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal nodes cache: %w", err)
+	}
+
+	tmpFile := PersistentNodesCachePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return fmt.Errorf("write tmp cache: %w", err)
+	}
+
+	if err := os.Rename(tmpFile, PersistentNodesCachePath); err != nil {
+		_ = os.Remove(tmpFile)
+		return fmt.Errorf("atomic rename cache: %w", err)
+	}
+
+	return nil
+}
+
+func loadNodesCache() []*config.GenericNode {
+	data, err := os.ReadFile(PersistentNodesCachePath)
+	if err != nil {
+		return nil
+	}
+
+	var nodes []*config.GenericNode
+	if err := json.Unmarshal(data, &nodes); err != nil {
+		log.Printf("[WARN] Failed to unmarshal persistent node cache: %v", err)
+		return nil
+	}
+
+	log.Printf("[INFO] Loaded %d nodes from persistent storage (%s)", len(nodes), PersistentNodesCachePath)
+	return nodes
 }
 
 type diagReporterAdapter struct {
@@ -522,6 +566,12 @@ func (a *App) handleSubscriptionAutoUpdate(ctx context.Context, targetSub config
 		log.Printf("[subscription-loop] WARN: Commit state returned unexpected error: %v", err)
 	}
 
+	if err := saveNodesCache(candidate.Nodes); err != nil {
+		log.Printf("[subscription-loop] WARN: Failed to persist nodes cache: %v", err)
+	} else {
+		log.Printf("[subscription-loop] Cached %d active nodes to %s", len(candidate.Nodes), PersistentNodesCachePath)
+	}
+
 	if a.stateController != nil {
 		a.stateController.UpdatePool(candidate)
 		a.stateController.Reassert(ctx)
@@ -592,6 +642,8 @@ func runDaemon() {
 
 	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID, initialConfig.MixedPort, mixedProxyAliveChecker)
 
+	diskCachedNodes := loadNodesCache()
+
 	switch initialConfig.SourceMode {
 	case "manual":
 		for _, raw := range initialConfig.ManualNodes {
@@ -614,15 +666,46 @@ func runDaemon() {
 			if sub.URL == "" || !sub.Enabled {
 				continue
 			}
+
+			cleanName := strings.TrimSpace(sub.Name)
+			prefix := ""
+			if cleanName != "" {
+				prefix = fmt.Sprintf("[%s]", cleanName)
+			}
+
 			log.Printf("[INFO] Fetching subscription [%s]: %s", sub.UserAgent, sub.URL)
 			nodes, err := subWorker.FetchNodes(context.Background(), sub)
-			if err != nil {
-				log.Printf("[ERROR] Failed to fetch subscription '%s': %v", sub.URL, err)
+			if err != nil || len(nodes) == 0 {
+				log.Printf("[WARN] Failed to fetch subscription '%s' (%v). Looking up persistent disk cache...", sub.Name, err)
+
+				var recovered []*config.GenericNode
+				for _, cn := range diskCachedNodes {
+					if cn != nil && prefix != "" && strings.HasPrefix(cn.Tag, prefix) {
+						recovered = append(recovered, cn)
+					}
+				}
+
+				if len(recovered) > 0 {
+					log.Printf("[INFO] Recovered %d cached nodes for '%s' from %s", len(recovered), sub.Name, PersistentNodesCachePath)
+					initialConfig.Nodes = append(initialConfig.Nodes, recovered...)
+				} else {
+					log.Printf("[ERROR] No cached nodes found for '%s'", sub.Name)
+				}
 				continue
 			}
+
 			log.Printf("[INFO] Successfully fetched %d nodes from %s", len(nodes), sub.URL)
 			initialConfig.Nodes = append(initialConfig.Nodes, nodes...)
 		}
+
+		if len(initialConfig.Nodes) == 0 && len(diskCachedNodes) > 0 {
+			log.Printf("[CRITICAL] All subscriptions failed to download. Restoring full disk cache (%d nodes)!", len(diskCachedNodes))
+			initialConfig.Nodes = diskCachedNodes
+		}
+	}
+
+	if len(initialConfig.Nodes) > 0 {
+		_ = saveNodesCache(initialConfig.Nodes)
 	}
 
 	log.Printf("[INFO] Total active nodes initialized: %d (source mode: %s)", len(initialConfig.Nodes), initialConfig.SourceMode)
@@ -881,6 +964,9 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	candidate := *diskCfg
 	candidate.Nodes = previousConfig.Nodes
+	if len(candidate.Nodes) == 0 {
+		candidate.Nodes = loadNodesCache()
+	}
 
 	setupBootstrapResolver(&candidate)
 
@@ -967,6 +1053,10 @@ func (a *App) reloadActiveEngine(ctx context.Context) error {
 
 	if _, err := a.state.Commit(&candidate, false); err != nil {
 		log.Printf("[WARN] State committed to memory, but persistence returned: %v", err)
+	}
+
+	if len(candidate.Nodes) > 0 {
+		_ = saveNodesCache(candidate.Nodes)
 	}
 
 	if a.subWorker != nil && len(candidate.Subscriptions) > 0 {
@@ -1207,9 +1297,8 @@ func (a *App) supervisorLoop(ctx context.Context) {
 					l2Failures = 0
 					log.Printf("[supervisor] Proxy traffic dead, triggering adaptive failover to next node...")
 					if a.adaptiveWorker != nil {
-						a.adaptiveWorker.Trigger() // Даем команду воркеру срочно сменить ноду
+						a.adaptiveWorker.Trigger()
 					}
-					//triggerRestart("L2_TRAFFIC_DEAD")
 				}
 			} else {
 				if l2Failures > 0 {
