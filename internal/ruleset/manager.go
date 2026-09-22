@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	RulesetDir = "/etc/config/cheburnet/rulesets"
-	BackupDir  = "/etc/config/cheburnet/rulesets/backup"
+	RulesetDir = "/etc/cheburnet/rulesets"
+	BackupDir  = "/etc/cheburnet/rulesets_backup"
 )
 
 type DiagnosticReporter interface {
