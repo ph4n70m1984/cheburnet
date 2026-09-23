@@ -410,15 +410,24 @@ func (p *Prober) updateCache(m *NodeMetrics) {
 
 func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode) []*NodeMetrics {
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var localMu sync.Mutex
 	results := make([]*NodeMetrics, 0, len(nodes))
 	sem := make(chan struct{}, l4Concurrency)
 
 	now := time.Now()
+
+	// Снимаем снимок failedPool и latestPool под одним RLock
 	p.mu.RLock()
 	failedCopy := make(map[string]time.Time, len(p.failedPool))
 	for k, v := range p.failedPool {
 		failedCopy[k] = v
+	}
+	prevPoolCopy := make(map[string]*NodeMetrics, len(p.latestPool))
+	for k, v := range p.latestPool {
+		if v != nil {
+			cp := *v
+			prevPoolCopy[k] = &cp
+		}
 	}
 	p.mu.RUnlock()
 
@@ -447,10 +456,9 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 					RTT:     40 * time.Millisecond,
 					L1Score: 40.0,
 				}
-				mu.Lock()
+				localMu.Lock()
 				results = append(results, m)
-				p.latestPool[node.Tag] = m
-				mu.Unlock()
+				localMu.Unlock()
 				return
 			}
 
@@ -468,23 +476,26 @@ func (p *Prober) filterLevel1L4(ctx context.Context, nodes []*config.GenericNode
 					(2.0 * float64(metrics.Jitter.Milliseconds())) +
 					(metrics.LossRate * 150.0)
 
-				p.mu.RLock()
-				prevMetric, hadPrev := p.latestPool[node.Tag]
-				p.mu.RUnlock()
-
-				if hadPrev && prevMetric != nil && prevMetric.HTTPRTT == 0 {
+				// Безопасно проверяем предыдущую метрику из локального снимка
+				if prevMetric, hadPrev := prevPoolCopy[node.Tag]; hadPrev && prevMetric != nil && prevMetric.HTTPRTT == 0 {
 					metrics.L1Score += 1000.0
 				}
 
-				mu.Lock()
+				localMu.Lock()
 				results = append(results, metrics)
-				p.latestPool[node.Tag] = metrics
-				mu.Unlock()
+				localMu.Unlock()
 			}
 		}(n)
 	}
 
 	wg.Wait()
+
+	// Атомарно обновляем p.latestPool под глобальным Lock после завершения всех горутин L1
+	p.mu.Lock()
+	for _, m := range results {
+		p.latestPool[m.Tag] = m
+	}
+	p.mu.Unlock()
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].L1Score < results[j].L1Score
@@ -564,7 +575,7 @@ func (p *Prober) probeL4Handshake(ctx context.Context, addr string, port int, at
 
 func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics) []*NodeMetrics {
 	var wg sync.WaitGroup
-	var mu sync.Mutex
+	var localMu sync.Mutex
 	valid := make([]*NodeMetrics, 0, len(candidates))
 	sem := make(chan struct{}, l2Concurrency)
 
@@ -618,10 +629,9 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && res.Delay > 0 {
 				c.HTTPRTT = time.Duration(res.Delay) * time.Millisecond
 
-				mu.Lock()
+				localMu.Lock()
 				valid = append(valid, c)
-				p.latestPool[c.Tag] = c
-				mu.Unlock()
+				localMu.Unlock()
 			} else {
 				c.HTTPRTT = 0
 			}
@@ -629,6 +639,13 @@ func (p *Prober) filterLevel2HTTP(ctx context.Context, candidates []*NodeMetrics
 	}
 
 	wg.Wait()
+
+	// Атомарно обновляем p.latestPool под глобальным Lock после завершения всех горутин L2
+	p.mu.Lock()
+	for _, c := range valid {
+		p.latestPool[c.Tag] = c
+	}
+	p.mu.Unlock()
 
 	sort.Slice(valid, func(i, j int) bool {
 		return valid[i].HTTPRTT < valid[j].HTTPRTT
