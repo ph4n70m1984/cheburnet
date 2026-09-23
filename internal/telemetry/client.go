@@ -18,6 +18,7 @@ type Client struct {
 	send      chan []byte
 	closeOnce sync.Once
 	done      chan struct{}
+	writeMu   sync.Mutex // Защита от concurrent write в websocket
 }
 
 func newClient(c *websocket.Conn) *Client {
@@ -28,15 +29,21 @@ func newClient(c *websocket.Conn) *Client {
 	}
 }
 
+// write потокобезопасно отправляет сообщение в WebSocket с установкой таймаута
+func (c *Client) write(messageType int, payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	return c.conn.WriteMessage(messageType, payload)
+}
+
 // close корректно и идемпотентно закрывает сессию с отправкой каноничного CloseNormalClosure
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
 
-		// Отправляем штатный Close frame (1000 Normal Closure), чтобы браузер
-		// получил событие onclose с флагом wasClean: true вместо TCP RST (1006)
-		_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-		_ = c.conn.WriteMessage(
+		// Отправляем Close frame безопасно через мьютекс
+		_ = c.write(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "server shutdown"),
 		)
@@ -45,7 +52,7 @@ func (c *Client) close() {
 	})
 }
 
-// writePump — единственный писатель в WebSocket сокет с периодическим heartbeat
+// writePump — единственный обработчик исходящей очереди и heartbeat
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -60,19 +67,17 @@ func (c *Client) writePump() {
 			return
 
 		case msg, ok := <-c.send:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				_ = c.write(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			if err := c.write(websocket.TextMessage, msg); err != nil {
 				return
 			}
 
 		case <-ticker.C:
 			// Heartbeat: держит соединение активным и сбрасывает зависшие полуоткрытые TCP-сессии
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.write(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
