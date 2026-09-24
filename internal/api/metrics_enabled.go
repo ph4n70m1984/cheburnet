@@ -11,14 +11,18 @@ import (
 )
 
 func setupMetrics(app *fiber.App) {
-	// 1. Регистрируем сборщик процессора, памяти и сети в глобальном реестре
+	// 1. Регистрируем сборщик процессора, памяти и сети хоста
 	sysCollector := NewSystemCollector()
 	_ = prometheus.DefaultRegisterer.Register(sysCollector)
 
-	// 2. Инициализируем метрики HTTP для Fiber
+	// 2. Регистрируем сборщик метрик ядра sing-box (CPU, RSS, трафик, соединения)
+	singboxCollector := NewSingboxCollector()
+	_ = prometheus.DefaultRegisterer.Register(singboxCollector)
+
+	// 3. Инициализируем метрики HTTP для Fiber
 	prometheusExporter := fiberprometheus.New("cheburnetd")
 	app.Use(prometheusExporter.Middleware)
 
-	// 3. Отдаем объединенный реестр (Go runtime + Fiber + SystemCollector) через promhttp
+	// 4. Отдаем объединенный реестр (Go runtime + Fiber + System + Singbox) через promhttp
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 }
