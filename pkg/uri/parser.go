@@ -11,7 +11,6 @@ import (
 	"cheburnet/pkg/hwid"
 )
 
-// decodeBase64Safe декодирует строку Base64 со стандартным или URL-safe алфавитом и любым паддингом
 func decodeBase64Safe(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
 	if pad := len(s) % 4; pad != 0 {
@@ -24,7 +23,6 @@ func decodeBase64Safe(s string) ([]byte, error) {
 	return base64.URLEncoding.DecodeString(s)
 }
 
-// extractSNI безопасно извлекает SNI с учётом алиасов (sni, peer, serverName)
 func extractSNI(q url.Values) string {
 	for _, key := range []string{"sni", "peer", "serverName"} {
 		if val := strings.TrimSpace(q.Get(key)); val != "" {
@@ -34,14 +32,12 @@ func extractSNI(q url.Values) string {
 	return ""
 }
 
-// ParseNodeURI парсит vless://, ss://, trojan://, socks4/5://, hy2/hysteria2://
 func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.GenericNode, error) {
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" {
 		return nil, fmt.Errorf("empty uri")
 	}
 
-	// Обработка старого формата Shadowsocks: ss://BASE64#Tag (где base64 содержит method:pass@host:port)
 	if strings.HasPrefix(strings.ToLower(rawURI), "ss://") && !strings.Contains(rawURI[5:], "@") {
 		decodedURI, err := parseLegacyShadowsocksURI(rawURI)
 		if err == nil {
@@ -64,7 +60,6 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		tag = fmt.Sprintf("%s:%s", u.Hostname(), u.Port())
 	}
 
-	// Логика опционального HWID
 	nodeHWID := q.Get("hwid")
 	if nodeHWID == "" {
 		if customHWID != "" {
@@ -97,10 +92,7 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		}
 		node.Security = strings.ToLower(strings.TrimSpace(q.Get("security")))
 
-		// 1. Извлекаем SNI через алиасы: sni, peer, serverName
 		sni := extractSNI(q)
-
-		// 2. Для Reality НЕЛЬЗЯ делать fallback на node.Address (это ломает TLS ClientHello)
 		if sni == "" && node.Security != "reality" {
 			sni = node.Address
 		}
@@ -115,6 +107,35 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		node.Path = q.Get("path")
 		node.Host = q.Get("host")
 
+		// Парсинг XHTTP транспорта
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "xhttp" || netType == "splithttp" {
+			node.Network = "xhttp"
+			if node.Path == "" {
+				node.Path = "/"
+			}
+			mode := strings.ToLower(strings.TrimSpace(q.Get("mode")))
+			if mode == "" {
+				mode = "auto"
+			}
+			node.XHTTPMode = mode
+
+			padding := q.Get("x_padding_bytes")
+			if padding == "" {
+				padding = q.Get("xPaddingBytes")
+			}
+			if padding == "" {
+				padding = "100-1000"
+			}
+			node.XHTTPPadding = padding
+
+			noGRPC := q.Get("no_grpc_header")
+			node.XHTTPNoGRPC = (noGRPC == "1" || strings.EqualFold(noGRPC, "true"))
+
+			// Несовместимость протокола: XTLS-Vision запрещен с XHTTP
+			node.Flow = ""
+		}
+
 	case "ss":
 		node.Protocol = "shadowsocks"
 		if u.User != nil {
@@ -122,7 +143,6 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 			password, hasPassword := u.User.Password()
 
 			if !hasPassword {
-				// SIP002 URL-safe base64: ss://base64(method:password)@host:port
 				if decoded, err := decodeBase64Safe(userInfo); err == nil {
 					parts := strings.SplitN(string(decoded), ":", 2)
 					if len(parts) == 2 {
@@ -131,7 +151,6 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 					}
 				}
 			} else {
-				// ss://method:password@host:port
 				node.Method = userInfo
 				node.Password = password
 			}
@@ -157,6 +176,31 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		node.Insecure = q.Get("allowInsecure") == "1" || q.Get("insecure") == "1"
 		node.Path = q.Get("path")
 		node.Host = q.Get("host")
+
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "xhttp" || netType == "splithttp" {
+			node.Network = "xhttp"
+			if node.Path == "" {
+				node.Path = "/"
+			}
+			mode := strings.ToLower(strings.TrimSpace(q.Get("mode")))
+			if mode == "" {
+				mode = "auto"
+			}
+			node.XHTTPMode = mode
+
+			padding := q.Get("x_padding_bytes")
+			if padding == "" {
+				padding = q.Get("xPaddingBytes")
+			}
+			if padding == "" {
+				padding = "100-1000"
+			}
+			node.XHTTPPadding = padding
+
+			noGRPC := q.Get("no_grpc_header")
+			node.XHTTPNoGRPC = (noGRPC == "1" || strings.EqualFold(noGRPC, "true"))
+		}
 
 	case "socks", "socks5", "socks5h", "socks4", "socks4a":
 		node.Protocol = "socks"
@@ -189,7 +233,6 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 		return nil, fmt.Errorf("unsupported protocol: %s", scheme)
 	}
 
-	// Валидация базовых сетевых параметров
 	if node.Address == "" || node.Port == 0 {
 		return nil, fmt.Errorf("missing host or port in uri")
 	}
@@ -197,7 +240,6 @@ func ParseNodeURI(rawURI string, autoHWID bool, customHWID string) (*config.Gene
 	return node, nil
 }
 
-// parseLegacyShadowsocksURI преобразует формат ss://BASE64(method:password@host:port)#Tag в валидный SIP002 URL
 func parseLegacyShadowsocksURI(rawURI string) (string, error) {
 	tag := ""
 	payload := rawURI[5:]

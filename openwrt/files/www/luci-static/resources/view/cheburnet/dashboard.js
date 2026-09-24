@@ -646,7 +646,7 @@ return view.extend({
         o = s.taboption('routing_rules', form.TextValue, 'custom_ports', _('Список портов'));
         o.rows = 4;
 
-        // --- ВКЛАДКА НАСТРОЕК DNS ---
+        // --- ВКЛАДКА НАСТРОЕК DNS И СЕТИ ---
         o = s.taboption('dns_settings', form.ListValue, 'dns_protocol', _('Протокол DNS'));
         o.value('doh', 'DoH');
         o.value('dot', 'DoT');
@@ -660,8 +660,11 @@ return view.extend({
         o.value('1.1.1.1', 'Cloudflare');
         o.default = '77.88.8.8';
 
-        o = s.taboption('dns_settings', widgets.NetworkSelect, 'source_interface', _('Интерфейс'));
-        o.default = 'br-lan';
+        // Мультивыбор интерфейсов для проксирования трафика
+        o = s.taboption('dns_settings', widgets.NetworkSelect, 'proxy_ifaces', _('Интерфейсы для проксирования (TProxy)'));
+        o.multiple = true;
+        o.default = ['br-lan'];
+        o.description = _('Интерфейсы, с которых трафик перенаправляется в прокси (например: br-lan, wg0). Демон автоматически применяет для них rp_filter=2 и forwarding=1 в ядре Linux.');
 
         if (hasPublicSub) {
             o = s.taboption('public_sub', form.Flag, 'public_sub_enabled', _('Включить публичный сервер подписки'));
@@ -928,8 +931,6 @@ return view.extend({
 
                 var titleText = titleEl.textContent.trim();
                 if (!titleText || titleText.indexOf('Состояние, диагностика') !== -1) return;
-
-                var isMain = (titleText.indexOf('Параметры маршрутизации') !== -1);
 
                 var details = E('details', {
                     'class': 'cb-accordion'

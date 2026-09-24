@@ -337,6 +337,18 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		APIToken: cache.get("cheburnet.main.api_token", ""),
 	}
 
+	// Считываем список интерфейсов proxy_ifaces
+	cfg.ProxyIfaces = cache.getList("cheburnet.main.proxy_ifaces")
+	if len(cfg.ProxyIfaces) == 0 {
+		// Fallback на старое скалярное поле source_interface
+		oldIface := cache.get("cheburnet.main.source_interface", "")
+		if oldIface != "" {
+			cfg.ProxyIfaces = []string{oldIface}
+		} else {
+			cfg.ProxyIfaces = []string{"br-lan"}
+		}
+	}
+
 	if cfg.APIToken == "" {
 		generatedToken := generateSecureHex(16)
 		_ = exec.Command("uci", "set", "cheburnet.main.api_token="+generatedToken).Run()

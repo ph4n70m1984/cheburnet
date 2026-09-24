@@ -497,7 +497,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		urltestTag := "auto"
 		selectorTag := "PROXY"
 
-		// urltest ВСЕГДА присутствует в ядре для автоматического наполнения истории задержек в Clash API
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":                        "urltest",
 			"tag":                         urltestTag,
@@ -517,7 +516,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"default":   urltestTag,
 			})
 		} else {
-			// В адаптивном режиме PROXY содержит только реальные узлы и переключается cheburnetd
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":      "selector",
 				"tag":       selectorTag,
@@ -871,7 +869,12 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			return nil, fmt.Errorf("skipped: transport '%s' is only supported by extended/lx sing-box builds", netType)
+			tr, err := buildXHTTPTransport(node)
+			if err != nil {
+				return nil, err
+			}
+			out["transport"] = tr
+			delete(out, "flow")
 		}
 
 	case "hysteria2":
@@ -904,6 +907,26 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 			"enabled":     true,
 			"server_name": node.SNI,
 			"insecure":    node.Insecure,
+		}
+
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "ws" || netType == "websocket" {
+			out["transport"] = map[string]interface{}{
+				"type":    "ws",
+				"path":    node.Path,
+				"headers": map[string]string{"Host": node.Host},
+			}
+		} else if netType == "grpc" {
+			out["transport"] = map[string]interface{}{
+				"type":         "grpc",
+				"service_name": node.Path,
+			}
+		} else if netType == "xhttp" || netType == "splithttp" {
+			tr, err := buildXHTTPTransport(node)
+			if err != nil {
+				return nil, err
+			}
+			out["transport"] = tr
 		}
 
 	case "socks":

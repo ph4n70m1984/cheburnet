@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -27,6 +29,61 @@ const (
 
 var ifaceRegex = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,16}$`)
 
+// ConfigureInterfaceSysctl конфигурирует параметры ядра Linux для TProxy и туннельных интерфейсов
+func ConfigureInterfaceSysctl(ifaces []string) {
+	// Базовые параметры: включение роутинга и перевод глобального фильтра обратного пути в Loose Mode (2)
+	globals := map[string]string{
+		"net.ipv4.ip_forward":             "1",
+		"net.ipv4.conf.all.rp_filter":     "2",
+		"net.ipv4.conf.default.rp_filter": "2",
+	}
+
+	for param, val := range globals {
+		if err := setSysctl(param, val); err != nil {
+			log.Printf("[network-sysctl] warning: failed to set %s=%s: %v", param, val, err)
+		}
+	}
+
+	// Динамическая настройка для каждого выбранного интерфейса (br-lan, wg0 и др.)
+	for _, iface := range ifaces {
+		clean := strings.TrimSpace(iface)
+		if clean == "" || !ifaceRegex.MatchString(clean) {
+			continue
+		}
+
+		// 1. Loose Reverse Path Filter (rp_filter=2): предотвращает сброс асимметричного входящего TProxy-трафика
+		rpKey := fmt.Sprintf("net.ipv4.conf.%s.rp_filter", clean)
+		if err := setSysctl(rpKey, "2"); err != nil {
+			log.Printf("[network-sysctl] notice: %s not updated: %v (interface may be offline)", rpKey, err)
+		}
+
+		// 2. IP Forwarding (forwarding=1): разрешает пересылку пакетов между локальными и туннельными сетями
+		fwdKey := fmt.Sprintf("net.ipv4.conf.%s.forwarding", clean)
+		if err := setSysctl(fwdKey, "1"); err != nil {
+			log.Printf("[network-sysctl] notice: %s not updated: %v (interface may be offline)", fwdKey, err)
+		}
+	}
+}
+
+func setSysctl(param, val string) error {
+	// 1. Быстрая запись напрямую в псевдо-ФС ядра без вызова подпроцессов
+	procPath := "/proc/sys/" + strings.ReplaceAll(param, ".", "/")
+	if err := os.WriteFile(procPath, []byte(val+"\n"), 0644); err == nil {
+		return nil
+	}
+
+	// 2. Fallback через стандартную системную утилиту sysctl
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sysctl", "-w", fmt.Sprintf("%s=%s", param, val))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // ApplyNFTRules выполняет атомарное применение правил nftables для перехвата сетевого трафика через TProxy
 func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobalMode bool) error {
 	// Валидация TProxy порта
@@ -34,8 +91,9 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		return fmt.Errorf("invalid tproxy port: %d (must be between 1 and 65535)", tproxyPort)
 	}
 
-	// 1. Валидация сетевых интерфейсов (защита от DSL-инъекций в @interfaces)
+	// 1. Валидация сетевых интерфейсов и подготовка сырого списка для sysctl
 	var validIfaces []string
+	var rawIfaces []string
 	for _, iface := range ifaces {
 		clean := strings.TrimSpace(iface)
 		if clean == "" {
@@ -45,11 +103,16 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 			return fmt.Errorf("invalid interface name (possible injection attempt): %q", clean)
 		}
 		validIfaces = append(validIfaces, fmt.Sprintf("%q", clean))
+		rawIfaces = append(rawIfaces, clean)
 	}
 	if len(validIfaces) == 0 {
 		validIfaces = []string{`"br-lan"`}
+		rawIfaces = []string{"br-lan"}
 	}
 	ifaceElements := strings.Join(validIfaces, ", ")
+
+	// Применяем настройки ядра ОС для интерфейсов перед включением правил
+	ConfigureInterfaceSysctl(rawIfaces)
 
 	// 2. Валидация подсетей через строгий парсинг CIDR (только IPv4)
 	subnetElements := ""
@@ -68,14 +131,12 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 			}
 			_, ipNet, err := net.ParseCIDR(clean)
 			if err != nil {
-				// Пробуем распарсить как единичный IPv4-адрес
 				ip := net.ParseIP(clean)
 				if ip == nil || ip.To4() == nil {
 					return fmt.Errorf("invalid bypass subnet/ip: %q", clean)
 				}
 				validSubnets = append(validSubnets, ip.To4().String()+"/32")
 			} else {
-				// Защита от сбоя nftables при попытке положить IPv6 в set type ipv4_addr
 				if ipNet.IP.To4() == nil {
 					return fmt.Errorf("IPv6 subnets are not supported in IPv4 bypass set: %q", clean)
 				}
@@ -126,8 +187,7 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 		}
 	}
 
-	// Атомарный Netlink batch: объявление -> удаление старых правил -> применение новой таблицы.
-	// В случае синтаксической ошибки ядро Linux целиком откатывает транзакцию без fail-open утечек[cite: 8].
+	// Атомарный Netlink batch[cite: 5]
 	tpl := `table inet %s
 delete table inet %s
 table inet %s {
@@ -186,14 +246,13 @@ table inet %s {
 		TableMark,
 		TableMark, TableMark, tproxyPort,
 		TableMark, TableMark, tproxyPort,
-		SelfMark,            // Пропуск собственного служебного трафика ядра sing-box[cite: 8]
-		EmergencyDirectMark, // Пропуск прямого аварийного трафика демона (fallback обновления подписок)
+		SelfMark,
+		EmergencyDirectMark,
 		bypassOutputRule,
 		TableMark,
 		TableMark,
 	)
 
-	// Атомарное применение правил через stdin с жестким таймаутом
 	applyCtx, cancelApply := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelApply()
 
@@ -220,7 +279,6 @@ func FlushNFTRules() error {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("flush nft rules timed out")
 		}
-		// Если таблица уже отсутствует, ошибкой не считается
 		if strings.Contains(string(out), "No such file or directory") {
 			return nil
 		}

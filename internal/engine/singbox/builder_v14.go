@@ -783,7 +783,12 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode) (map[string]int
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			return nil, fmt.Errorf("skipped: transport '%s' is only supported by extended/lx sing-box builds", netType)
+			tr, err := buildXHTTPTransport(node)
+			if err != nil {
+				return nil, err
+			}
+			out["transport"] = tr
+			delete(out, "flow")
 		}
 
 	case "hysteria2", "hy2", "hysteria":
@@ -821,6 +826,26 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode) (map[string]int
 			"enabled":     true,
 			"server_name": strings.TrimSpace(node.SNI),
 			"insecure":    node.Insecure,
+		}
+
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		if netType == "ws" {
+			out["transport"] = map[string]interface{}{
+				"type":    "ws",
+				"path":    node.Path,
+				"headers": map[string]string{"Host": node.Host},
+			}
+		} else if netType == "grpc" {
+			out["transport"] = map[string]interface{}{
+				"type":         "grpc",
+				"service_name": node.Path,
+			}
+		} else if netType == "xhttp" || netType == "splithttp" {
+			tr, err := buildXHTTPTransport(node)
+			if err != nil {
+				return nil, err
+			}
+			out["transport"] = tr
 		}
 
 	case "socks", "socks5":

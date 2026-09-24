@@ -5,8 +5,6 @@ import (
 	"strings"
 )
 
-// MainSelectorTag задает имя главного селектора прокси в sing-box.
-// Используется синхронно во всех билдерах (v12/v13/v14), StateController и AdaptiveWorker[cite: 10, 11].
 const MainSelectorTag = "PROXY"
 
 type ClientMode string
@@ -58,6 +56,12 @@ type GenericNode struct {
 	PortRange    string `json:"port_range,omitempty"`
 	SocksVersion string `json:"socks_version,omitempty"`
 	SourceURL    string `json:"source_url,omitempty"`
+
+	// XHTTP (SplitHTTP) параметры для sing-box-lx / extended
+	XHTTPMode    string            `json:"xhttp_mode,omitempty"`
+	XHTTPPadding string            `json:"xhttp_padding,omitempty"`
+	XHTTPNoGRPC  bool              `json:"xhttp_no_grpc,omitempty"`
+	XHTTPHeaders map[string]string `json:"xhttp_headers,omitempty"`
 }
 
 type BalancingGroup struct {
@@ -123,6 +127,7 @@ type CheburConfig struct {
 	DNSPort               int                  `json:"dns_port"`
 	MixedPort             int                  `json:"mixed_port"`
 	SourceIface           string               `json:"source_iface"`
+	ProxyIfaces           []string             `json:"proxy_ifaces"`
 	DNSProtocol           string               `json:"dns_protocol"`
 	DNSServer             string               `json:"dns_server"`
 	BootstrapDNS          string               `json:"bootstrap_dns"`
@@ -164,6 +169,9 @@ func (c *CheburConfig) Clone() *CheburConfig {
 	}
 	cp := *c
 
+	if c.ProxyIfaces != nil {
+		cp.ProxyIfaces = append([]string(nil), c.ProxyIfaces...)
+	}
 	if c.ManualNodes != nil {
 		cp.ManualNodes = append([]string(nil), c.ManualNodes...)
 	}
@@ -191,6 +199,12 @@ func (c *CheburConfig) Clone() *CheburConfig {
 		for i, n := range c.Nodes {
 			if n != nil {
 				nodeCopy := *n
+				if n.XHTTPHeaders != nil {
+					nodeCopy.XHTTPHeaders = make(map[string]string, len(n.XHTTPHeaders))
+					for k, v := range n.XHTTPHeaders {
+						nodeCopy.XHTTPHeaders[k] = v
+					}
+				}
 				cp.Nodes[i] = &nodeCopy
 			}
 		}
