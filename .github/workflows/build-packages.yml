@@ -72,19 +72,13 @@ jobs:
       - name: Extract Version and Build Flags
         id: vars
         run: |
-          BUILD_TAGS=""
+          BUILD_TAGS="-tags metrics,with_public_sub,adaptive_probe"
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
-            if echo "$VERSION" | grep -Eiq 'beta|rc|alpha|dev'; then
-              BUILD_TAGS="-tags metrics,with_public_sub,adaptive_probe"
-              echo "[+] Pre-release tag detected ($VERSION): enabling '-tags metrics,with_public_sub,adaptive_probe'"
-            else
-              echo "[+] Stable release tag detected ($VERSION): standard build (no metrics, no public_sub, no adaptive_probe)"
-            fi
+            echo "[+] Tag release detected ($VERSION): enabling '$BUILD_TAGS'"
           else
             VERSION="0.0.1-$(git rev-parse --short HEAD)"
-            BUILD_TAGS="-tags metrics,with_public_sub,adaptive_probe"
-            echo "[+] Non-tag build ($VERSION): enabling '-tags metrics,with_public_sub,adaptive_probe'"
+            echo "[+] Non-tag build ($VERSION): enabling '$BUILD_TAGS'"
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
