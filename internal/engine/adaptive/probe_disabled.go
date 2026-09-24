@@ -62,3 +62,10 @@ func (p *Prober) SelectBestNode(ctx context.Context, nodes []*config.GenericNode
 func (p *Prober) SwitchOutbound(ctx context.Context, selector, nodeTag string) error {
 	return ErrClashAPINotConfigured
 }
+
+// InvalidateNode stub yeroo adaptive_probe hin fayyadamneef
+func (p *Prober) InvalidateNode(tag string) {}
+
+func (p *Prober) IsNodeFailed(tag string) bool {
+	return false
+}
