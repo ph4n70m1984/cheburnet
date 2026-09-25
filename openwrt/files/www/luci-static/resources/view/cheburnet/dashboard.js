@@ -660,11 +660,13 @@ return view.extend({
         o.value('1.1.1.1', 'Cloudflare');
         o.default = '77.88.8.8';
 
-        // Мультивыбор интерфейсов для проксирования трафика
-        o = s.taboption('dns_settings', widgets.NetworkSelect, 'proxy_ifaces', _('Интерфейсы для проксирования (TProxy)'));
+        // Выбор системных сетевых интерфейсов ядра Linux (br-lan, wg0 и др.)
+        o = s.taboption('dns_settings', widgets.DeviceSelect, 'proxy_ifaces', _('Интерфейсы для проксирования (TProxy)'));
         o.multiple = true;
+        o.noaliases = true;
         o.default = ['br-lan'];
-        o.description = _('Интерфейсы, с которых трафик перенаправляется в прокси (например: br-lan, wg0). Демон автоматически применяет для них rp_filter=2 и forwarding=1 в ядре Linux.');
+        o.rmempty = false;
+        o.description = _('Системные интерфейсы Linux (например: br-lan, wg0), с которых трафик перехватывается в прокси. Демон автоматически применяет для них rp_filter=2 и forwarding=1 в ядре.');
 
         if (hasPublicSub) {
             o = s.taboption('public_sub', form.Flag, 'public_sub_enabled', _('Включить публичный сервер подписки'));

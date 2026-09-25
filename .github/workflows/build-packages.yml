@@ -38,7 +38,7 @@ jobs:
             apk_arch: arm_cortex-a7_neon-vfpv4
             use_upx: true
 
-          # MediaTek MT7621, MT7628, ramips/mipsel (Cudy, Keenetic, Xiaomi, TP-Link Archer C6U и др.)
+          # MediaTek MT7621, MT7628, ramips/mipsel
           - arch: mipsel_24kc
             goarch: mipsle
             goarm: ""
@@ -60,10 +60,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Checkout sing-box-lx Core (v1.14.2-lx.2)
+        uses: actions/checkout@v4
+        with:
+          repository: 'Leadaxe/sing-box-lx'
+          ref: 'v1.14.2-lx.2'
+          path: 'src_singbox_lx'
+          submodules: 'recursive'
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.23'
           cache: true
 
       - name: Install UPX
@@ -97,15 +105,33 @@ jobs:
                    -trimpath \
                    -o bin/cheburnetd ./cmd/cheburnetd
 
-      - name: Compress binary with UPX
+      - name: Compile sing-box-lx Core
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+        run: |
+          mkdir -p bin dist
+          cd src_singbox_lx
+          go build -v -trimpath \
+            -tags "with_tproxy,with_vless,with_reality_server,with_clash_api,with_utls,with_quic,with_xhttp" \
+            -ldflags="-s -w -buildid=" \
+            -o ../bin/sing-box ./cmd/sing-box
+          cd ..
+
+      - name: Compress binaries with UPX
         if: ${{ matrix.use_upx }}
         run: |
           upx --best --lzma bin/cheburnetd
+          upx --best --lzma bin/sing-box
 
-      - name: Copy raw binary for Manager UpgradeSelf
+      - name: Copy raw binaries for distribution / direct download
         run: |
           mkdir -p dist
           cp bin/cheburnetd dist/cheburnetd_linux_${{ matrix.goarch }}
+          cp bin/sing-box dist/sing-box-lx_v1.14.2-lx.2_linux_${{ matrix.goarch }}
 
       - name: Pack .ipk Package
         run: |
@@ -166,7 +192,7 @@ jobs:
           cat <<EOF > "$PKG_DIR/control/control"
           Package: luci-app-cheburnet
           Version: ${{ steps.vars.outputs.version }}
-          Depends: sing-box, nftables, ip-full, ca-bundle
+          Depends: nftables, ip-full, ca-bundle
           Section: luci
           Architecture: ${{ matrix.opkg_arch }}
           Maintainer: Developer <dev@example.com>
@@ -198,7 +224,6 @@ jobs:
                    "$APK_DATA_DIR/usr/share/luci/menu.d" "$APK_DATA_DIR/usr/share/rpcd/acl.d" \
                    "$APK_SCRIPTS_DIR" dist
 
-          # Копирование исполняемого файла и скриптов инициализации
           cp bin/cheburnetd "$APK_DATA_DIR/usr/bin/cheburnetd"
           chmod 755 "$APK_DATA_DIR/usr/bin/cheburnetd"
 
@@ -246,7 +271,6 @@ jobs:
           EOF
           fi
 
-          # Валидация и нормализация формата версии для APK
           RAW_VER="${{ steps.vars.outputs.version }}"
           CLEAN_VER=$(echo "$RAW_VER" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/\1.\2.\3_p\4/')
           CLEAN_VER=$(echo "$CLEAN_VER" | sed -E 's/-.*//' | tr -cd '0-9.a-zA-Z_')
@@ -254,7 +278,6 @@ jobs:
 
           echo "[+] Сформирована валидная APK-версия: $CLEAN_VER"
 
-          # Установочные хуки (сохранение пользовательского конфига)
           cat <<'EOF' > "$APK_SCRIPTS_DIR/pre-install"
           #!/bin/sh
           if [ -f /etc/config/cheburnet ]; then
@@ -273,7 +296,6 @@ jobs:
           EOF
           chmod 755 "$APK_SCRIPTS_DIR/post-install"
 
-          # Создаем изолированный fakeroot для корректного маппинга UID/GID
           APK_ROOT_DIR=$(mktemp -d)
           mkdir -p "$APK_ROOT_DIR/etc"
           cat > "$APK_ROOT_DIR/etc/passwd" <<EOF
@@ -283,7 +305,6 @@ jobs:
           root:x:$(id -g):root
           EOF
 
-          # Формирование пакета метаданных conffiles для OpenWrt
           PACKAGES_DIR="$APK_DATA_DIR/lib/apk/packages"
           mkdir -p "$PACKAGES_DIR"
           
