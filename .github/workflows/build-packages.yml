@@ -116,7 +116,7 @@ jobs:
           mkdir -p bin dist
           cd src_singbox_lx
           go build -v -trimpath \
-            -tags "with_tproxy,with_vless,with_reality_server,with_clash_api,with_utls,with_quic,with_xhttp" \
+            -tags "with_tproxy,with_vless,with_clash_api,with_utls,with_quic,with_xhttp" \
             -ldflags="-s -w -buildid=" \
             -o ../bin/sing-box ./cmd/sing-box
           cd ..
