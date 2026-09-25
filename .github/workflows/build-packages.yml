@@ -115,9 +115,10 @@ jobs:
         run: |
           mkdir -p bin dist
           cd src_singbox_lx
+          CORE_VER="1.14.2-lx.2"
           go build -v -trimpath \
             -tags "with_tproxy,with_vless,with_clash_api,with_utls,with_quic,with_xhttp" \
-            -ldflags="-s -w -buildid=" \
+            -ldflags "-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=${CORE_VER}" \
             -o ../bin/sing-box ./cmd/sing-box
           cd ..
 
