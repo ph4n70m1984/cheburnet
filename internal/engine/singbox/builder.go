@@ -580,173 +580,180 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		})
 	}
 
-	if activeOutboundTag != "direct-out" {
-		routeRules = append(routeRules, map[string]interface{}{
-			"action":   "route",
-			"inbound":  []string{"tproxy-in"},
-			"ip_cidr":  []string{"198.18.0.0/15"},
-			"outbound": activeOutboundTag,
-		})
+	// 1. ПРИОРИТЕТНЫЕ ПОЛЬЗОВАТЕЛЬСКИЕ ПРАВИЛА (Route Policies)
+	for _, rp := range cfg.RoutePolicies {
+		if !rp.Enabled || rp.Outbound == "" {
+			continue
+		}
 
-		if isGlobal {
+		targetOutbound := rp.Outbound
+		if strings.EqualFold(targetOutbound, "direct") {
+			targetOutbound = "direct-out"
+		} else if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
+			targetOutbound = "PROXY"
+		}
+
+		rpDomains := cleanTokens(rp.Domains)
+		if len(rpDomains) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":        "route",
+				"inbound":       []string{"tproxy-in"},
+				"domain_suffix": rpDomains,
+				"outbound":      targetOutbound,
+			})
+		}
+
+		totalPolicySubnets := append([]string(nil), cleanTokens(rp.Subnets)...)
+		var policyRuleSets []string
+		hasPolicyTelegram := false
+
+		for _, rs := range rp.RuleSets {
+			cleanRS := strings.ToLower(strings.TrimSpace(rs))
+			if cleanRS == "" {
+				continue
+			}
+			policyRuleSets = append(policyRuleSets, cleanRS)
+			if cleanRS == "telegram" {
+				hasPolicyTelegram = true
+			}
+			if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
+				totalPolicySubnets = append(totalPolicySubnets, subnets...)
+			}
+		}
+
+		if hasPolicyTelegram {
+			totalPolicySubnets = append(totalPolicySubnets, getTelegramSubnets()...)
+		}
+
+		if len(totalPolicySubnets) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  totalPolicySubnets,
+				"outbound": targetOutbound,
+			})
+		}
+
+		if len(policyRuleSets) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"outbound": targetOutbound,
+				"rule_set": policyRuleSets,
+			})
+		}
+	}
+
+	if isGlobal {
+		if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},
 				"outbound": activeOutboundTag,
 			})
-		} else {
-			for _, rp := range cfg.RoutePolicies {
-				if !rp.Enabled || rp.Outbound == "" {
-					continue
-				}
+		}
+	} else {
+		// 2. ПОЛЬЗОВАТЕЛЬСКИЕ ДОМЕНЫ И СЕТИ ПО УМОЛЧАНИЮ
+		if len(cleanCustomDomains) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":        "route",
+				"inbound":       []string{"tproxy-in"},
+				"domain_suffix": cleanCustomDomains,
+				"outbound":      activeOutboundTag,
+			})
+		}
 
-				targetOutbound := rp.Outbound
-				if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
-					targetOutbound = "PROXY"
-				}
+		totalSubnets := append([]string(nil), cleanTokens(cfg.CustomSubnets)...)
+		var defaultRuleSets []string
+		hasDiscord := false
+		hasTelegram := false
 
-				totalPolicySubnets := append([]string(nil), cleanTokens(rp.Subnets)...)
-				var policyRuleSets []string
-				hasPolicyTelegram := false
-
-				for _, rs := range rp.RuleSets {
-					cleanRS := strings.ToLower(strings.TrimSpace(rs))
-					if cleanRS == "" {
-						continue
-					}
-					policyRuleSets = append(policyRuleSets, cleanRS)
-					if cleanRS == "telegram" {
-						hasPolicyTelegram = true
-					}
-					if subnets, err := b.rulesLoader.GetSubnets(cleanRS); err == nil && len(subnets) > 0 {
-						totalPolicySubnets = append(totalPolicySubnets, subnets...)
-					}
-				}
-
-				if hasPolicyTelegram {
-					totalPolicySubnets = append(totalPolicySubnets, getTelegramSubnets()...)
-				}
-
-				if len(totalPolicySubnets) > 0 {
-					routeRules = append(routeRules, map[string]interface{}{
-						"action":   "route",
-						"inbound":  []string{"tproxy-in"},
-						"ip_cidr":  totalPolicySubnets,
-						"outbound": targetOutbound,
-					})
-				}
-
-				rpDomains := cleanTokens(rp.Domains)
-				if len(rpDomains) > 0 {
-					routeRules = append(routeRules, map[string]interface{}{
-						"action":        "route",
-						"inbound":       []string{"tproxy-in"},
-						"domain_suffix": rpDomains,
-						"outbound":      targetOutbound,
-					})
-				}
-
-				if len(policyRuleSets) > 0 {
-					routeRules = append(routeRules, map[string]interface{}{
-						"action":   "route",
-						"inbound":  []string{"tproxy-in"},
-						"outbound": targetOutbound,
-						"rule_set": policyRuleSets,
-					})
-				}
+		for _, rs := range cfg.RuleSets {
+			cleanRS := strings.ToLower(strings.TrimSpace(rs))
+			if cleanRS == "" {
+				continue
 			}
-
-			totalSubnets := append([]string(nil), cleanTokens(cfg.CustomSubnets)...)
-			var defaultRuleSets []string
-			hasDiscord := false
-			hasTelegram := false
-
-			for _, rs := range cfg.RuleSets {
-				cleanRS := strings.ToLower(strings.TrimSpace(rs))
-				if cleanRS == "" {
-					continue
-				}
-				defaultRuleSets = append(defaultRuleSets, cleanRS)
-				if cleanRS == "discord" {
-					hasDiscord = true
-				}
-				if cleanRS == "telegram" {
-					hasTelegram = true
-				}
-				subnets, err := b.rulesLoader.GetSubnets(cleanRS)
-				if err == nil && len(subnets) > 0 {
-					totalSubnets = append(totalSubnets, subnets...)
-				}
+			defaultRuleSets = append(defaultRuleSets, cleanRS)
+			if cleanRS == "discord" {
+				hasDiscord = true
 			}
-
-			if hasTelegram {
-				totalSubnets = append(totalSubnets, getTelegramSubnets()...)
+			if cleanRS == "telegram" {
+				hasTelegram = true
 			}
-
-			if len(totalSubnets) > 0 {
-				routeRules = append(routeRules, map[string]interface{}{
-					"action":   "route",
-					"inbound":  []string{"tproxy-in"},
-					"ip_cidr":  totalSubnets,
-					"outbound": activeOutboundTag,
-				})
+			subnets, err := b.rulesLoader.GetSubnets(cleanRS)
+			if err == nil && len(subnets) > 0 {
+				totalSubnets = append(totalSubnets, subnets...)
 			}
+		}
 
-			if hasDiscord {
-				routeRules = append(routeRules, map[string]interface{}{
-					"action":     "route",
-					"inbound":    []string{"tproxy-in"},
-					"network":    "udp",
-					"port":       []uint16{443},
-					"port_range": []string{"50000:65535"},
-					"outbound":   activeOutboundTag,
-				})
-			}
+		if hasTelegram {
+			totalSubnets = append(totalSubnets, getTelegramSubnets()...)
+		}
 
-			if len(cfg.CustomPorts) > 0 {
-				singlePorts, portRanges := parsePortsAndRanges(cfg.CustomPorts)
-				if len(singlePorts) > 0 || len(portRanges) > 0 {
-					portRule := map[string]interface{}{
-						"action":   "route",
-						"inbound":  []string{"tproxy-in"},
-						"outbound": activeOutboundTag,
-					}
-					if len(singlePorts) > 0 {
-						portRule["port"] = singlePorts
-					}
-					if len(portRanges) > 0 {
-						portRule["port_range"] = portRanges
-					}
-					routeRules = append(routeRules, portRule)
-				}
-			}
+		if len(totalSubnets) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  totalSubnets,
+				"outbound": activeOutboundTag,
+			})
+		}
 
-			if len(cleanCustomDomains) > 0 {
-				routeRules = append(routeRules, map[string]interface{}{
-					"action":        "route",
-					"inbound":       []string{"tproxy-in"},
-					"domain_suffix": cleanCustomDomains,
-					"outbound":      activeOutboundTag,
-				})
-			}
+		if hasDiscord {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":     "route",
+				"inbound":    []string{"tproxy-in"},
+				"network":    "udp",
+				"port":       []uint16{443},
+				"port_range": []string{"50000:65535"},
+				"outbound":   activeOutboundTag,
+			})
+		}
 
-			if len(defaultRuleSets) > 0 {
-				routeRules = append(routeRules, map[string]interface{}{
+		if len(cfg.CustomPorts) > 0 {
+			singlePorts, portRanges := parsePortsAndRanges(cfg.CustomPorts)
+			if len(singlePorts) > 0 || len(portRanges) > 0 {
+				portRule := map[string]interface{}{
 					"action":   "route",
 					"inbound":  []string{"tproxy-in"},
 					"outbound": activeOutboundTag,
-					"rule_set": defaultRuleSets,
-				})
+				}
+				if len(singlePorts) > 0 {
+					portRule["port"] = singlePorts
+				}
+				if len(portRanges) > 0 {
+					portRule["port_range"] = portRanges
+				}
+				routeRules = append(routeRules, portRule)
 			}
+		}
 
-			if len(customSRSTags) > 0 {
-				routeRules = append(routeRules, map[string]interface{}{
-					"action":   "route",
-					"inbound":  []string{"tproxy-in"},
-					"outbound": activeOutboundTag,
-					"rule_set": customSRSTags,
-				})
-			}
+		if len(defaultRuleSets) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"outbound": activeOutboundTag,
+				"rule_set": defaultRuleSets,
+			})
+		}
+
+		if len(customSRSTags) > 0 {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"outbound": activeOutboundTag,
+				"rule_set": customSRSTags,
+			})
+		}
+
+		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
+		if activeOutboundTag != "direct-out" {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  []string{"198.18.0.0/15"},
+				"outbound": activeOutboundTag,
+			})
 		}
 	}
 

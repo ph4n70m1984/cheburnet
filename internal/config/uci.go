@@ -61,6 +61,35 @@ func parseTextLines(raw string) []string {
 	return result
 }
 
+func parseQuotedTokens(raw string) []string {
+	var result []string
+	if strings.Contains(raw, "'") {
+		tokens := strings.Split(raw, "'")
+		for _, token := range tokens {
+			item := sanitizeToken(token)
+			if item != "" {
+				result = append(result, item)
+			}
+		}
+	} else if strings.Contains(raw, "\"") {
+		tokens := strings.Split(raw, "\"")
+		for _, token := range tokens {
+			item := sanitizeToken(token)
+			if item != "" {
+				result = append(result, item)
+			}
+		}
+	} else {
+		for _, part := range strings.Fields(raw) {
+			item := sanitizeToken(part)
+			if item != "" {
+				result = append(result, item)
+			}
+		}
+	}
+	return result
+}
+
 func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 	var rules []CustomSRSRule
 	for _, raw := range rawList {
@@ -98,9 +127,11 @@ func parseCustomSRSRules(rawList []string) []CustomSRSRule {
 }
 
 type uciCache struct {
-	scalars map[string]string
-	lists   map[string][]string
-	rawShow string
+	scalars      map[string]string
+	lists        map[string][]string
+	sectionTypes map[string]string
+	sectionOrder []string
+	rawShow      string
 }
 
 func loadUCICache(packageName string) (*uciCache, error) {
@@ -110,9 +141,11 @@ func loadUCICache(packageName string) (*uciCache, error) {
 	}
 
 	cache := &uciCache{
-		scalars: make(map[string]string),
-		lists:   make(map[string][]string),
-		rawShow: string(out),
+		scalars:      make(map[string]string),
+		lists:        make(map[string][]string),
+		sectionTypes: make(map[string]string),
+		sectionOrder: make([]string, 0),
+		rawShow:      string(out),
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(out))
@@ -170,6 +203,20 @@ func loadUCICache(packageName string) (*uciCache, error) {
 
 func storeUCIEntry(cache *uciCache, k, rawVal string) {
 	v := sanitizeToken(rawVal)
+	parts := strings.Split(k, ".")
+
+	// Обнаружение объявления секции вида cheburnet.cfg046d03=route_policy
+	// или cheburnet.@route_policy[0]=route_policy
+	if len(parts) == 2 {
+		secID := parts[1]
+		if _, exists := cache.sectionTypes[secID]; !exists {
+			cache.sectionOrder = append(cache.sectionOrder, secID)
+		}
+		cache.sectionTypes[secID] = v
+		cache.scalars[k] = v
+		return
+	}
+
 	if idx := strings.Index(k, "["); idx != -1 && strings.HasSuffix(k, "]") {
 		baseKey := k[:idx]
 		if v != "" {
@@ -229,67 +276,143 @@ func (c *uciCache) getList(key string) []string {
 	return nil
 }
 
-func (u *UCIStorage) parseNodeGroupSections(rawShow string) []NodeFilterGroup {
+func (u *UCIStorage) parseNodeGroupSections(cache *uciCache) []NodeFilterGroup {
 	var groups []NodeFilterGroup
-	secMap := make(map[string]*NodeFilterGroup)
-	scanner := bufio.NewScanner(strings.NewReader(rawShow))
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "cheburnet.@node_group[") {
+	for _, secID := range cache.sectionOrder {
+		if cache.sectionTypes[secID] != "node_group" {
 			continue
 		}
+		prefix := "cheburnet." + secID + "."
 
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
+		enabledStr := cache.get(prefix+"enabled", "1")
+		enabled := enabledStr == "1" || strings.EqualFold(enabledStr, "true")
 
-		keyParts := strings.Split(parts[0], ".")
-		if len(keyParts) < 3 {
-			continue
-		}
+		name := cache.get(prefix+"name", "")
+		priority := cache.getInt(prefix+"priority", 50)
 
-		secID := keyParts[1]
-		val := parts[1]
-
-		if _, ok := secMap[secID]; !ok {
-			secMap[secID] = &NodeFilterGroup{
-				Enabled:  true,
-				Priority: 0,
+		rawRegex := cache.get(prefix+"regex", "")
+		var regexList []string
+		if rawRegex != "" {
+			regexList = parseQuotedTokens(rawRegex)
+			if len(regexList) == 0 {
+				regexList = []string{unquoteUCIValue(rawRegex)}
 			}
 		}
 
-		propName := keyParts[2]
-		if idx := strings.Index(propName, "["); idx != -1 {
-			propName = propName[:idx]
-		}
-
-		cleanVal := sanitizeToken(val)
-
-		switch propName {
-		case "name":
-			secMap[secID].Name = cleanVal
-		case "priority":
-			if p, err := strconv.Atoi(cleanVal); err == nil {
-				secMap[secID].Priority = p
-			}
-		case "enabled":
-			secMap[secID].Enabled = (cleanVal == "1" || strings.EqualFold(cleanVal, "true"))
-		case "regex":
-			cleanRegex := unquoteUCIValue(val)
-			if cleanRegex != "" {
-				secMap[secID].Regex = append(secMap[secID].Regex, cleanRegex)
-			}
-		}
-	}
-
-	for _, g := range secMap {
-		if g.Name != "" && g.Enabled && len(g.Regex) > 0 {
-			groups = append(groups, *g)
+		if name != "" && enabled && len(regexList) > 0 {
+			groups = append(groups, NodeFilterGroup{
+				Name:     name,
+				Priority: priority,
+				Enabled:  enabled,
+				Regex:    regexList,
+			})
 		}
 	}
 	return groups
+}
+
+func (u *UCIStorage) parseSubscriptionSections(cache *uciCache) []SubscriptionConfig {
+	var subs []SubscriptionConfig
+	for _, secID := range cache.sectionOrder {
+		if cache.sectionTypes[secID] != "subscription" {
+			continue
+		}
+		prefix := "cheburnet." + secID + "."
+
+		enabledStr := cache.get(prefix+"enabled", "1")
+		enabled := enabledStr == "1" || strings.EqualFold(enabledStr, "true")
+
+		url := cache.get(prefix+"url", "")
+		if url == "" || !enabled {
+			continue
+		}
+
+		name := cache.get(prefix+"name", "")
+		ua := cache.get(prefix+"user_agent", "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)")
+		hwid := cache.get(prefix+"hwid", "")
+		interval := cache.get(prefix+"update_interval", "24h")
+		filterMode := cache.get(prefix+"filter_mode", "exclude")
+
+		rawExclude := cache.get(prefix+"exclude_regex", "")
+		excludeRegex := parseQuotedTokens(rawExclude)
+
+		sub := SubscriptionConfig{
+			Name:           name,
+			URL:            url,
+			UserAgent:      ua,
+			HWID:           hwid,
+			UpdateInterval: interval,
+			FilterMode:     filterMode,
+			Enabled:        enabled,
+			ExcludeRegex:   excludeRegex,
+		}
+		sub.CompileFilters()
+		subs = append(subs, sub)
+	}
+	return subs
+}
+
+func (u *UCIStorage) parseRoutePolicySections(cache *uciCache) []RoutePolicy {
+	var policies []RoutePolicy
+	for _, secID := range cache.sectionOrder {
+		if cache.sectionTypes[secID] != "route_policy" {
+			continue
+		}
+		prefix := "cheburnet." + secID + "."
+
+		enabledStr := cache.get(prefix+"enabled", "1")
+		enabled := enabledStr == "1" || strings.EqualFold(enabledStr, "true")
+
+		name := cache.get(prefix+"name", "")
+		outbound := cache.get(prefix+"outbound", "")
+
+		rulesets := parseQuotedTokens(cache.get(prefix+"rulesets", ""))
+		domains := parseTextLines(cache.get(prefix+"custom_domains", ""))
+		subnets := parseTextLines(cache.get(prefix+"custom_subnets", ""))
+
+		p := RoutePolicy{
+			Name:     name,
+			Enabled:  enabled,
+			Outbound: outbound,
+			RuleSets: rulesets,
+			Domains:  domains,
+			Subnets:  subnets,
+		}
+
+		if p.Outbound != "" && p.Enabled && (len(p.RuleSets) > 0 || len(p.Domains) > 0 || len(p.Subnets) > 0) {
+			policies = append(policies, p)
+		}
+	}
+	return policies
+}
+
+func (u *UCIStorage) parseClientRuleSections(cache *uciCache) []ClientPolicy {
+	var policies []ClientPolicy
+	for _, secID := range cache.sectionOrder {
+		if cache.sectionTypes[secID] != "client_rule" {
+			continue
+		}
+		prefix := "cheburnet." + secID + "."
+
+		enabledStr := cache.get(prefix+"enabled", "1")
+		enabled := enabledStr == "1" || strings.EqualFold(enabledStr, "true")
+
+		target := cache.get(prefix+"target", "")
+		if target == "" || !enabled {
+			continue
+		}
+
+		name := cache.get(prefix+"name", "")
+		mode := ClientMode(cache.get(prefix+"mode", string(ClientModeRules)))
+
+		policies = append(policies, ClientPolicy{
+			Name:    name,
+			Target:  target,
+			Mode:    mode,
+			Enabled: enabled,
+		})
+	}
+	return policies
 }
 
 func (u *UCIStorage) Load() (*CheburConfig, error) {
@@ -337,17 +460,35 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		APIToken: cache.get("cheburnet.main.api_token", ""),
 	}
 
-	// Считываем список интерфейсов proxy_ifaces
-	cfg.ProxyIfaces = cache.getList("cheburnet.main.proxy_ifaces")
-	if len(cfg.ProxyIfaces) == 0 {
-		// Fallback на старое скалярное поле source_interface
+	rawIfaces := cache.getList("cheburnet.main.proxy_ifaces")
+	if len(rawIfaces) == 0 {
 		oldIface := cache.get("cheburnet.main.source_interface", "")
 		if oldIface != "" {
-			cfg.ProxyIfaces = []string{oldIface}
-		} else {
-			cfg.ProxyIfaces = []string{"br-lan"}
+			rawIfaces = []string{oldIface}
 		}
 	}
+
+	var cleanIfaces []string
+	seenIface := make(map[string]bool)
+
+	for _, iface := range rawIfaces {
+		clean := strings.TrimSpace(iface)
+		if clean == "" {
+			continue
+		}
+		if clean == "lan" {
+			clean = "br-lan"
+		}
+		if !seenIface[clean] {
+			seenIface[clean] = true
+			cleanIfaces = append(cleanIfaces, clean)
+		}
+	}
+
+	if len(cleanIfaces) == 0 {
+		cleanIfaces = []string{"br-lan"}
+	}
+	cfg.ProxyIfaces = cleanIfaces
 
 	if cfg.APIToken == "" {
 		generatedToken := generateSecureHex(16)
@@ -356,8 +497,8 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		cfg.APIToken = generatedToken
 	}
 
-	cfg.NodeGroups = u.parseNodeGroupSections(cache.rawShow)
-	cfg.Subscriptions = u.parseSubscriptionSections(cache.rawShow)
+	cfg.NodeGroups = u.parseNodeGroupSections(cache)
+	cfg.Subscriptions = u.parseSubscriptionSections(cache)
 
 	if len(cfg.Subscriptions) == 0 {
 		oldSubs := cache.getList("cheburnet.main.subscription")
@@ -377,8 +518,8 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		}
 	}
 
-	cfg.ClientPolicies = u.parseClientRuleSections(cache.rawShow)
-	cfg.RoutePolicies = u.parseRoutePolicySections(cache.rawShow)
+	cfg.ClientPolicies = u.parseClientRuleSections(cache)
+	cfg.RoutePolicies = u.parseRoutePolicySections(cache)
 
 	cfg.ManualNodes = cache.getList("cheburnet.main.manual_nodes")
 
@@ -422,220 +563,22 @@ func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
 		}
 	}
 
+	_ = exec.Command("uci", "-q", "delete", "cheburnet.main.proxy_ifaces").Run()
+	for _, iface := range cfg.ProxyIfaces {
+		clean := strings.TrimSpace(iface)
+		if clean == "lan" {
+			clean = "br-lan"
+		}
+		if clean != "" {
+			_ = exec.Command("uci", "add_list", "cheburnet.main.proxy_ifaces="+clean).Run()
+		}
+	}
+
 	if out, err := exec.Command("uci", "commit", "cheburnet").CombinedOutput(); err != nil {
 		return fmt.Errorf("uci commit cheburnet failed: %s (%w)", string(out), err)
 	}
 
 	return nil
-}
-
-func (u *UCIStorage) parseSubscriptionSections(rawShow string) []SubscriptionConfig {
-	var subs []SubscriptionConfig
-	secMap := make(map[string]*SubscriptionConfig)
-	scanner := bufio.NewScanner(strings.NewReader(rawShow))
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "cheburnet.@subscription[") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		keyParts := strings.Split(parts[0], ".")
-		if len(keyParts) < 3 {
-			continue
-		}
-
-		secID := keyParts[1]
-		val := sanitizeToken(parts[1])
-
-		if _, ok := secMap[secID]; !ok {
-			secMap[secID] = &SubscriptionConfig{
-				UserAgent:      "Happ/4.1.3 (iPhone; iOS 17.5.1; Scale/3.00)",
-				Enabled:        true,
-				FilterMode:     "exclude",
-				UpdateInterval: "24h",
-			}
-		}
-
-		propName := keyParts[2]
-		if idx := strings.Index(propName, "["); idx != -1 {
-			propName = propName[:idx]
-		}
-
-		switch propName {
-		case "name":
-			secMap[secID].Name = val
-		case "url":
-			secMap[secID].URL = val
-		case "user_agent":
-			secMap[secID].UserAgent = val
-		case "hwid":
-			secMap[secID].HWID = val
-		case "update_interval":
-			secMap[secID].UpdateInterval = val
-		case "filter_mode":
-			if strings.EqualFold(val, "include") {
-				secMap[secID].FilterMode = "include"
-			} else {
-				secMap[secID].FilterMode = "exclude"
-			}
-		case "enabled":
-			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
-		case "exclude_regex":
-			rawRight := parts[1]
-			if strings.Contains(rawRight, "'") {
-				tokens := strings.Split(rawRight, "'")
-				for _, token := range tokens {
-					item := sanitizeToken(token)
-					if item != "" {
-						secMap[secID].ExcludeRegex = append(secMap[secID].ExcludeRegex, item)
-					}
-				}
-			} else if val != "" {
-				secMap[secID].ExcludeRegex = append(secMap[secID].ExcludeRegex, val)
-			}
-		}
-	}
-
-	for _, sub := range secMap {
-		if sub.URL != "" && sub.Enabled {
-			if sub.FilterMode == "" {
-				sub.FilterMode = "exclude"
-			}
-			if sub.UpdateInterval == "" {
-				sub.UpdateInterval = "24h"
-			}
-			sub.CompileFilters()
-			subs = append(subs, *sub)
-		}
-	}
-	return subs
-}
-
-func (u *UCIStorage) parseRoutePolicySections(rawShow string) []RoutePolicy {
-	var policies []RoutePolicy
-	secMap := make(map[string]*RoutePolicy)
-	scanner := bufio.NewScanner(strings.NewReader(rawShow))
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "cheburnet.@route_policy[") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		keyParts := strings.Split(parts[0], ".")
-		if len(keyParts) < 3 {
-			continue
-		}
-
-		secID := keyParts[1]
-		val := sanitizeToken(parts[1])
-
-		if _, ok := secMap[secID]; !ok {
-			secMap[secID] = &RoutePolicy{
-				Enabled: true,
-			}
-		}
-
-		propName := keyParts[2]
-		if idx := strings.Index(propName, "["); idx != -1 {
-			propName = propName[:idx]
-		}
-
-		switch propName {
-		case "name":
-			secMap[secID].Name = val
-		case "outbound":
-			secMap[secID].Outbound = val
-		case "enabled":
-			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
-		case "rulesets":
-			rawRight := parts[1]
-			if strings.Contains(rawRight, "'") {
-				tokens := strings.Split(rawRight, "'")
-				for _, token := range tokens {
-					item := sanitizeToken(token)
-					if item != "" {
-						secMap[secID].RuleSets = append(secMap[secID].RuleSets, item)
-					}
-				}
-			} else if val != "" {
-				secMap[secID].RuleSets = append(secMap[secID].RuleSets, val)
-			}
-		case "custom_domains":
-			secMap[secID].Domains = append(secMap[secID].Domains, parseTextLines(val)...)
-		case "custom_subnets":
-			secMap[secID].Subnets = append(secMap[secID].Subnets, parseTextLines(val)...)
-		}
-	}
-
-	for _, p := range secMap {
-		if p.Outbound != "" && p.Enabled && (len(p.RuleSets) > 0 || len(p.Domains) > 0 || len(p.Subnets) > 0) {
-			policies = append(policies, *p)
-		}
-	}
-	return policies
-}
-
-func (u *UCIStorage) parseClientRuleSections(rawShow string) []ClientPolicy {
-	var policies []ClientPolicy
-	secMap := make(map[string]*ClientPolicy)
-	scanner := bufio.NewScanner(strings.NewReader(rawShow))
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "cheburnet.@client_rule[") {
-			continue
-		}
-
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		keyParts := strings.Split(parts[0], ".")
-		if len(keyParts) < 3 {
-			continue
-		}
-
-		secID := keyParts[1]
-		val := sanitizeToken(parts[1])
-
-		if _, ok := secMap[secID]; !ok {
-			secMap[secID] = &ClientPolicy{
-				Enabled: true,
-				Mode:    ClientModeRules,
-			}
-		}
-
-		switch keyParts[2] {
-		case "name":
-			secMap[secID].Name = val
-		case "target":
-			secMap[secID].Target = val
-		case "mode":
-			secMap[secID].Mode = ClientMode(val)
-		case "enabled":
-			secMap[secID].Enabled = (val == "1" || strings.EqualFold(val, "true"))
-		}
-	}
-
-	for _, p := range secMap {
-		if p.Target != "" && p.Enabled {
-			policies = append(policies, *p)
-		}
-	}
-	return policies
 }
 
 func (u *UCIStorage) SaveEngine(engineName string) error {
