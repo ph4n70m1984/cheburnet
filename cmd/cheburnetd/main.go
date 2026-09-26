@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,12 @@ var (
 	lastKnownActiveNodeMu sync.RWMutex
 )
 
+func initMemoryLimits() {
+	// Жесткий лимит кучи рантайма Go для предотвращения срабатывания Linux OOM-killer на роутерах с 128 МБ RAM
+	debug.SetMemoryLimit(32 * 1024 * 1024)
+	debug.SetGCPercent(50)
+}
+
 func initTimezone() {
 	if tzBytes, err := os.ReadFile("/etc/TZ"); err == nil {
 		tzStr := strings.TrimSpace(string(tzBytes))
@@ -53,7 +60,6 @@ func initTimezone() {
 			if loc, locErr := time.LoadLocation(tzStr); locErr == nil {
 				time.Local = loc
 			} else {
-				// Если zoneinfo отсутствует в OpenWrt, парсим смещение вручную
 				time.Local = time.FixedZone(tzStr, 3*3600)
 			}
 		}
@@ -202,13 +208,11 @@ func setupBootstrapResolver(cfg *config.CheburConfig) {
 		endpoints = append([]string{b}, endpoints...)
 	}
 
-	directDialer := &net.Dialer{
-		Timeout: 3 * time.Second,
-	}
+	directDialer := network.NewBypassDialer(3*time.Second, network.EmergencyDirectMarkInt)
 
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		Dial: func(ctx context.Context, networkProto, address string) (net.Conn, error) {
 			var lastErr error
 			for _, ep := range endpoints {
 				conn, err := directDialer.DialContext(ctx, "udp", ep)
@@ -226,7 +230,7 @@ func isMixedProxyAlive(mixedPort int) bool {
 	if mixedPort <= 0 {
 		mixedPort = 4534
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
 	d := net.Dialer{}
@@ -239,6 +243,7 @@ func isMixedProxyAlive(mixedPort int) bool {
 }
 
 func main() {
+	initMemoryLimits()
 	initTimezone()
 
 	if len(os.Args) < 2 {
@@ -642,7 +647,6 @@ func runDaemon() {
 	}
 
 	subWorker := subscription.NewWorker(initialConfig.AutoHWID, initialConfig.CustomHWID, initialConfig.MixedPort, mixedProxyAliveChecker)
-
 	diskCachedNodes := loadNodesCache()
 
 	switch initialConfig.SourceMode {
@@ -910,7 +914,6 @@ func runDaemon() {
 	for sig := range sigChan {
 		if sig == syscall.SIGHUP {
 			go func() {
-				// Защита от наложения параллельных reload-запросов
 				if !app.engineOpMu.TryLock() {
 					log.Println("[engine-reload] SIGHUP skipped: reload operation is already in progress")
 					return
@@ -939,8 +942,17 @@ func runDaemon() {
 	}
 
 	log.Println("[INFO] Shutting down Chebur.NET...")
+	// 1. Немедленно отменяем контекст, останавливая все горутины и supervisorLoop во избежание гонок
+	daemonCancel()
+	time.Sleep(100 * time.Millisecond)
+
+	// 2. Штатная остановка API и сервера подписок
 	_ = srv.Shutdown()
+
+	// 3. Гарантированная остановка ядра проксирования
 	app.stopActiveEngine()
+
+	// 4. Очистка Netfilter, policy routing и возврат настроек DNS
 	network.CleanupRouting()
 	_ = network.FlushNFTRules()
 	network.RestoreDnsmasq()
@@ -953,8 +965,18 @@ func stopDaemon() {
 		_ = exec.Command("killall", "cheburnetd").Run()
 		return
 	}
-	pid := strings.TrimSpace(string(data))
-	_ = exec.Command("kill", pid).Run()
+	pidStr := strings.TrimSpace(string(data))
+	pid, err := strconv.Atoi(pidStr)
+	if err == nil && pid > 1 {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+		for i := 0; i < 20; i++ {
+			if err := syscall.Kill(pid, 0); err != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
 	_ = os.Remove(PIDFile)
 }
 
@@ -1289,13 +1311,11 @@ func (a *App) supervisorLoop(ctx context.Context) {
 				continue
 			}
 
-			// Быстрая проверка L2 трафика (таймаут 2.5 сек)
 			trafficCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
 			startTraffic := time.Now()
 			err := engine.VerifyTraffic(trafficCtx, &cfg)
 			cancel()
 
-			// Если первый тест упал — делаем мгновенный подтверждающий ретест через 800 мс (не ждем 30 секунд!)
 			if err != nil {
 				time.Sleep(800 * time.Millisecond)
 				retestCtx, retestCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
@@ -1326,12 +1346,10 @@ func (a *App) supervisorLoop(ctx context.Context) {
 					generalConsecutiveFails++
 					log.Printf("[supervisor] Fail %d/2 in 'general'. Triggering next candidate...", generalConsecutiveFails)
 
-					// Уже после 2 сбоев подряд в general сразу уходим в надежный LTE-пул
 					if generalConsecutiveFails >= 2 && a.stateController != nil {
 						log.Printf("[supervisor] Failover: Group 'general' failed twice, switching to 'lte' pool immediately")
 						_ = a.stateController.SwitchGroup(ctx, "lte", "general_pool_failed")
 						generalConsecutiveFails = 0
-						// ГАРАНТИЯ DWELL TIME: засекаем точку старта работы в LTE
 						lastGeneralProbeTime = time.Now()
 					}
 				}
@@ -1348,15 +1366,12 @@ func (a *App) supervisorLoop(ctx context.Context) {
 					isInFaultState = false
 				}
 
-				// Фоновая проверка восстановления пула general:
-				// Запускается ТОЛЬКО после 150 секунд непрерывной стабильной работы в LTE
 				if currentGrp == "lte" && time.Since(lastGeneralProbeTime) > 150*time.Second {
 					lastGeneralProbeTime = time.Now()
 					if a.stateController != nil {
 						ok, winnerNodeTag := a.stateController.CheckGroupHealth(ctx, "general")
 						if ok && winnerNodeTag != "" {
 							log.Printf("[supervisor] Recovery: Functional node confirmed in 'general' pool ('%s'), returning [lte -> general]", winnerNodeTag)
-							// Переключаемся сразу на проверенный узел, а не вслепую на начало списка
 							if switchErr := a.stateController.SwitchGroup(ctx, "general", "general_recovered", winnerNodeTag); switchErr == nil {
 								if a.adaptiveWorker != nil {
 									a.adaptiveWorker.Trigger()
@@ -1485,7 +1500,7 @@ func testDNSQuery(ctx context.Context, serverAddr string, isDoH bool) (bool, int
 
 	r := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		Dial: func(ctx context.Context, networkProto, address string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 2 * time.Second}
 			return d.DialContext(ctx, "udp", dialTarget)
 		},

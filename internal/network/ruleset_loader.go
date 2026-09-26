@@ -3,6 +3,7 @@ package network
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -25,7 +26,7 @@ const (
 type CompressedRulesetLoader struct {
 	storageDir string
 	client     *http.Client
-	downloadMu sync.Map // Map[string]*sync.Mutex для исключения TOCTOU гонок на скачивание
+	downloadMu sync.Map
 }
 
 func NewCompressedRulesetLoader() *CompressedRulesetLoader {
@@ -33,13 +34,12 @@ func NewCompressedRulesetLoader() *CompressedRulesetLoader {
 	return &CompressedRulesetLoader{
 		storageDir: RulesStorageDir,
 		client: &http.Client{
-			Timeout: DownloadTimeout,
+			Timeout:   DownloadTimeout,
+			Transport: NewBypassTransport(DownloadTimeout, EmergencyDirectMarkInt),
 		},
 	}
 }
 
-// HasCIDRSubnets проверяет, содержит ли удаленный репозиторий списки IPv4-подсетей для этого сервиса.
-// Чисто доменные сервисы (google_ai, youtube, russia_inside и др.) маршрутизируются через .srs правила.
 func HasCIDRSubnets(rulesetName string) bool {
 	switch strings.ToLower(strings.TrimSpace(rulesetName)) {
 	case "telegram", "discord", "meta", "twitter":
@@ -54,14 +54,12 @@ func (l *CompressedRulesetLoader) getFileMutex(key string) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
-// GetSubnets читает локальный .gz кэш или скачивает его при первом запуске
 func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, error) {
 	normName := l.normalizeName(rulesetName)
 	if normName == "" {
 		return nil, nil
 	}
 
-	// Для чисто доменных правил не выполняем HTTP-запросы за подсетями
 	if !HasCIDRSubnets(normName) {
 		return nil, nil
 	}
@@ -72,7 +70,6 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Если файла нет или он пустой — скачиваем
 	if stat, err := os.Stat(targetGz); os.IsNotExist(err) || (err == nil && stat.Size() <= 30) {
 		if err := l.downloadAndCompressAtomic(normName, targetGz); err != nil {
 			log.Printf("[ruleset] WARN: Failed to download subnets for '%s': %v", normName, err)
@@ -83,7 +80,6 @@ func (l *CompressedRulesetLoader) GetSubnets(rulesetName string) ([]string, erro
 	return l.readCIDRsFromGz(targetGz)
 }
 
-// UpdateRuleset принудительно обновляет и упаковывает .txt.gz
 func (l *CompressedRulesetLoader) UpdateRuleset(rulesetName string) error {
 	normName := l.normalizeName(rulesetName)
 	if normName == "" || !HasCIDRSubnets(normName) {
@@ -110,7 +106,6 @@ func (l *CompressedRulesetLoader) normalizeName(name string) string {
 	}
 }
 
-// downloadAndCompressAtomic скачивает поток и сжимает его на лету с сохранением реальной ошибки
 func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetGz string) error {
 	candidates := []string{
 		fmt.Sprintf("https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Subnets/IPv4/%s.txt", rulesetName),
@@ -121,8 +116,11 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	var resp *http.Response
 	var lastErr error
 
+	ctx, cancel := context.WithTimeout(context.Background(), DownloadTimeout)
+	defer cancel()
+
 	for _, u := range candidates {
-		req, reqErr := http.NewRequest("GET", u, nil)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if reqErr != nil {
 			lastErr = reqErr
 			continue
@@ -145,9 +143,11 @@ func (l *CompressedRulesetLoader) downloadAndCompressAtomic(rulesetName, targetG
 	if resp == nil {
 		return fmt.Errorf("subnets for ruleset '%s' not found on remote (last error: %w)", rulesetName, lastErr)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+	}()
 
-	// Уникальный staging-файл для исключения гонок при параллельных загрузках
 	tmpFile, err := os.CreateTemp(TempDownloadDir, fmt.Sprintf("%s-*.txt.gz.tmp", rulesetName))
 	if err != nil {
 		return fmt.Errorf("create tmp file: %w", err)
@@ -198,7 +198,6 @@ func (l *CompressedRulesetLoader) validateGzFile(filePath string) error {
 	return nil
 }
 
-// StreamCIDRsFromGz валидирует CIDR построчно, исключая попадание IPv6 и мусорных строк
 func (l *CompressedRulesetLoader) StreamCIDRsFromGz(filePath string, onSubnet func(cidr string) error) error {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -222,10 +221,9 @@ func (l *CompressedRulesetLoader) StreamCIDRsFromGz(filePath string, onSubnet fu
 			continue
 		}
 
-		// Строгая проверка валидности CIDR или отдельного IPv4
 		if _, ipNet, err := net.ParseCIDR(line); err == nil {
 			if ipNet.IP.To4() == nil {
-				continue // Отклоняем IPv6
+				continue
 			}
 			if err := onSubnet(ipNet.String()); err != nil {
 				return err
@@ -233,7 +231,6 @@ func (l *CompressedRulesetLoader) StreamCIDRsFromGz(filePath string, onSubnet fu
 			continue
 		}
 
-		// Если передан чистый IPv4 без слэша
 		if ip := net.ParseIP(line); ip != nil && ip.To4() != nil {
 			if err := onSubnet(ip.To4().String() + "/32"); err != nil {
 				return err
@@ -258,7 +255,6 @@ func (l *CompressedRulesetLoader) safeCopyToFlash(src, dst string) error {
 		return err
 	}
 
-	// Уникальный staging-файл в том же каталоге для атомарного Rename
 	tmpFile, err := os.CreateTemp(dstDir, filepath.Base(dst)+"-*.tmp")
 	if err != nil {
 		return err
@@ -284,7 +280,6 @@ func (l *CompressedRulesetLoader) safeCopyToFlash(src, dst string) error {
 		return err
 	}
 
-	// Fsync директории для гарантии записи метаданных в файловую систему OpenWrt
 	if d, err := os.Open(dstDir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()

@@ -32,6 +32,7 @@ type SingBoxEngine struct {
 	builder14       ConfigBuilder
 	cmd             *exec.Cmd
 	cfg             *config.CheburConfig
+	logBuf          *RingLogBuffer
 	mu              sync.Mutex
 	isTransitioning bool
 	client          *http.Client
@@ -42,6 +43,7 @@ func NewSingBoxEngine() *SingBoxEngine {
 		builder12: singbox.NewBuilder(),
 		builder13: singbox.NewBuilderV13(),
 		builder14: singbox.NewBuilderV14(),
+		logBuf:    NewRingLogBuffer(64 * 1024),
 		client: &http.Client{
 			Transport: &http.Transport{
 				MaxIdleConns:      5,
@@ -88,15 +90,13 @@ func (s *SingBoxEngine) ValidateConfig(ctx context.Context, configPath string) e
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if checkCtx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("sing-box check timed out after 5s: configuration validation hung")
+			return fmt.Errorf("sing-box check timed out: configuration validation hung")
 		}
 		return fmt.Errorf("sing-box check failed: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// killPIDSafely проверяет, что указанный PID действительно принадлежит процессу sing-box
-// с переданным configPath, после чего завершает его точечно без вызова pkill/killall.
 func killPIDSafely(pid int, expectedConfig string) {
 	if pid <= 1 {
 		return
@@ -112,6 +112,7 @@ func killPIDSafely(pid int, expectedConfig string) {
 		return
 	}
 
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	_ = syscall.Kill(pid, syscall.SIGTERM)
 
 	for i := 0; i < 15; i++ {
@@ -121,6 +122,7 @@ func killPIDSafely(pid int, expectedConfig string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
@@ -150,12 +152,10 @@ func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 		s.mu.Unlock()
 	}()
 
-	// Останавливаем предыдущий процесс, если он существует
 	if s.cmd != nil {
 		_ = s.stopLocked()
 	}
 
-	// Очищаем зависший экземпляр по PID-файлу
 	s.cleanupStalePID(configPath)
 	s.mu.Unlock()
 
@@ -164,6 +164,9 @@ func (s *SingBoxEngine) Start(ctx context.Context, configPath string) error {
 	}
 
 	newCmd := NewIsolatedCmd(ctx, "sing-box", "run", "-c", configPath)
+	newCmd.Stdout = s.logBuf
+	newCmd.Stderr = s.logBuf
+
 	if err := newCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start sing-box: %w", err)
 	}
@@ -184,10 +187,7 @@ func (s *SingBoxEngine) Stop() error {
 	return s.stopLocked()
 }
 
-// stopLocked атомарно отвязывает активный *exec.Cmd и PID-файл, после чего
-// гарантирует полное завершение процесса sing-box.
 func (s *SingBoxEngine) stopLocked() error {
-	// 1. Атомарно забираем дескриптор процесса и немедленно обнуляем поле структуры
 	targetCmd := s.cmd
 	s.cmd = nil
 	_ = os.Remove(SingBoxPIDFile)
@@ -196,29 +196,19 @@ func (s *SingBoxEngine) stopLocked() error {
 		return nil
 	}
 
-	pid := targetCmd.Process.Pid
-	done := make(chan error, 1)
-	go func() {
-		done <- targetCmd.Wait()
-	}()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
 
-	// 2. Отправляем SIGTERM
-	_ = targetCmd.Process.Signal(syscall.SIGTERM)
+	return TerminateCmd(stopCtx, targetCmd)
+}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		// Принудительное завершение через SIGKILL при таймауте
-		_ = targetCmd.Process.Kill()
-		select {
-		case <-done:
-		case <-time.After(500 * time.Millisecond):
-		}
+func (s *SingBoxEngine) LastLogs() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logBuf != nil {
+		return s.logBuf.String()
 	}
-
-	// 3. Страховочная проверка: если процесс остался в системе, добиваем строго по PID
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	return nil
+	return ""
 }
 
 func (s *SingBoxEngine) CollectMetrics(ctx context.Context) (*UnifiedMetrics, error) {

@@ -13,6 +13,48 @@ import (
 
 type proxyDecisionKey struct{}
 
+// NewBypassDialer создает сетевой dialer с принудительной системной меткой SO_MARK.
+// Пакеты сокета помечаются меткой (по умолчанию EmergencyDirectMarkInt = 0x00300000),
+// что позволяет им миновать перехват TProxy в цепочке mangle_output nftables.
+func NewBypassDialer(timeout time.Duration, mark int) *net.Dialer {
+	if mark <= 0 {
+		mark = EmergencyDirectMarkInt
+	}
+	return &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+		Control: func(networkProto, address string, c syscall.RawConn) error {
+			var operr error
+			err := c.Control(func(fd uintptr) {
+				operr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark)
+			})
+			if err != nil {
+				return err
+			}
+			return operr
+		},
+	}
+}
+
+// NewBypassTransport создает http.Transport со встроенным BypassDialer
+func NewBypassTransport(timeout time.Duration, mark int) *http.Transport {
+	return &http.Transport{
+		DialContext:           NewBypassDialer(timeout, mark).DialContext,
+		ResponseHeaderTimeout: timeout,
+		TLSHandshakeTimeout:   10 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+		DisableKeepAlives:     true,
+	}
+}
+
+// NewBypassClient создает изолированный http.Client с обходом TProxy-перехвата
+func NewBypassClient(timeout time.Duration, mark int) *http.Client {
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: NewBypassTransport(timeout, mark),
+	}
+}
+
 func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive func() bool) *http.Transport {
 	if mixedPort <= 0 {
 		mixedPort = 4534
@@ -25,21 +67,13 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 		Timeout: timeout,
 	}
 
-	// Единый аварийный диалер: использует каноничную метку EmergencyDirectMarkInt (0x00300000)
-	directBypassDialer := &net.Dialer{
-		Timeout: timeout,
-		Control: func(protoName, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, EmergencyDirectMarkInt)
-			})
-		},
-	}
+	directBypassDialer := NewBypassDialer(timeout, EmergencyDirectMarkInt)
 
 	return &http.Transport{
 		Proxy: func(req *http.Request) (*url.URL, error) {
 			alive := isMixedProxyAlive != nil && isMixedProxyAlive()
 
-			// Сохраняем атомарное решение в контексте запроса для устранения P1-гонки с DialContext
+			// Сохраняем атомарное решение в контексте запроса для устранения гонки с DialContext
 			*req = *req.WithContext(context.WithValue(req.Context(), proxyDecisionKey{}, alive))
 
 			targetHost := req.URL.Host
@@ -58,10 +92,8 @@ func NewSmartTransport(timeout time.Duration, mixedPort int, isMixedProxyAlive f
 		DialContext: func(ctx context.Context, networkProto, addr string) (net.Conn, error) {
 			start := time.Now()
 
-			// Считываем зафиксированное на этапе Proxy() решение из контекста
 			useProxy, hasDecision := ctx.Value(proxyDecisionKey{}).(bool)
 			if !hasDecision {
-				// Фоллбэк на случай прямого вызова DialContext без прохождения Proxy func
 				useProxy = isMixedProxyAlive != nil && isMixedProxyAlive()
 			}
 

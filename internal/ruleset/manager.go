@@ -2,6 +2,7 @@ package ruleset
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -14,11 +15,13 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/network"
 )
 
 const (
-	RulesetDir = "/etc/cheburnet/rulesets"
-	BackupDir  = "/etc/cheburnet/rulesets_backup"
+	RulesetDir             = "/etc/cheburnet/rulesets"
+	BackupDir              = "/etc/cheburnet/rulesets_backup"
+	maxRulesetDownloadSize = 25 * 1024 * 1024 // 25 МБ лимит
 )
 
 type DiagnosticReporter interface {
@@ -69,7 +72,6 @@ func (m *Manager) FetchSystemRuleSet(ruleSetName string) (string, error) {
 	hashedPath := filepath.Join(RulesetDir, hashedFileName)
 	systemPath := filepath.Join(RulesetDir, fmt.Sprintf("%s.srs", srsName))
 
-	// 1. Проверяем наличие по хешированному пути, куда скачивает FetchRuleSet
 	if stat, err := os.Stat(hashedPath); err == nil && stat.Size() > 0 {
 		if _, sErr := os.Stat(systemPath); sErr != nil {
 			_ = copyFile(hashedPath, systemPath)
@@ -77,7 +79,6 @@ func (m *Manager) FetchSystemRuleSet(ruleSetName string) (string, error) {
 		return hashedPath, nil
 	}
 
-	// 2. Проверяем наличие по системному имени
 	if stat, err := os.Stat(systemPath); err == nil && stat.Size() > 0 {
 		return systemPath, nil
 	}
@@ -101,7 +102,6 @@ func (m *Manager) SyncAll(rules []config.CustomSRSRule) map[string]string {
 		fileName := fmt.Sprintf("srs_%s.srs", hash)
 		targetPath := filepath.Join(RulesetDir, fileName)
 
-		// Кэш для пользовательских правил: исключаем повторный запрос при релоаде
 		if stat, err := os.Stat(targetPath); err == nil && stat.Size() > 0 {
 			resolvedPaths[tag] = targetPath
 			continue
@@ -137,21 +137,31 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 		displayName = rawURL
 	}
 
-	client := &http.Client{Timeout: 90 * time.Second}
+	var client *http.Client
 
 	if detour == "proxy" {
 		proxyURL, err := url.Parse(m.socksProxy)
 		if err == nil {
-			client.Transport = &http.Transport{
-				Proxy:               http.ProxyURL(proxyURL),
-				DisableKeepAlives:   true,
-				TLSHandshakeTimeout: 15 * time.Second,
+			client = &http.Client{
+				Timeout: 90 * time.Second,
+				Transport: &http.Transport{
+					Proxy:               http.ProxyURL(proxyURL),
+					DisableKeepAlives:   true,
+					TLSHandshakeTimeout: 15 * time.Second,
+				},
 			}
+		} else {
+			client = network.NewBypassClient(90*time.Second, network.EmergencyDirectMarkInt)
 		}
+	} else {
+		client = network.NewBypassClient(90*time.Second, network.EmergencyDirectMarkInt)
 	}
 
 	err := func() error {
-		req, err := http.NewRequest("GET", rawURL, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 85*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return err
 		}
@@ -161,7 +171,10 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 		if err != nil {
 			return fmt.Errorf("соединение не удалось: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+		}()
 
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("HTTP %d (%s)", resp.StatusCode, resp.Status)
@@ -193,9 +206,14 @@ func (m *Manager) FetchRuleSet(name, rawURL, detour string) (string, error) {
 			return fmt.Errorf("запись заголовка: %w", err)
 		}
 
-		copied, err := io.Copy(out, resp.Body)
+		limitedBody := io.LimitReader(resp.Body, maxRulesetDownloadSize+1)
+		copied, err := io.Copy(out, limitedBody)
 		if err != nil {
 			return fmt.Errorf("сохранение потока данных: %w", err)
+		}
+
+		if copied > maxRulesetDownloadSize {
+			return fmt.Errorf("размер файла превысил допустимый лимит %d МБ", maxRulesetDownloadSize/(1024*1024))
 		}
 
 		log.Printf("[ruleset] Downloaded %d bytes for %s", int64(n)+copied, displayName)

@@ -12,14 +12,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"cheburnet/internal/config"
@@ -30,11 +28,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// maxSubscriptionSize снижен до 4 MiB: защита от OOM на роутерах со 128 МБ RAM
-const maxSubscriptionSize = 4 << 20
-
-// EmergencyDirectMark — отдельная метка для аварийного запроса подписок напрямую
-const EmergencyDirectMark = 0x00300000
+const maxSubscriptionSize = 4 << 20 // 4 MiB лимит
 
 type Worker struct {
 	autoHWID      bool
@@ -48,20 +42,7 @@ type Worker struct {
 
 func NewWorker(autoHWID bool, customHWID string, mixedPort int, engineAliveChecker func() bool) *Worker {
 	transport := network.NewSmartTransport(8*time.Second, mixedPort, engineAliveChecker)
-
-	// Используем каноничную метку network.EmergencyDirectMarkInt
-	directTransport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 8 * time.Second,
-			Control: func(networkProto, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, network.EmergencyDirectMarkInt)
-				})
-			},
-		}).DialContext,
-		ResponseHeaderTimeout: 8 * time.Second,
-		DisableKeepAlives:     true,
-	}
+	directTransport := network.NewBypassTransport(8*time.Second, network.EmergencyDirectMarkInt)
 
 	return &Worker{
 		autoHWID:      autoHWID,
@@ -135,7 +116,6 @@ func (w *Worker) StartSubscriptionLoops(ctx context.Context, subs []config.Subsc
 		s := sub
 		interval := parseDurationSafe(s.UpdateInterval)
 		subCtx, subCancel := context.WithCancel(ctx)
-		// Ключ включает имя и URL для исключения конфликтов коллизий
 		w.cancelMap[s.Name+"|"+s.URL] = subCancel
 
 		log.Printf("[subscription] Registered auto-update loop for %s (interval: %v, host: %s)",
@@ -181,7 +161,6 @@ func (w *Worker) getOrGenerateHWID() string {
 			}
 		}
 	}
-	// Генерация уникального псевдослучайного HWID вместо хардкода
 	randBytes := make([]byte, 16)
 	_, _ = rand.Read(randBytes)
 	return hex.EncodeToString(randBytes)
@@ -256,7 +235,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		targetHWID = w.getOrGenerateHWID()
 	}
 
-	// 1. Статические happ://crypt4/ парсятся офлайн
 	if happ.IsCrypt4(reqURL) {
 		decrypted, err := happ.DecryptCrypt4(reqURL, targetHWID, sub.HWID, "HappDefaultSalt")
 		if err != nil {
@@ -265,7 +243,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		return w.parseContent(decrypted, sub, targetHWID)
 	}
 
-	// 2. Первая попытка через основной клиент (SmartTransport)
 	body, err := w.fetchPayload(ctx, sub, targetHWID, w.client)
 	if err == nil {
 		nodes, parseErr := w.parseContent(body, sub, targetHWID)
@@ -277,7 +254,6 @@ func (w *Worker) FetchNodes(ctx context.Context, sub config.SubscriptionConfig) 
 		}
 	}
 
-	// 3. Безусловный фоллбэк на прямой аварийный клиент
 	host := safeHost(reqURL)
 	log.Printf("[subscription] WARN: Primary fetch failed for host %s (%v). Retrying via Direct Bypass...", host, err)
 	directBody, directErr := w.fetchPayload(ctx, sub, targetHWID, w.directClient)
@@ -323,7 +299,10 @@ func (w *Worker) fetchPayload(ctx context.Context, sub config.SubscriptionConfig
 	if err != nil {
 		return nil, fmt.Errorf("http fetch error: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subscription HTTP status: %d", resp.StatusCode)
@@ -383,11 +362,9 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 		return tag
 	}
 
-	// 1. Попытка распарсить как Xray JSON[cite: 7]
 	if xrayNodes := parseXrayJSON(body, targetHWID, sub.CompiledRegex, filterMode, subName, seenTags); len(xrayNodes) > 0 {
 		nodes = xrayNodes
 	} else {
-		// 2. Попытка распарсить как Clash YAML[cite: 7]
 		var clashCfg ClashConfig
 		if err := yaml.Unmarshal(body, &clashCfg); err == nil && len(clashCfg.Proxies) > 0 {
 			for _, p := range clashCfg.Proxies {
@@ -424,7 +401,6 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 				nodes = append(nodes, node)
 			}
 		} else {
-			// 3. Потоковое Base64 декодирование и Plaintext URI парсинг без раздувания кучи
 			trimmed := bytes.TrimSpace(body)
 			var streamReader io.Reader = bytes.NewReader(trimmed)
 
@@ -447,7 +423,6 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 				}
 			}
 
-			// 4. Построчный потоковый парсинг URI
 			scanner := bufio.NewScanner(streamReader)
 			scanBuf := make([]byte, 32*1024)
 			scanner.Buffer(scanBuf, 64*1024)
@@ -458,16 +433,25 @@ func (w *Worker) parseContent(body []byte, sub config.SubscriptionConfig, target
 					continue
 				}
 
+				var linesToProcess []string
 				if happ.IsCrypt4(line) {
 					if dec, err := happ.DecryptCrypt4(line, targetHWID, sub.HWID, "HappDefaultSalt"); err == nil {
-						line = string(dec)
+						linesToProcess = strings.Split(string(dec), "\n")
 					}
+				} else {
+					linesToProcess = []string{line}
 				}
 
-				node, err := uri.ParseNodeURI(line, w.autoHWID, targetHWID)
-				if err == nil && node != nil {
-					node.Tag = makeUniqueTag(node.Tag)
-					nodes = append(nodes, node)
+				for _, rawL := range linesToProcess {
+					rawL = strings.TrimSpace(rawL)
+					if rawL == "" || strings.HasPrefix(rawL, "#") {
+						continue
+					}
+					node, err := uri.ParseNodeURI(rawL, w.autoHWID, targetHWID)
+					if err == nil && node != nil {
+						node.Tag = makeUniqueTag(node.Tag)
+						nodes = append(nodes, node)
+					}
 				}
 			}
 		}

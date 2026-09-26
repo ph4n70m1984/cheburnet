@@ -2,9 +2,11 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 const (
@@ -15,20 +17,23 @@ const (
 )
 
 func SetupRouting() error {
-	// 1. Добавляем таблицу cheburnet в /etc/iproute2/rt_tables, если её там нет
-	_ = exec.Command("sh", "-c", fmt.Sprintf("grep -q '%d %s' /etc/iproute2/rt_tables 2>/dev/null || echo '%d %s' >> /etc/iproute2/rt_tables", RTTableID, RTTableName, RTTableID, RTTableName)).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. Добавляем таблицу cheburnet в /etc/iproute2/rt_tables
+	_ = exec.CommandContext(ctx, "sh", "-c", fmt.Sprintf("grep -q '%d %s' /etc/iproute2/rt_tables 2>/dev/null || echo '%d %s' >> /etc/iproute2/rt_tables", RTTableID, RTTableName, RTTableID, RTTableName)).Run()
 
 	// 2. Локальный роут на loopback для перехвата TProxy
-	_ = exec.Command("ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", fmt.Sprintf("%d", RTTableID)).Run()
+	_ = exec.CommandContext(ctx, "ip", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", fmt.Sprintf("%d", RTTableID)).Run()
 
-	// 3. Проверяем, существует ли уже это правило в системе
-	out, _ := exec.Command("ip", "rule", "show").CombinedOutput()
+	// 3. Проверяем, существует ли правило fwmark
+	out, _ := exec.CommandContext(ctx, "ip", "rule", "show").CombinedOutput()
 	outStr := string(out)
 	if strings.Contains(outStr, FwmarkHex) || strings.Contains(outStr, FwmarkDec) {
 		return nil
 	}
 
-	// 4. Последовательные попытки добавления с разными синтаксисами iproute2
+	// 4. Попытки добавления правила с различными синтаксисами
 	attempts := [][]string{
 		{"ip", "rule", "add", "fwmark", FwmarkHex, "table", fmt.Sprintf("%d", RTTableID), "priority", "105"},
 		{"ip", "rule", "add", "fwmark", FwmarkDec, "table", fmt.Sprintf("%d", RTTableID), "priority", "105"},
@@ -40,7 +45,7 @@ func SetupRouting() error {
 	var lastOutput string
 
 	for _, args := range attempts {
-		cmd := exec.Command(args[0], args[1:]...)
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		cmd.Stdout = &stderr
@@ -57,7 +62,10 @@ func SetupRouting() error {
 }
 
 func CleanupRouting() {
-	_ = exec.Command("ip", "rule", "del", "fwmark", FwmarkHex, "table", fmt.Sprintf("%d", RTTableID)).Run()
-	_ = exec.Command("ip", "rule", "del", "fwmark", FwmarkDec, "table", fmt.Sprintf("%d", RTTableID)).Run()
-	_ = exec.Command("ip", "route", "flush", "table", fmt.Sprintf("%d", RTTableID)).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	_ = exec.CommandContext(ctx, "ip", "rule", "del", "fwmark", FwmarkHex, "table", fmt.Sprintf("%d", RTTableID)).Run()
+	_ = exec.CommandContext(ctx, "ip", "rule", "del", "fwmark", FwmarkDec, "table", fmt.Sprintf("%d", RTTableID)).Run()
+	_ = exec.CommandContext(ctx, "ip", "route", "flush", "table", fmt.Sprintf("%d", RTTableID)).Run()
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"cheburnet/internal/config"
+	"cheburnet/internal/network"
 )
 
 type CensorshipSentinel struct {
@@ -45,9 +46,7 @@ func NewCensorshipSentinel(state *config.StateManager, controller *StateControll
 
 	directTransport := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: (&net.Dialer{
-			Timeout: 2 * time.Second,
-		}).DialContext,
+		DialContext:       network.NewBypassDialer(2*time.Second, network.EmergencyDirectMarkInt).DialContext,
 	}
 
 	tunnelTransport := &http.Transport{
@@ -124,7 +123,6 @@ func isTimeInWindow(now time.Time, startStr, endStr string) bool {
 func (s *CensorshipSentinel) tick(ctx context.Context) {
 	cfg := s.state.Get()
 
-	// Ручной оверрайд из интерфейса
 	if cfg.ActiveGroup != "" && cfg.ActiveGroup != "auto" && cfg.ActiveGroup != "all" {
 		currentGrp, _ := s.controller.GetActiveGroupNodes()
 		if currentGrp != cfg.ActiveGroup {
@@ -139,7 +137,6 @@ func (s *CensorshipSentinel) tick(ctx context.Context) {
 
 	now := time.Now()
 
-	// Проверка расписания
 	if cfg.ScheduleLTEEnabled && isTimeInWindow(now, cfg.ScheduleLTEStart, cfg.ScheduleLTEEnd) {
 		s.applySwitch(ctx, "lte", "schedule_active")
 		return
@@ -158,7 +155,7 @@ func (s *CensorshipSentinel) tick(ctx context.Context) {
 
 	wg.Add(3)
 
-	// 1. Проверка прямого зарубежного канала
+	// 1. Проверка прямого зарубежного канала с обходом TProxy
 	go func() {
 		defer wg.Done()
 		start := time.Now()
@@ -258,7 +255,6 @@ func (s *CensorshipSentinel) tick(ctx context.Context) {
 
 	wg.Wait()
 
-	// Защита от ложного срабатывания при отключенном кабеле (WAN Down)
 	if !domesticDirectAlive {
 		return
 	}
@@ -267,11 +263,8 @@ func (s *CensorshipSentinel) tick(ctx context.Context) {
 
 	var isCensored bool
 	if currentGroup == "lte" {
-		// В группе LTE остаемся ТОЛЬКО пока прямой зарубежный трафик заблокирован.
-		// Если прямой доступ восстановился — цензура снята, возвращаемся в general.
 		isCensored = foreignDirectDead
 	} else {
-		// В группе general фиксируем цензуру, только если зарубежный канал заблокирован И туннель не работает.
 		isCensored = foreignDirectDead && tunnelForeignDead
 	}
 
