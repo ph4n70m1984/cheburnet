@@ -19,6 +19,7 @@ import (
 type BuilderV14 struct {
 	rulesLoader    *network.CompressedRulesetLoader
 	rulesetManager *ruleset.Manager
+	binPath        string
 }
 
 func NewBuilderV14() *BuilderV14 {
@@ -26,6 +27,15 @@ func NewBuilderV14() *BuilderV14 {
 		rulesLoader:    network.NewCompressedRulesetLoader(),
 		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
+}
+
+func NewBuilderV14WithBin(binPath string) *BuilderV14 {
+	b := NewBuilderV14()
+	b.binPath = binPath
+	if binPath != "" {
+		SetBinaryPath(binPath)
+	}
+	return b
 }
 
 func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
@@ -294,17 +304,26 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	var allNodeTags []string
+	skippedCount := 0
+
 	for _, node := range cfg.Nodes {
 		ob, err := b.buildNodeOutbound(node)
 		if err != nil {
 			log.Printf("[WARN] [builder_v14] Skipped node '%s' (protocol: %s): %v", node.Tag, node.Protocol, err)
+			skippedCount++
 			continue
 		}
 		outbounds = append(outbounds, ob)
 		allNodeTags = append(allNodeTags, node.Tag)
 	}
 
-	log.Printf("[INFO] [builder_v14] Successfully compiled %d/%d nodes into sing-box outbounds", len(allNodeTags), len(cfg.Nodes))
+	if skippedCount > 0 {
+		log.Printf("[INFO] [builder_v14] Successfully compiled %d/%d nodes into sing-box outbounds (%d unsupported nodes skipped)",
+			len(allNodeTags), len(cfg.Nodes), skippedCount)
+	} else {
+		log.Printf("[INFO] [builder_v14] Successfully compiled %d/%d nodes into sing-box outbounds",
+			len(allNodeTags), len(cfg.Nodes))
+	}
 
 	activeOutboundTag := "direct-out"
 
@@ -480,7 +499,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	// 1. ПРИОРИТЕТНЫЕ ПОЛЬЗОВАТЕЛЬСКИЕ ПРАВИЛА (Route Policies)
-	// Должны стоять ВЫШЕ общего Fake-IP пула и глобального туннеля
 	for _, rp := range cfg.RoutePolicies {
 		if !rp.Enabled || rp.Outbound == "" {
 			continue
@@ -545,7 +563,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if isGlobal {
-		// В глобальном режиме всё, что не перехвачено RoutePolicies, уходит в основной прокси
 		if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
@@ -648,7 +665,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 
 		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
-		// Срабатывает только если домен не попал ни в одно правило выше
 		if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",

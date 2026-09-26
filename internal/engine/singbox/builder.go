@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 type Builder struct {
 	rulesLoader    *network.CompressedRulesetLoader
 	rulesetManager *ruleset.Manager
+	binPath        string
 }
 
 func NewBuilder() *Builder {
@@ -28,6 +28,15 @@ func NewBuilder() *Builder {
 		rulesLoader:    network.NewCompressedRulesetLoader(),
 		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
+}
+
+func NewBuilderWithBin(binPath string) *Builder {
+	b := NewBuilder()
+	b.binPath = binPath
+	if binPath != "" {
+		SetBinaryPath(binPath)
+	}
+	return b
 }
 
 func cleanTokens(items []string) []string {
@@ -48,30 +57,8 @@ func cleanTokens(items []string) []string {
 }
 
 func detectSingBoxVersion() (major, minor, patch int) {
-	binPath := "/usr/bin/sing-box"
-	if _, err := os.Stat(binPath); err != nil {
-		binPath = "sing-box"
-	}
-	out, err := exec.Command(binPath, "version").Output()
-	if err != nil {
-		return 1, 12, 0
-	}
-
-	fields := strings.Fields(string(out))
-	if len(fields) >= 3 {
-		rawVer := strings.TrimPrefix(fields[2], "v")
-		parts := strings.Split(rawVer, ".")
-		if len(parts) >= 2 {
-			major, _ = strconv.Atoi(parts[0])
-			minor, _ = strconv.Atoi(parts[1])
-			if len(parts) >= 3 {
-				subParts := strings.Split(parts[2], "-")
-				patch, _ = strconv.Atoi(subParts[0])
-			}
-			return major, minor, patch
-		}
-	}
-	return 1, 12, 0
+	ver := DetectVersion("")
+	return ver.Major, ver.Minor, ver.Patch
 }
 
 func loadDHCPLeasesMap() map[string]string {
@@ -397,14 +384,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	var allNodeTags []string
+	skippedCount := 0
+
 	for _, node := range cfg.Nodes {
 		ob, err := b.buildNodeOutbound(node)
 		if err == nil {
 			outbounds = append(outbounds, ob)
 			allNodeTags = append(allNodeTags, node.Tag)
 		} else {
-			log.Printf("[builder] WARN: Skipping node '%s': %v", node.Tag, err)
+			log.Printf("[WARN] [builder] Skipped node '%s' (protocol: %s): %v", node.Tag, node.Protocol, err)
+			skippedCount++
 		}
+	}
+
+	if skippedCount > 0 {
+		log.Printf("[INFO] [builder] Successfully compiled %d/%d nodes into sing-box outbounds (%d unsupported nodes skipped)",
+			len(allNodeTags), len(cfg.Nodes), skippedCount)
+	} else {
+		log.Printf("[INFO] [builder] Successfully compiled %d/%d nodes into sing-box outbounds",
+			len(allNodeTags), len(cfg.Nodes))
 	}
 
 	activeOutboundTag := "direct-out"
@@ -828,40 +826,55 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 }
 
 func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
+	if node == nil {
+		return nil, fmt.Errorf("node is nil")
+	}
+
+	tag := strings.TrimSpace(node.Tag)
+	addr := strings.TrimSpace(node.Address)
+	if tag == "" || addr == "" || node.Port <= 0 {
+		return nil, fmt.Errorf("invalid node address or port: tag='%s', addr='%s', port=%d", tag, addr, node.Port)
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(node.Protocol))
+
 	out := map[string]interface{}{
-		"tag":         node.Tag,
-		"server":      node.Address,
+		"tag":         tag,
+		"server":      addr,
 		"server_port": node.Port,
 	}
 
-	switch node.Protocol {
-	case "vless":
+	switch proto {
+	case "vless", "vlite":
 		out["type"] = "vless"
-		out["uuid"] = node.UUID
+		out["uuid"] = strings.TrimSpace(node.UUID)
 		if node.Flow != "" {
-			out["flow"] = node.Flow
+			out["flow"] = strings.TrimSpace(node.Flow)
 		}
 
-		tlsMap := map[string]interface{}{
-			"enabled":     true,
-			"server_name": node.SNI,
-			"insecure":    node.Insecure,
-		}
-		if node.Fingerprint != "" {
-			tlsMap["utls"] = map[string]interface{}{
+		sec := strings.ToLower(strings.TrimSpace(node.Security))
+		if sec == "tls" || sec == "reality" || node.SNI != "" || node.PublicKey != "" {
+			tlsMap := map[string]interface{}{
 				"enabled":     true,
-				"fingerprint": node.Fingerprint,
+				"server_name": strings.TrimSpace(node.SNI),
+				"insecure":    node.Insecure,
 			}
-		}
-		if node.Security == "reality" {
-			realityMap := map[string]interface{}{
-				"enabled":    true,
-				"public_key": node.PublicKey,
-				"short_id":   node.ShortID,
+			if node.Fingerprint != "" {
+				tlsMap["utls"] = map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": strings.TrimSpace(node.Fingerprint),
+				}
 			}
-			tlsMap["reality"] = realityMap
+			if sec == "reality" || node.PublicKey != "" {
+				realityMap := map[string]interface{}{
+					"enabled":    true,
+					"public_key": strings.TrimSpace(node.PublicKey),
+					"short_id":   strings.TrimSpace(node.ShortID),
+				}
+				tlsMap["reality"] = realityMap
+			}
+			out["tls"] = tlsMap
 		}
-		out["tls"] = tlsMap
 
 		netType := strings.ToLower(strings.TrimSpace(node.Network))
 		if netType == "ws" || netType == "websocket" {
@@ -884,9 +897,14 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 			delete(out, "flow")
 		}
 
-	case "hysteria2":
+	case "hysteria2", "hy2", "hysteria":
 		out["type"] = "hysteria2"
-		out["password"] = node.Password
+		password := node.Password
+		if password == "" {
+			password = node.UUID
+		}
+		out["password"] = strings.TrimSpace(password)
+
 		if node.PortRange != "" {
 			out["server_ports"] = strings.Split(node.PortRange, ",")
 		}
@@ -898,21 +916,21 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 		}
 		out["tls"] = map[string]interface{}{
 			"enabled":     true,
-			"server_name": node.SNI,
+			"server_name": strings.TrimSpace(node.SNI),
 			"insecure":    node.Insecure,
 		}
 
-	case "shadowsocks":
+	case "shadowsocks", "ss":
 		out["type"] = "shadowsocks"
-		out["method"] = node.Method
-		out["password"] = node.Password
+		out["method"] = strings.TrimSpace(node.Method)
+		out["password"] = strings.TrimSpace(node.Password)
 
 	case "trojan":
 		out["type"] = "trojan"
-		out["password"] = node.Password
+		out["password"] = strings.TrimSpace(node.Password)
 		out["tls"] = map[string]interface{}{
 			"enabled":     true,
-			"server_name": node.SNI,
+			"server_name": strings.TrimSpace(node.SNI),
 			"insecure":    node.Insecure,
 		}
 
@@ -936,9 +954,13 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 			out["transport"] = tr
 		}
 
-	case "socks":
+	case "socks", "socks5":
 		out["type"] = "socks"
-		out["version"] = node.SocksVersion
+		ver := node.SocksVersion
+		if ver == "" {
+			ver = "5"
+		}
+		out["version"] = ver
 		if node.Username != "" {
 			out["username"] = node.Username
 			out["password"] = node.Password

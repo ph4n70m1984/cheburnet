@@ -19,6 +19,7 @@ import (
 type BuilderV13 struct {
 	rulesLoader    *network.CompressedRulesetLoader
 	rulesetManager *ruleset.Manager
+	binPath        string
 }
 
 func NewBuilderV13() *BuilderV13 {
@@ -26,6 +27,15 @@ func NewBuilderV13() *BuilderV13 {
 		rulesLoader:    network.NewCompressedRulesetLoader(),
 		rulesetManager: ruleset.NewManager(nil, 4534),
 	}
+}
+
+func NewBuilderV13WithBin(binPath string) *BuilderV13 {
+	b := NewBuilderV13()
+	b.binPath = binPath
+	if binPath != "" {
+		SetBinaryPath(binPath)
+	}
+	return b
 }
 
 func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
@@ -294,17 +304,26 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	var allNodeTags []string
+	skippedCount := 0
+
 	for _, node := range cfg.Nodes {
 		ob, err := b.buildNodeOutbound(node)
 		if err != nil {
 			log.Printf("[WARN] [builder_v13] Skipped node '%s' (protocol: %s): %v", node.Tag, node.Protocol, err)
+			skippedCount++
 			continue
 		}
 		outbounds = append(outbounds, ob)
 		allNodeTags = append(allNodeTags, node.Tag)
 	}
 
-	log.Printf("[INFO] [builder_v13] Successfully compiled %d/%d nodes into sing-box outbounds", len(allNodeTags), len(cfg.Nodes))
+	if skippedCount > 0 {
+		log.Printf("[INFO] [builder_v13] Successfully compiled %d/%d nodes into sing-box outbounds (%d unsupported nodes skipped)",
+			len(allNodeTags), len(cfg.Nodes), skippedCount)
+	} else {
+		log.Printf("[INFO] [builder_v13] Successfully compiled %d/%d nodes into sing-box outbounds",
+			len(allNodeTags), len(cfg.Nodes))
+	}
 
 	activeOutboundTag := "direct-out"
 

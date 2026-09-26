@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cheburnet/internal/engine/singbox"
 )
 
 type EngineType string
@@ -25,9 +27,13 @@ type BinaryInfo struct {
 	Minor      int
 	Patch      int
 	IsExtended bool
+	IsLX       bool
+	HasXHTTP   bool
+	HasAWG     bool
+	Tags       []string
 }
 
-// CheckBinary валидирует наличие, исполняемость и извлекает версию бинарника sing-box
+// CheckBinary валидирует наличие, исполняемость и детальные возможности бинарника sing-box
 func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 	fi, err := os.Stat(binPath)
 	if err != nil {
@@ -54,15 +60,56 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 	}
 
 	output := out.String()
+	lines := strings.Split(output, "\n")
+	firstLine := ""
+	if len(lines) > 0 {
+		firstLine = strings.TrimSpace(lines[0])
+	}
+
 	info := &BinaryInfo{
 		Path:       binPath,
-		VersionRaw: strings.TrimSpace(strings.Split(output, "\n")[0]),
+		VersionRaw: firstLine,
+		Tags:       make([]string, 0),
 	}
 
-	if strings.Contains(strings.ToLower(output), "extended") || strings.Contains(strings.ToLower(output), "shtorm") {
+	lowerOutput := strings.ToLower(output)
+
+	// 1. Парсинг строки тегов скомпилированного Go-бинарника (Tags: with_clash_api,with_xhttp,...)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Tags:") {
+			tagStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "Tags:"))
+			for _, t := range strings.Split(tagStr, ",") {
+				t = strings.TrimSpace(t)
+				if t != "" {
+					info.Tags = append(info.Tags, t)
+					switch t {
+					case "with_xhttp":
+						info.HasXHTTP = true
+					case "with_awg", "with_amneziawg":
+						info.HasAWG = true
+					case "with_lx_command", "with_lxd", "with_lx_chain":
+						info.IsLX = true
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Определение форков по именованию и выводу
+	if strings.Contains(lowerOutput, "extended") || strings.Contains(lowerOutput, "shtorm") {
 		info.IsExtended = true
 	}
+	if strings.Contains(lowerOutput, "-lx") || strings.Contains(lowerOutput, " lx") || strings.Contains(lowerOutput, "sing-box-lx") {
+		info.IsLX = true
+	}
 
+	// 3. Если тег with_xhttp не был найден в явном виде, выполняем probe-тест ядра
+	if !info.HasXHTTP {
+		info.HasXHTTP = ProbeXHTTPSupport(binPath)
+	}
+
+	// 4. Парсинг семантической версии
 	re := regexp.MustCompile(`v?(\d+)\.(\d+)(?:\.(\d+))?`)
 	matches := re.FindStringSubmatch(output)
 	if len(matches) >= 3 {
@@ -79,11 +126,57 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 		return nil, err
 	}
 
+	// Синхронизируем активный проверенный бинарник с пакетом builder'а singbox
+	singbox.SetBinaryPath(binPath)
+
 	return info, nil
 }
 
+// ProbeXHTTPSupport проверяет реальную поддержку транспорта xhttp через sing-box check
+func ProbeXHTTPSupport(binPath string) bool {
+	dummyJSON := `{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "probe",
+      "server": "127.0.0.1",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "transport": {
+        "type": "xhttp",
+        "path": "/"
+      }
+    }
+  ]
+}`
+
+	tmpFile, err := os.CreateTemp("", "sb-probe-*.json")
+	if err != nil {
+		return false
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(dummyJSON); err != nil {
+		_ = tmpFile.Close()
+		return false
+	}
+	_ = tmpFile.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, binPath, "check", "-c", tmpFile.Name())
+	out, _ := cmd.CombinedOutput()
+
+	// Если бинарник не поддерживает SplitHTTP/xhttp, он вернёт exit status 1 с явной ошибкой транспорта
+	if strings.Contains(string(out), "unknown transport type: xhttp") {
+		return false
+	}
+
+	return true
+}
+
 func validateMinimumVersion(info *BinaryInfo) error {
-	// Для формата 1.8+ и работы clash_api
 	if info.Major < 1 || (info.Major == 1 && info.Minor < 8) {
 		return fmt.Errorf("версия sing-box %d.%d.%d слишком старая (требуется >= 1.8.0)", info.Major, info.Minor, info.Patch)
 	}
