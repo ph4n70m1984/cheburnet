@@ -1,17 +1,25 @@
 package learning
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"cheburnet/internal/config"
+)
+
+var (
+	// Ловит ошибки сброса TCP и таймауты ядра на прямом выходе direct-out (ТСПУ RST / Blackhole)
+	logRstRegex        = regexp.MustCompile(`outbound\/direct\[direct-out\]:.*(?:dial|connect|read).*(?:connection reset by peer|i/o timeout|handshake failure|broken pipe|EOF)`)
+	domainExtractRegex = regexp.MustCompile(`([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z0-9][-a-zA-Z0-9.]+)`)
 )
 
 type DomainCandidate struct {
@@ -20,7 +28,12 @@ type DomainCandidate struct {
 	FirstSeen   time.Time `json:"first_seen"`
 	LastSeen    time.Time `json:"last_seen"`
 	LastClient  string    `json:"last_client"`
+	Reason      string    `json:"reason"`
 	AutoApplied bool      `json:"auto_applied"`
+}
+
+type LogReader interface {
+	LastLogs() string
 }
 
 type DomainLearner struct {
@@ -28,20 +41,22 @@ type DomainLearner struct {
 	candidates  map[string]*DomainCandidate
 	state       *config.StateManager
 	client      *http.Client
+	logReader   LogReader
 	clashSecret string
 	autoPromote bool
 	threshold   int
 }
 
-func NewDomainLearner(state *config.StateManager, clashSecret string, autoPromote bool) *DomainLearner {
+func NewDomainLearner(state *config.StateManager, clashSecret string, autoPromote bool, logReader LogReader) *DomainLearner {
 	return &DomainLearner{
 		candidates:  make(map[string]*DomainCandidate),
 		state:       state,
+		logReader:   logReader,
 		clashSecret: clashSecret,
 		autoPromote: autoPromote,
 		threshold:   3,
 		client: &http.Client{
-			Timeout: 2 * time.Second,
+			Timeout: 1500 * time.Millisecond,
 		},
 	}
 }
@@ -57,7 +72,6 @@ type clashConnectionItem struct {
 	Download int64     `json:"download"`
 	Start    time.Time `json:"start"`
 	Chains   []string  `json:"chains"`
-	Rule     string    `json:"rule"`
 }
 
 type clashConnectionsResponse struct {
@@ -65,21 +79,26 @@ type clashConnectionsResponse struct {
 }
 
 func (l *DomainLearner) StartLoop(ctx context.Context) {
-	ticker := time.NewTicker(4 * time.Second)
-	defer ticker.Stop()
+	connTicker := time.NewTicker(1500 * time.Millisecond)
+	logTicker := time.NewTicker(2000 * time.Millisecond)
+	defer connTicker.Stop()
+	defer logTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			l.auditDirectConnections(ctx)
+		case <-connTicker.C:
+			l.auditActiveConnections(ctx)
+		case <-logTicker.C:
+			l.auditEngineLogs()
 		}
 	}
 }
 
-func (l *DomainLearner) auditDirectConnections(ctx context.Context) {
-	reqCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+// Контур А: Анализ активных сессий Clash API (Silent Drop / таймаут ответа сервера)
+func (l *DomainLearner) auditActiveConnections(ctx context.Context) {
+	reqCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://127.0.0.1:9090/connections", nil)
@@ -127,18 +146,52 @@ func (l *DomainLearner) auditDirectConnections(ctx context.Context) {
 			continue
 		}
 
-		// Критерий сбоя: клиент послал SYN/ClientHello (Upload > 60 байт), прошло > 2.5 сек, но Download == 0
+		// Запрос отправлен (Upload > 30 байт), прошло > 1.2 с, входящего трафика нет
 		duration := now.Sub(conn.Start)
-		if conn.Upload > 60 && conn.Download == 0 && duration > 2500*time.Millisecond {
-			l.recordFailure(host, conn.Metadata.ClientIP)
+		if conn.Upload > 30 && conn.Download == 0 && duration > 1200*time.Millisecond {
+			l.recordFailure(host, conn.Metadata.ClientIP, "silent_timeout")
 		}
 	}
 }
 
-func (l *DomainLearner) recordFailure(rawHost, clientIP string) {
+// Контур Б: Анализ мгновенных TCP RST через системный вывод ядра Sing-Box
+func (l *DomainLearner) auditEngineLogs() {
+	if l.logReader == nil {
+		return
+	}
+
+	logs := l.logReader.LastLogs()
+	if len(logs) == 0 {
+		return
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(logs))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if logRstRegex.MatchString(line) {
+			matches := domainExtractRegex.FindAllString(line, -1)
+			for _, match := range matches {
+				matchLower := strings.ToLower(match)
+				if !strings.Contains(matchLower, ".") || net.ParseIP(matchLower) != nil {
+					continue
+				}
+				if strings.HasSuffix(matchLower, "direct-out") || strings.HasSuffix(matchLower, "sing-box") {
+					continue
+				}
+				l.recordFailure(matchLower, "router/local", "tcp_rst_injected")
+			}
+		}
+	}
+}
+
+func (l *DomainLearner) recordFailure(rawHost, clientIP, reason string) {
 	host := strings.ToLower(rawHost)
 	if h, _, err := net.SplitHostPort(rawHost); err == nil {
 		host = strings.ToLower(h)
+	}
+
+	if strings.Contains(host, "cloudflare") || strings.Contains(host, "gstatic") || strings.Contains(host, "yandex") {
+		return
 	}
 
 	l.mu.Lock()
@@ -152,12 +205,15 @@ func (l *DomainLearner) recordFailure(rawHost, clientIP string) {
 			FirstSeen:  time.Now(),
 			LastSeen:   time.Now(),
 			LastClient: clientIP,
+			Reason:     reason,
 		}
 		l.candidates[host] = cand
+		log.Printf("[domain-learning] Captured blocked candidate: %s (reason: %s, client: %s)", host, reason, clientIP)
 	} else {
 		cand.FailCount++
 		cand.LastSeen = time.Now()
 		cand.LastClient = clientIP
+		cand.Reason = reason
 	}
 
 	if l.autoPromote && cand.FailCount >= l.threshold && !cand.AutoApplied {
@@ -167,7 +223,7 @@ func (l *DomainLearner) recordFailure(rawHost, clientIP string) {
 }
 
 func (l *DomainLearner) promoteDomainToConfig(domain string) {
-	log.Printf("[domain-learning] Promoting blocked domain candidate '%s' to custom_domains...", domain)
+	log.Printf("[domain-learning] Promoting blocked domain '%s' into custom_domains...", domain)
 	candidate := l.state.Clone()
 
 	for _, d := range candidate.CustomDomains {

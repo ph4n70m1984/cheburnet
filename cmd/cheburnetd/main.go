@@ -771,7 +771,7 @@ func runDaemon() {
 	stateController := adaptive.NewStateController(state, prober)
 	adaptiveWorker := adaptive.NewWorker(state, prober, stateController)
 	sentinel := adaptive.NewCensorshipSentinel(state, stateController, initialConfig.MixedPort)
-	domainLearner := learning.NewDomainLearner(state, initialConfig.ClashAPISecret, initialConfig.AutoLearnDomains)
+	domainLearner := learning.NewDomainLearner(state, initialConfig.ClashAPISecret, initialConfig.AutoLearnDomains, sbEngine)
 
 	app := &App{
 		state:           state,

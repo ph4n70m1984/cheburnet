@@ -159,9 +159,6 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		allRuleSets = append(allRuleSets, rs)
 	}
 
-	dnsRuleSetList := append([]string(nil), allRuleSets...)
-	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
-
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -175,32 +172,10 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	if isGlobal {
-		dnsRules = append(dnsRules, map[string]interface{}{
-			"server": "fakeip-dns",
-		})
-	} else {
-		var fakeipDomains []string
-		fakeipDomains = append(fakeipDomains, cleanCustomDomains...)
-		for _, rp := range cfg.RoutePolicies {
-			if rp.Enabled && len(rp.Domains) > 0 {
-				fakeipDomains = append(fakeipDomains, cleanTokens(rp.Domains)...)
-			}
-		}
-
-		if len(fakeipDomains) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":        "fakeip-dns",
-				"domain_suffix": fakeipDomains,
-			})
-		}
-		if len(dnsRuleSetList) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":   "fakeip-dns",
-				"rule_set": dnsRuleSetList,
-			})
-		}
-	}
+	// Направляем внешние домены в fakeip-dns
+	dnsRules = append(dnsRules, map[string]interface{}{
+		"server": "fakeip-dns",
+	})
 
 	remoteServerEntry := map[string]interface{}{
 		"tag":         "remote-dns",
@@ -524,7 +499,6 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	leasesMap := loadDHCPLeasesMap()
 
-	// Multi-Outbound клиентские политики
 	for _, cp := range cfg.ClientPolicies {
 		if !cp.Enabled || cp.Target == "" {
 			continue
@@ -559,7 +533,6 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// Route Policies
 	for _, rp := range cfg.RoutePolicies {
 		if !rp.Enabled || rp.Outbound == "" {
 			continue
@@ -724,7 +697,15 @@ func (b *BuilderV13) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		if activeOutboundTag != "direct-out" {
+		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
+		if !isGlobal {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  []string{"198.18.0.0/15"},
+				"outbound": "direct-out",
+			})
+		} else if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},

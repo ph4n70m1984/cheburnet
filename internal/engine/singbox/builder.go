@@ -256,40 +256,13 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		allRuleSets = append(allRuleSets, rs)
 	}
 
-	dnsRuleSetList := append([]string(nil), allRuleSets...)
-	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
-
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	if isGlobal {
-		dnsRules = append(dnsRules, map[string]interface{}{
-			"action": "route",
-			"server": "fakeip-dns",
-		})
-	} else {
-		var fakeipDomains []string
-		fakeipDomains = append(fakeipDomains, cleanCustomDomains...)
-		for _, rp := range cfg.RoutePolicies {
-			if rp.Enabled && len(rp.Domains) > 0 {
-				fakeipDomains = append(fakeipDomains, cleanTokens(rp.Domains)...)
-			}
-		}
-
-		if len(fakeipDomains) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"action":        "route",
-				"server":        "fakeip-dns",
-				"domain_suffix": fakeipDomains,
-			})
-		}
-		if len(dnsRuleSetList) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"action":   "route",
-				"server":   "fakeip-dns",
-				"rule_set": dnsRuleSetList,
-			})
-		}
-	}
+	// Направляем внешние домены в fakeip-dns
+	dnsRules = append(dnsRules, map[string]interface{}{
+		"action": "route",
+		"server": "fakeip-dns",
+	})
 
 	dnsConfig := map[string]interface{}{
 		"servers": []map[string]interface{}{
@@ -557,7 +530,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if len(allNodeTags) > 0 {
 		urltestTag := "auto"
-		selectorTag := "PROXY"
+		selectorTag := config.MainSelectorTag
 
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":                        "urltest",
@@ -604,7 +577,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	leasesMap := loadDHCPLeasesMap()
 
-	// Multi-Outbound клиентские политики
 	for _, cp := range cfg.ClientPolicies {
 		if !cp.Enabled || cp.Target == "" {
 			continue
@@ -639,7 +611,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// Route Policies
 	for _, rp := range cfg.RoutePolicies {
 		if !rp.Enabled || rp.Outbound == "" {
 			continue
@@ -648,8 +619,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		targetOutbound := rp.Outbound
 		if strings.EqualFold(targetOutbound, "direct") {
 			targetOutbound = "direct-out"
-		} else if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
-			targetOutbound = "PROXY"
+		} else if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, config.MainSelectorTag)) && configType != "urltest" {
+			targetOutbound = config.MainSelectorTag
 		}
 
 		rpDomains := cleanTokens(rp.Domains)
@@ -804,7 +775,15 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		if activeOutboundTag != "direct-out" {
+		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
+		if !isGlobal {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  []string{"198.18.0.0/15"},
+				"outbound": "direct-out",
+			})
+		} else if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},

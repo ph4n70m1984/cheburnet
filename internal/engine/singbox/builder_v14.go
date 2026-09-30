@@ -159,9 +159,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		allRuleSets = append(allRuleSets, rs)
 	}
 
-	dnsRuleSetList := append([]string(nil), allRuleSets...)
-	dnsRuleSetList = append(dnsRuleSetList, customSRSTags...)
-
 	dnsRules := []map[string]interface{}{
 		{
 			"action":     "reject",
@@ -175,32 +172,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	if isGlobal {
-		dnsRules = append(dnsRules, map[string]interface{}{
-			"server": "fakeip-dns",
-		})
-	} else {
-		var fakeipDomains []string
-		fakeipDomains = append(fakeipDomains, cleanCustomDomains...)
-		for _, rp := range cfg.RoutePolicies {
-			if rp.Enabled && len(rp.Domains) > 0 {
-				fakeipDomains = append(fakeipDomains, cleanTokens(rp.Domains)...)
-			}
-		}
-
-		if len(fakeipDomains) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":        "fakeip-dns",
-				"domain_suffix": fakeipDomains,
-			})
-		}
-		if len(dnsRuleSetList) > 0 {
-			dnsRules = append(dnsRules, map[string]interface{}{
-				"server":   "fakeip-dns",
-				"rule_set": dnsRuleSetList,
-			})
-		}
-	}
+	// Направляем внешние домены в fakeip-dns. Неизвестные домены в rules-режиме
+	// получат Fake-IP и пойдут в direct-out, позволяя Sing-Box зафиксировать блокировку.
+	dnsRules = append(dnsRules, map[string]interface{}{
+		"server": "fakeip-dns",
+	})
 
 	remoteServerEntry := map[string]interface{}{
 		"tag":         "remote-dns",
@@ -304,7 +280,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
-	// 1. Подготовка сопоставления групп интерфейсам ОС (Multi-WAN PBR)
 	groupIfaceMap := make(map[string]string)
 	groupRegexMap := make(map[string][]*regexp.Regexp)
 	for _, ng := range cfg.NodeGroups {
@@ -385,9 +360,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
 	}
 
-	// 2. Создание селекторов для групп классификации (NodeGroups: stream, game, lte и др.)
-	createdGroups := make(map[string]bool)
-
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
 			var validGrpNodes []string
@@ -434,7 +406,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"outbounds": selectorList,
 				"default":   urltestTag,
 			})
-			createdGroups[grp.Tag] = true
 
 			if activeOutboundTag == "direct-out" {
 				activeOutboundTag = grp.Tag
@@ -477,11 +448,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"outbounds": selectorList,
 				"default":   urltestTag,
 			})
-			createdGroups[ng.Name] = true
 		}
 	}
 
-	// 3. Создание главного PROXY селектора
 	if len(allNodeTags) > 0 {
 		urltestTag := "auto"
 		selectorTag := config.MainSelectorTag
@@ -531,7 +500,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	leasesMap := loadDHCPLeasesMap()
 
-	// 4. Multi-Outbound клиентские политики (индивидуальная маршрутизация устройств)
 	for _, cp := range cfg.ClientPolicies {
 		if !cp.Enabled || cp.Target == "" {
 			continue
@@ -566,7 +534,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	// 5. Приоритетные правила маршрутизации (Route Policies)
 	for _, rp := range cfg.RoutePolicies {
 		if !rp.Enabled || rp.Outbound == "" {
 			continue
@@ -731,7 +698,17 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		if activeOutboundTag != "direct-out" {
+		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
+		// Неизвестные домены направляются в direct-out. Sing-Box резолвит реальный IP,
+		// пытается подключиться напрямую и при сбое передает домен в DomainLearner.
+		if !isGlobal {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":   "route",
+				"inbound":  []string{"tproxy-in"},
+				"ip_cidr":  []string{"198.18.0.0/15"},
+				"outbound": "direct-out",
+			})
+		} else if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
 				"inbound":  []string{"tproxy-in"},
