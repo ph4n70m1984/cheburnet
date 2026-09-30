@@ -205,8 +205,6 @@ func storeUCIEntry(cache *uciCache, k, rawVal string) {
 	v := sanitizeToken(rawVal)
 	parts := strings.Split(k, ".")
 
-	// Обнаружение объявления секции вида cheburnet.cfg046d03=route_policy
-	// или cheburnet.@route_policy[0]=route_policy
 	if len(parts) == 2 {
 		secID := parts[1]
 		if _, exists := cache.sectionTypes[secID]; !exists {
@@ -289,6 +287,7 @@ func (u *UCIStorage) parseNodeGroupSections(cache *uciCache) []NodeFilterGroup {
 
 		name := cache.get(prefix+"name", "")
 		priority := cache.getInt(prefix+"priority", 50)
+		bindIface := cache.get(prefix+"bind_interface", "")
 
 		rawRegex := cache.get(prefix+"regex", "")
 		var regexList []string
@@ -301,10 +300,11 @@ func (u *UCIStorage) parseNodeGroupSections(cache *uciCache) []NodeFilterGroup {
 
 		if name != "" && enabled && len(regexList) > 0 {
 			groups = append(groups, NodeFilterGroup{
-				Name:     name,
-				Priority: priority,
-				Enabled:  enabled,
-				Regex:    regexList,
+				Name:          name,
+				Priority:      priority,
+				BindInterface: bindIface,
+				Enabled:       enabled,
+				Regex:         regexList,
 			})
 		}
 	}
@@ -404,12 +404,14 @@ func (u *UCIStorage) parseClientRuleSections(cache *uciCache) []ClientPolicy {
 
 		name := cache.get(prefix+"name", "")
 		mode := ClientMode(cache.get(prefix+"mode", string(ClientModeRules)))
+		outbound := cache.get(prefix+"outbound", "")
 
 		policies = append(policies, ClientPolicy{
-			Name:    name,
-			Target:  target,
-			Mode:    mode,
-			Enabled: enabled,
+			Name:     name,
+			Target:   target,
+			Mode:     mode,
+			Outbound: outbound,
+			Enabled:  enabled,
 		})
 	}
 	return policies
@@ -451,6 +453,9 @@ func (u *UCIStorage) Load() (*CheburConfig, error) {
 		ScheduleLTEEnabled: cache.get("cheburnet.main.schedule_lte_enabled", "0") == "1",
 		ScheduleLTEStart:   cache.get("cheburnet.main.schedule_lte_start", "21:00"),
 		ScheduleLTEEnd:     cache.get("cheburnet.main.schedule_lte_end", "07:00"),
+
+		AutoLearnDomains: cache.get("cheburnet.main.auto_learn_domains", "0") == "1",
+		LearnThreshold:   cache.getInt("cheburnet.main.learn_threshold", 3),
 
 		PublicSubEnabled: cache.get("cheburnet.main.public_sub_enabled", "0") == "1",
 		PublicSubPort:    cache.getInt("cheburnet.main.public_sub_port", 9443),
@@ -544,6 +549,11 @@ func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
 		return fmt.Errorf("cannot persist nil config")
 	}
 
+	autoLearnStr := "0"
+	if cfg.AutoLearnDomains {
+		autoLearnStr = "1"
+	}
+
 	cmds := [][]string{
 		{"set", fmt.Sprintf("cheburnet.main.engine=%s", cfg.Engine)},
 		{"set", fmt.Sprintf("cheburnet.main.routing_mode=%s", cfg.RoutingMode)},
@@ -554,6 +564,8 @@ func (u *UCIStorage) SaveCoreSettings(cfg *CheburConfig) error {
 		{"set", fmt.Sprintf("cheburnet.main.dns_port=%d", cfg.DNSPort)},
 		{"set", fmt.Sprintf("cheburnet.main.mixed_port=%d", cfg.MixedPort)},
 		{"set", fmt.Sprintf("cheburnet.main.update_channel=%s", cfg.UpdateChannel)},
+		{"set", fmt.Sprintf("cheburnet.main.auto_learn_domains=%s", autoLearnStr)},
+		{"set", fmt.Sprintf("cheburnet.main.learn_threshold=%d", cfg.LearnThreshold)},
 	}
 
 	for _, args := range cmds {
@@ -592,6 +604,17 @@ func (u *UCIStorage) SaveRuleSets(rulesets []string) error {
 		clean := sanitizeToken(rs)
 		if clean != "" {
 			_ = exec.Command("uci", "add_list", "cheburnet.main.rulesets="+clean).Run()
+		}
+	}
+	return exec.Command("uci", "commit", "cheburnet").Run()
+}
+
+func (u *UCIStorage) SaveCustomDomains(domains []string) error {
+	_ = exec.Command("uci", "delete", "cheburnet.main.custom_domains").Run()
+	for _, d := range domains {
+		clean := sanitizeToken(d)
+		if clean != "" {
+			_ = exec.Command("uci", "add_list", "cheburnet.main.custom_domains="+clean).Run()
 		}
 	}
 	return exec.Command("uci", "commit", "cheburnet").Run()

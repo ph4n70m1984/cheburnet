@@ -10,6 +10,7 @@
 'require view.cheburnet.modules.constants as constants';
 'require view.cheburnet.modules.nodes as nodesModule';
 'require view.cheburnet.modules.telemetry as telemetryModule';
+'require view.cheburnet.modules.learning as learningModule';
 
 return view.extend({
     load: function() {
@@ -451,7 +452,7 @@ return view.extend({
             }
         };
 
-        // --- 1. СЕКЦИЯ СТАТУСА И ТЕЛЕМЕТРИИ ---
+        // --- 1. СЕКЦИЯ СТАТУСА, ТЕЛЕМЕТРИИ И DOMAIN LEARNING ---
         var statusSec = m.section(form.NamedSection, 'telemetry', 'cheburnet', _('Состояние, диагностика и телеметрия'));
         statusSec.anonymous = true;
         statusSec.render = function() {
@@ -480,7 +481,9 @@ return view.extend({
             ]);
 
             var telemetryNode = telemetryModule.createTelemetrySection(nodesModule);
-            return E('div', {}, [ controlPanel, telemetryNode ]);
+            var learningNode = learningModule.createLearningSection();
+
+            return E('div', {}, [ controlPanel, telemetryNode, learningNode ]);
         };
 
         // --- 2. СЕКЦИЯ ОСНОВНЫХ НАСТРОЕК (MAIN) ---
@@ -624,6 +627,16 @@ return view.extend({
         o.default = '07:00';
 
         // --- ВКЛАДКА МАРШРУТИЗАЦИИ СПИСКОВ ---
+        o = s.taboption('routing_rules', form.Flag, 'auto_learn_domains', _('Автоматическое добавление заблокированных сайтов (Domain Learning)'));
+        o.description = _('Отслеживает разорванные прямые TCP-сессии (TCP RST / сброс пакетов). При регулярных сбоях домен автоматически добавляется в список обхода custom_domains.');
+        o.default = '0';
+
+        o = s.taboption('routing_rules', form.Value, 'learn_threshold', _('Порог сбоев для автодобавления'));
+        o.depends('auto_learn_domains', '1');
+        o.datatype = 'uinteger';
+        o.default = '3';
+        o.description = _('Количество зафиксированных сбросов соединения, после которых домен автоматически направляется в прокси.');
+
         o = s.taboption('routing_rules', form.ListValue, 'ruleset_update_interval', _('Интервал обновления списков'));
         o.value('24h', _('24 часа (каждый день)'));
         o.value('72h', _('72 часа (раз в 3 дня)'));
@@ -765,8 +778,8 @@ return view.extend({
         o.description = _('Фоновая периодическая проверка доступных релизов на GitHub и в opkg/apk.');
         o.default = '0';
 
-        // --- 3. СЕКЦИЯ ГРУПП КЛАССИФИКАЦИИ СЕРВЕРОВ (NODE GROUPS) ---
-        var groupSec = m.section(form.GridSection, 'node_group', _('Группы классификации серверов (Node Groups)'));
+        // --- 3. СЕКЦИЯ ГРУПП КЛАССИФИКАЦИИ СЕРВЕРОВ (NODE GROUPS + MULTI-WAN) ---
+        var groupSec = m.section(form.GridSection, 'node_group', _('Группы серверов и Multi-WAN привязка (Node Groups)'));
         groupSec.anonymous = true;
         groupSec.addremove = true;
         groupSec.sortable = true;
@@ -776,7 +789,7 @@ return view.extend({
         o.editable = true;
 
         o = groupSec.option(form.Value, 'name', _('Имя группы'));
-        o.placeholder = 'lte / game / message';
+        o.placeholder = 'lte / game / stream';
         o.validate = function(section_id, value) {
             if (!value || !/^[a-z0-9_-]{1,32}$/.test(value)) {
                 return _('Имя группы должно содержать от 1 до 32 символов (строчные латинские буквы, цифры, тире или подчёркивание)');
@@ -789,7 +802,11 @@ return view.extend({
         o.datatype = 'integer';
         o.default = '50';
         o.editable = true;
-        o.description = _('Чем выше число, тем раньше проверяются регулярные выражения группы.');
+
+        o = groupSec.option(form.Value, 'bind_interface', _('Интерфейс выхода (Multi-WAN)'));
+        o.placeholder = 'wwan0 / eth1 / wan';
+        o.editable = true;
+        o.description = _('Имя физического сетевого интерфейса Linux для отправки туннелей этой группы (Policy Routing / Dual-WAN).');
 
         o = groupSec.option(form.DynamicList, 'regex', _('Регулярные выражения (RegExp)'));
         o.placeholder = '(?i)(lte|white|ru-direct)';
@@ -843,7 +860,7 @@ return view.extend({
         o = subSec.option(form.Value, 'hwid', _('HWID (опционально)'));
         o.modalonly = true;
 
-        // --- 5. СЕКЦИЯ ПОЛИТИК УСТРОЙСТВ ---
+        // --- 5. СЕКЦИЯ ПОЛИТИК УСТРОЙСТВ (MULTI-OUTBOUND CLIENT POLICIES) ---
         var clientSec = m.section(form.GridSection, 'client_rule', _('Политики для устройств (Client Policy)'));
         clientSec.anonymous = true;
         clientSec.addremove = true;
@@ -866,12 +883,48 @@ return view.extend({
             }
         }
 
-        o = clientSec.option(form.ListValue, 'mode', _('Политика'));
+        o = clientSec.option(form.ListValue, 'mode', _('Режим'));
         o.value('rules', _('По спискам'));
         o.value('full_proxy', _('Всё в прокси'));
         o.value('direct', _('Direct'));
         o.default = 'rules';
         o.editable = true;
+
+        o = clientSec.option(form.ListValue, 'outbound', _('Шлюз выхода (Multi-Outbound)'));
+        o.depends('mode', 'full_proxy');
+        o.value('', _('По умолчанию (PROXY / Основной)'));
+        o.value('direct-out', _('Direct (Напрямую)'));
+
+        // Автоматическое добавление созданных групп классификации
+        var uciGroups = uci.sections('cheburnet', 'node_group');
+        if (Array.isArray(uciGroups)) {
+            uciGroups.forEach(function(g) {
+                if (g.name) {
+                    o.value(g.name, _('Группа: ') + g.name);
+                }
+            });
+        }
+        o.editable = true;
+
+        var clientOutboundSelect = o;
+        var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
+        var nodeReqHeaders = {};
+        if (apiToken) {
+            nodeReqHeaders['X-API-Token'] = apiToken;
+        }
+
+        fetch('http://' + window.location.hostname + ':8088/api/v1/nodes', {
+            headers: nodeReqHeaders
+        })
+            .then(function(r) { return r.ok ? r.json() : []; })
+            .then(function(nodes) {
+                if (Array.isArray(nodes)) {
+                    nodes.forEach(function(n) {
+                        clientOutboundSelect.value(n.tag, n.tag + ' (' + n.protocol + ')');
+                    });
+                }
+            })
+            .catch(function() {});
 
         // --- 6. СЕКЦИЯ МАРШРУТИЗАЦИИ СЕРВИСОВ ---
         var routeSec = m.section(form.GridSection, 'route_policy', _('Секции маршрутизации сервисов (Route Policies)'));
@@ -898,12 +951,6 @@ return view.extend({
         o.editable = true;
 
         var outboundSelect = o;
-        var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
-        var nodeReqHeaders = {};
-        if (apiToken) {
-            nodeReqHeaders['X-API-Token'] = apiToken;
-        }
-
         fetch('http://' + window.location.hostname + ':8088/api/v1/nodes', {
             headers: nodeReqHeaders
         })

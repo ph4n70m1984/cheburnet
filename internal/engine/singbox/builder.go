@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -383,11 +384,50 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		},
 	}
 
+	groupIfaceMap := make(map[string]string)
+	groupRegexMap := make(map[string][]*regexp.Regexp)
+	for _, ng := range cfg.NodeGroups {
+		if !ng.Enabled {
+			continue
+		}
+		if ng.BindInterface != "" {
+			groupIfaceMap[ng.Name] = ng.BindInterface
+		}
+		var regs []*regexp.Regexp
+		for _, rStr := range ng.Regex {
+			if rStr != "" {
+				if re, err := regexp.Compile("(?i)" + rStr); err == nil {
+					regs = append(regs, re)
+				}
+			}
+		}
+		if len(regs) > 0 {
+			groupRegexMap[ng.Name] = regs
+		}
+	}
+
 	var allNodeTags []string
 	skippedCount := 0
 
 	for _, node := range cfg.Nodes {
-		ob, err := b.buildNodeOutbound(node)
+		nodeBindIface := strings.TrimSpace(node.BindInterface)
+		if nodeBindIface == "" {
+			for grpName, regs := range groupRegexMap {
+				for _, re := range regs {
+					if re.MatchString(node.Tag) {
+						if iface, ok := groupIfaceMap[grpName]; ok {
+							nodeBindIface = iface
+							break
+						}
+					}
+				}
+				if nodeBindIface != "" {
+					break
+				}
+			}
+		}
+
+		ob, err := b.buildNodeOutbound(node, nodeBindIface)
 		if err == nil {
 			outbounds = append(outbounds, ob)
 			allNodeTags = append(allNodeTags, node.Tag)
@@ -400,9 +440,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	if skippedCount > 0 {
 		log.Printf("[INFO] [builder] Successfully compiled %d/%d nodes into sing-box outbounds (%d unsupported nodes skipped)",
 			len(allNodeTags), len(cfg.Nodes), skippedCount)
-	} else {
-		log.Printf("[INFO] [builder] Successfully compiled %d/%d nodes into sing-box outbounds",
-			len(allNodeTags), len(cfg.Nodes))
 	}
 
 	activeOutboundTag := "direct-out"
@@ -438,23 +475,19 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 					}
 				}
 			}
-
 			if len(validGrpNodes) == 0 {
 				continue
 			}
 
 			urltestTag := fmt.Sprintf("%s-auto", grp.Tag)
-
 			interval := grp.Interval
 			if interval == "" {
 				interval = globalURLTestInterval
 			}
-
 			tolerance := grp.Tolerance
 			if tolerance == 0 {
 				tolerance = globalURLTestTolerance
 			}
-
 			targetURL := grp.TargetURL
 			if targetURL == "" {
 				targetURL = globalURLTestURL
@@ -470,28 +503,59 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"interrupt_exist_connections": false,
 			})
 
-			if configType == "urltest" {
-				selectorList := append([]string{urltestTag}, validGrpNodes...)
-				outbounds = append(outbounds, map[string]interface{}{
-					"type":      "selector",
-					"tag":       grp.Tag,
-					"outbounds": selectorList,
-					"default":   urltestTag,
-				})
-			} else {
-				outbounds = append(outbounds, map[string]interface{}{
-					"type":      "selector",
-					"tag":       grp.Tag,
-					"outbounds": validGrpNodes,
-					"default":   validGrpNodes[0],
-				})
-			}
+			selectorList := append([]string{urltestTag}, validGrpNodes...)
+			outbounds = append(outbounds, map[string]interface{}{
+				"type":      "selector",
+				"tag":       grp.Tag,
+				"outbounds": selectorList,
+				"default":   urltestTag,
+			})
 
 			if activeOutboundTag == "direct-out" {
 				activeOutboundTag = grp.Tag
 			}
 		}
-	} else if len(allNodeTags) > 0 {
+	} else if len(cfg.NodeGroups) > 0 {
+		for _, ng := range cfg.NodeGroups {
+			if !ng.Enabled {
+				continue
+			}
+			var matchedNodes []string
+			regs := groupRegexMap[ng.Name]
+			for _, tag := range allNodeTags {
+				for _, re := range regs {
+					if re.MatchString(tag) {
+						matchedNodes = append(matchedNodes, tag)
+						break
+					}
+				}
+			}
+			if len(matchedNodes) == 0 {
+				continue
+			}
+
+			urltestTag := fmt.Sprintf("%s-auto", ng.Name)
+			outbounds = append(outbounds, map[string]interface{}{
+				"type":                        "urltest",
+				"tag":                         urltestTag,
+				"outbounds":                   matchedNodes,
+				"url":                         globalURLTestURL,
+				"interval":                    globalURLTestInterval,
+				"tolerance":                   globalURLTestTolerance,
+				"interrupt_exist_connections": false,
+			})
+
+			selectorList := append([]string{urltestTag}, matchedNodes...)
+			outbounds = append(outbounds, map[string]interface{}{
+				"type":      "selector",
+				"tag":       ng.Name,
+				"outbounds": selectorList,
+				"default":   urltestTag,
+			})
+		}
+	}
+
+	if len(allNodeTags) > 0 {
 		urltestTag := "auto"
 		selectorTag := "PROXY"
 
@@ -540,9 +604,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	leasesMap := loadDHCPLeasesMap()
 
-	var directClients []string
-	var fullProxyClients []string
-
+	// Multi-Outbound клиентские политики
 	for _, cp := range cfg.ClientPolicies {
 		if !cp.Enabled || cp.Target == "" {
 			continue
@@ -552,33 +614,32 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			continue
 		}
 
-		switch cp.Mode {
-		case config.ClientModeDirect:
-			directClients = append(directClients, cidr)
-		case config.ClientModeFullProxy:
-			fullProxyClients = append(fullProxyClients, cidr)
+		if cp.Mode == config.ClientModeDirect {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":         "route",
+				"inbound":        []string{"tproxy-in"},
+				"source_ip_cidr": []string{cidr},
+				"outbound":       "direct-out",
+			})
+			continue
+		}
+
+		targetOutbound := activeOutboundTag
+		if trimmed := strings.TrimSpace(cp.Outbound); trimmed != "" {
+			targetOutbound = trimmed
+		}
+
+		if cp.Mode == config.ClientModeFullProxy {
+			routeRules = append(routeRules, map[string]interface{}{
+				"action":         "route",
+				"inbound":        []string{"tproxy-in"},
+				"source_ip_cidr": []string{cidr},
+				"outbound":       targetOutbound,
+			})
 		}
 	}
 
-	if len(directClients) > 0 {
-		routeRules = append(routeRules, map[string]interface{}{
-			"action":         "route",
-			"inbound":        []string{"tproxy-in"},
-			"source_ip_cidr": directClients,
-			"outbound":       "direct-out",
-		})
-	}
-
-	if len(fullProxyClients) > 0 && activeOutboundTag != "direct-out" {
-		routeRules = append(routeRules, map[string]interface{}{
-			"action":         "route",
-			"inbound":        []string{"tproxy-in"},
-			"source_ip_cidr": fullProxyClients,
-			"outbound":       activeOutboundTag,
-		})
-	}
-
-	// 1. ПРИОРИТЕТНЫЕ ПОЛЬЗОВАТЕЛЬСКИЕ ПРАВИЛА (Route Policies)
+	// Route Policies
 	for _, rp := range cfg.RoutePolicies {
 		if !rp.Enabled || rp.Outbound == "" {
 			continue
@@ -651,7 +712,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 	} else {
-		// 2. ПОЛЬЗОВАТЕЛЬСКИЕ ДОМЕНЫ И СЕТИ ПО УМОЛЧАНИЮ
 		if len(cleanCustomDomains) > 0 {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":        "route",
@@ -744,7 +804,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
 		if activeOutboundTag != "direct-out" {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
@@ -825,7 +884,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 	return os.Rename(tmpPath, outputPath)
 }
 
-func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interface{}, error) {
+func (b *Builder) buildNodeOutbound(node *config.GenericNode, bindIface string) (map[string]interface{}, error) {
 	if node == nil {
 		return nil, fmt.Errorf("node is nil")
 	}
@@ -842,6 +901,10 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode) (map[string]interf
 		"tag":         tag,
 		"server":      addr,
 		"server_port": node.Port,
+	}
+
+	if bindIface != "" {
+		out["bind_interface"] = bindIface
 	}
 
 	switch proto {

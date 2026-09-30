@@ -16,10 +16,11 @@ const (
 )
 
 type ClientPolicy struct {
-	Name    string     `json:"name"`
-	Target  string     `json:"target"`
-	Mode    ClientMode `json:"mode"`
-	Enabled bool       `json:"enabled"`
+	Name     string     `json:"name"`
+	Target   string     `json:"target"`
+	Mode     ClientMode `json:"mode"`
+	Outbound string     `json:"outbound,omitempty"` // Имя группы (например, "game", "stream") или тег ноды
+	Enabled  bool       `json:"enabled"`
 }
 
 type RoutePolicy struct {
@@ -32,30 +33,31 @@ type RoutePolicy struct {
 }
 
 type GenericNode struct {
-	Tag          string `json:"tag"`
-	Address      string `json:"address"`
-	Port         int    `json:"port"`
-	Protocol     string `json:"protocol"`
-	Method       string `json:"method,omitempty"`
-	UUID         string `json:"uuid,omitempty"`
-	Password     string `json:"password,omitempty"`
-	Username     string `json:"username,omitempty"`
-	Flow         string `json:"flow,omitempty"`
-	Network      string `json:"network,omitempty"`
-	Security     string `json:"security,omitempty"`
-	SNI          string `json:"sni,omitempty"`
-	Fingerprint  string `json:"fingerprint,omitempty"`
-	PublicKey    string `json:"public_key,omitempty"`
-	ShortID      string `json:"short_id,omitempty"`
-	Path         string `json:"path,omitempty"`
-	Host         string `json:"host,omitempty"`
-	HWID         string `json:"hwid,omitempty"`
-	Insecure     bool   `json:"insecure,omitempty"`
-	ObfsType     string `json:"obfs_type,omitempty"`
-	ObfsPassword string `json:"obfs_password,omitempty"`
-	PortRange    string `json:"port_range,omitempty"`
-	SocksVersion string `json:"socks_version,omitempty"`
-	SourceURL    string `json:"source_url,omitempty"`
+	Tag           string `json:"tag"`
+	Address       string `json:"address"`
+	Port          int    `json:"port"`
+	Protocol      string `json:"protocol"`
+	Method        string `json:"method,omitempty"`
+	UUID          string `json:"uuid,omitempty"`
+	Password      string `json:"password,omitempty"`
+	Username      string `json:"username,omitempty"`
+	Flow          string `json:"flow,omitempty"`
+	Network       string `json:"network,omitempty"`
+	Security      string `json:"security,omitempty"`
+	SNI           string `json:"sni,omitempty"`
+	Fingerprint   string `json:"fingerprint,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
+	ShortID       string `json:"short_id,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Host          string `json:"host,omitempty"`
+	HWID          string `json:"hwid,omitempty"`
+	Insecure      bool   `json:"insecure,omitempty"`
+	ObfsType      string `json:"obfs_type,omitempty"`
+	ObfsPassword  string `json:"obfs_password,omitempty"`
+	PortRange     string `json:"port_range,omitempty"`
+	SocksVersion  string `json:"socks_version,omitempty"`
+	SourceURL     string `json:"source_url,omitempty"`
+	BindInterface string `json:"bind_interface,omitempty"` // Привязка к интерфейсу: "wwan0", "eth1", "wan"
 
 	// XHTTP (SplitHTTP) параметры для sing-box-lx / extended
 	XHTTPMode    string            `json:"xhttp_mode,omitempty"`
@@ -106,10 +108,11 @@ type CustomSRSRule struct {
 }
 
 type NodeFilterGroup struct {
-	Name     string   `json:"name"`
-	Regex    []string `json:"regex"`
-	Priority int      `json:"priority"`
-	Enabled  bool     `json:"enabled"`
+	Name          string   `json:"name"`
+	Regex         []string `json:"regex"`
+	Priority      int      `json:"priority"`
+	BindInterface string   `json:"bind_interface,omitempty"` // Привязка группы к интерфейсу ОС
+	Enabled       bool     `json:"enabled"`
 }
 
 type CheburConfig struct {
@@ -155,6 +158,10 @@ type CheburConfig struct {
 	ScheduleLTEEnabled bool              `json:"schedule_lte_enabled"`
 	ScheduleLTEStart   string            `json:"schedule_lte_start"`
 	ScheduleLTEEnd     string            `json:"schedule_lte_end"`
+
+	// Dynamic Domain Learning
+	AutoLearnDomains bool `json:"auto_learn_domains"`
+	LearnThreshold   int  `json:"learn_threshold"`
 
 	PublicSubEnabled bool   `json:"public_sub_enabled"`
 	PublicSubPort    int    `json:"public_sub_port"`

@@ -13,6 +13,7 @@ import (
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/engine/adaptive"
+	"cheburnet/internal/learning"
 	"cheburnet/internal/network"
 	"cheburnet/internal/service"
 	"cheburnet/internal/subscription"
@@ -38,6 +39,7 @@ type Server struct {
 	diagEngine     *diagnostics.DiagnosticsEngine
 	adaptiveWorker *adaptive.Worker
 	adaptiveProber *adaptive.Prober
+	domainLearner  *learning.DomainLearner
 	onAction       ActionCallback
 	ipifyClient    *http.Client
 	clashClient    *http.Client
@@ -49,6 +51,10 @@ func (s *Server) SetAdaptiveWorker(w *adaptive.Worker) {
 
 func (s *Server) SetAdaptiveProber(p *adaptive.Prober) {
 	s.adaptiveProber = p
+}
+
+func (s *Server) SetDomainLearner(l *learning.DomainLearner) {
+	s.domainLearner = l
 }
 
 func NewServer(
@@ -175,8 +181,70 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	// Защищенные эндпоинты мутаций
+	// Эндпоинты Dynamic Domain Learning
+	api.Get("/learning/candidates", func(c *fiber.Ctx) error {
+		if s.domainLearner != nil {
+			return c.JSON(s.domainLearner.GetCandidates())
+		}
+		return c.JSON([]interface{}{})
+	})
+
 	auth := s.authRequired()
+
+	api.Post("/learning/approve", auth, func(c *fiber.Ctx) error {
+		var req struct {
+			Domain string `json:"domain"`
+		}
+		if err := c.BodyParser(&req); err != nil || req.Domain == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "domain is required"})
+		}
+
+		cleanDomain := strings.TrimSpace(strings.ToLower(req.Domain))
+		candidate := s.state.Clone()
+
+		exists := false
+		for _, d := range candidate.CustomDomains {
+			if strings.EqualFold(d, cleanDomain) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			candidate.CustomDomains = append(candidate.CustomDomains, cleanDomain)
+		}
+
+		uci := config.NewUCIStorage()
+		_ = uci.SaveCustomDomains(candidate.CustomDomains)
+
+		if _, err := s.state.Commit(candidate, false); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		if s.domainLearner != nil {
+			s.domainLearner.ClearCandidate(cleanDomain)
+		}
+
+		eng := s.getEngine()
+		if eng != nil {
+			_ = engine.SafeReload(c.Context(), eng, candidate, TargetConfigPath)
+		}
+
+		return c.JSON(fiber.Map{"status": "ok", "domain": cleanDomain})
+	})
+
+	api.Post("/learning/clear", auth, func(c *fiber.Ctx) error {
+		var req struct {
+			Domain string `json:"domain"`
+		}
+		_ = c.BodyParser(&req)
+
+		if s.domainLearner != nil {
+			if req.Domain != "" {
+				s.domainLearner.ClearCandidate(req.Domain)
+			}
+		}
+		return c.JSON(fiber.Map{"status": "ok"})
+	})
 
 	api.Post("/engine/switch", auth, func(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{

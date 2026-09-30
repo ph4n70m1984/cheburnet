@@ -26,6 +26,7 @@ import (
 	"cheburnet/internal/diagnostics"
 	"cheburnet/internal/engine"
 	"cheburnet/internal/engine/adaptive"
+	"cheburnet/internal/learning"
 	"cheburnet/internal/network"
 	"cheburnet/internal/ruleset"
 	"cheburnet/internal/service"
@@ -47,7 +48,7 @@ var (
 )
 
 func initMemoryLimits() {
-	// Жесткий лимит кучи рантайма Go для предотвращения срабатывания Linux OOM-killer на роутерах с 128 МБ RAM
+	// Жесткий лимит кучи рантайма Go для защиты роутеров со 128 МБ RAM от OOM
 	debug.SetMemoryLimit(32 * 1024 * 1024)
 	debug.SetGCPercent(50)
 }
@@ -167,6 +168,7 @@ type App struct {
 	adaptiveProber  *adaptive.Prober
 	sentinel        *adaptive.CensorshipSentinel
 	stateController *adaptive.StateController
+	domainLearner   *learning.DomainLearner
 	mu              sync.RWMutex
 	engineOpMu      sync.Mutex
 }
@@ -769,6 +771,7 @@ func runDaemon() {
 	stateController := adaptive.NewStateController(state, prober)
 	adaptiveWorker := adaptive.NewWorker(state, prober, stateController)
 	sentinel := adaptive.NewCensorshipSentinel(state, stateController, initialConfig.MixedPort)
+	domainLearner := learning.NewDomainLearner(state, initialConfig.ClashAPISecret, initialConfig.AutoLearnDomains)
 
 	app := &App{
 		state:           state,
@@ -786,18 +789,25 @@ func runDaemon() {
 		adaptiveProber:  prober,
 		sentinel:        sentinel,
 		stateController: stateController,
+		domainLearner:   domainLearner,
 	}
 
-	sourceIface := initialConfig.SourceIface
-	if sourceIface == "" || sourceIface == "lan" {
-		sourceIface = "br-lan"
+	var proxyIfaces []string
+	if len(initialConfig.ProxyIfaces) > 0 {
+		proxyIfaces = initialConfig.ProxyIfaces
+	} else {
+		sourceIface := initialConfig.SourceIface
+		if sourceIface == "" || sourceIface == "lan" {
+			sourceIface = "br-lan"
+		}
+		proxyIfaces = []string{sourceIface}
 	}
 
 	isGlobal := initialConfig.RoutingMode == "global"
 	fullProxyIPs := extractFullProxyIPs(initialConfig.ClientPolicies)
 
-	log.Printf("[INFO] Setting up nftables and routing (global: %v, full_proxy clients: %v)...", isGlobal, fullProxyIPs)
-	if err := network.ApplyNFTRules([]string{sourceIface}, allSubnets, fullProxyIPs, initialConfig.TProxyPort, isGlobal); err != nil {
+	log.Printf("[INFO] Setting up nftables and routing (ifaces: %v, global: %v, full_proxy clients: %v)...", proxyIfaces, isGlobal, fullProxyIPs)
+	if err := network.ApplyNFTRules(proxyIfaces, allSubnets, fullProxyIPs, initialConfig.TProxyPort, isGlobal); err != nil {
 		log.Fatalf("[FATAL] nftables setup error: %v", err)
 	}
 	if err := network.SetupRouting(); err != nil {
@@ -841,6 +851,7 @@ func runDaemon() {
 
 	go adaptiveWorker.Start(daemonCtx)
 	go sentinel.Start(daemonCtx)
+	go domainLearner.StartLoop(daemonCtx)
 
 	go hub.Run(daemonCtx, app.getCurrentEngine, func() string {
 		cfg := app.state.Get()
@@ -874,9 +885,15 @@ func runDaemon() {
 				}
 				cfg := app.state.Get()
 				isGlobalMode := cfg.RoutingMode == "global"
-				sIface := cfg.SourceIface
-				if sIface == "" || sIface == "lan" {
-					sIface = "br-lan"
+				var ifaces []string
+				if len(cfg.ProxyIfaces) > 0 {
+					ifaces = cfg.ProxyIfaces
+				} else {
+					sIface := cfg.SourceIface
+					if sIface == "" || sIface == "lan" {
+						sIface = "br-lan"
+					}
+					ifaces = []string{sIface}
 				}
 				activeSets := collectAllRuleSets(&cfg)
 				subnets := append([]string(nil), cfg.CustomSubnets...)
@@ -890,7 +907,7 @@ func runDaemon() {
 					subnets = append(subnets, fetched...)
 				}
 				fpIPs := extractFullProxyIPs(cfg.ClientPolicies)
-				return network.ApplyNFTRules([]string{sIface}, subnets, fpIPs, cfg.TProxyPort, isGlobalMode)
+				return network.ApplyNFTRules(ifaces, subnets, fpIPs, cfg.TProxyPort, isGlobalMode)
 			default:
 				return fmt.Errorf("action %s is not supported", action)
 			}
@@ -898,6 +915,7 @@ func runDaemon() {
 	)
 	srv.SetAdaptiveWorker(adaptiveWorker)
 	srv.SetAdaptiveProber(prober)
+	srv.SetDomainLearner(domainLearner)
 	app.server = srv
 
 	go func() {
@@ -942,7 +960,7 @@ func runDaemon() {
 	}
 
 	log.Println("[INFO] Shutting down Chebur.NET...")
-	// 1. Немедленно отменяем контекст, останавливая все горутины и supervisorLoop во избежание гонок
+	// 1. Немедленно отменяем контекст, останавливая все горутины и supervisorLoop
 	daemonCancel()
 	time.Sleep(100 * time.Millisecond)
 
@@ -1043,11 +1061,16 @@ func (a *App) reloadActiveEngineLocked(ctx context.Context) error {
 		return fmt.Errorf("candidate engine reload rejected: %w", err)
 	}
 
-	prepareNFTParams := func(cfg *config.CheburConfig) (iface string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobal bool) {
+	prepareNFTParams := func(cfg *config.CheburConfig) (ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobal bool) {
 		isGlobal = cfg.RoutingMode == "global"
-		iface = cfg.SourceIface
-		if iface == "" || iface == "lan" {
-			iface = "br-lan"
+		if len(cfg.ProxyIfaces) > 0 {
+			ifaces = cfg.ProxyIfaces
+		} else {
+			iface := cfg.SourceIface
+			if iface == "" || iface == "lan" {
+				iface = "br-lan"
+			}
+			ifaces = []string{iface}
 		}
 		subnets = append([]string(nil), cfg.CustomSubnets...)
 		for _, rp := range cfg.RoutePolicies {
@@ -1065,8 +1088,8 @@ func (a *App) reloadActiveEngineLocked(ctx context.Context) error {
 		return
 	}
 
-	sIface, subnets, fullProxyIPs, tproxyPort, isGlobal := prepareNFTParams(&candidate)
-	if err := network.ApplyNFTRules([]string{sIface}, subnets, fullProxyIPs, tproxyPort, isGlobal); err != nil {
+	ifaces, subnets, fullProxyIPs, tproxyPort, isGlobal := prepareNFTParams(&candidate)
+	if err := network.ApplyNFTRules(ifaces, subnets, fullProxyIPs, tproxyPort, isGlobal); err != nil {
 		log.Printf("[CRITICAL] ApplyNFTRules failed for candidate: %v. Initiating ROLLBACK to previous stable configuration...", err)
 
 		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1079,8 +1102,8 @@ func (a *App) reloadActiveEngineLocked(ctx context.Context) error {
 			log.Printf("[INFO] Rollback engine SafeReload to previous configuration SUCCESS.")
 		}
 
-		prevIface, prevSubnets, prevFullProxy, prevPort, prevGlobal := prepareNFTParams(&previousConfig)
-		if prevNFTErr := network.ApplyNFTRules([]string{prevIface}, prevSubnets, prevFullProxy, prevPort, prevGlobal); prevNFTErr != nil {
+		prevIfaces, prevSubnets, prevFullProxy, prevPort, prevGlobal := prepareNFTParams(&previousConfig)
+		if prevNFTErr := network.ApplyNFTRules(prevIfaces, prevSubnets, prevFullProxy, prevPort, prevGlobal); prevNFTErr != nil {
 			log.Printf("[EMERGENCY] Rollback ApplyNFTRules to previous state FAILED: %v", prevNFTErr)
 		} else {
 			log.Printf("[INFO] Rollback ApplyNFTRules restored previous firewall state successfully.")
@@ -1112,7 +1135,7 @@ func (a *App) reloadActiveEngineLocked(ctx context.Context) error {
 		a.adaptiveWorker.Trigger()
 	}
 
-	log.Printf("[INFO] Reload synchronized: sing-box core and nftables are aligned (global: %v, tproxy_port: %d)", isGlobal, candidate.TProxyPort)
+	log.Printf("[INFO] Reload synchronized: sing-box core and nftables are aligned (ifaces: %v, global: %v, tproxy_port: %d)", ifaces, isGlobal, candidate.TProxyPort)
 	return nil
 }
 
