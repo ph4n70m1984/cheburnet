@@ -571,6 +571,47 @@ func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, fi
 						node.Security = sec
 					}
 
+					// 1. Разбор XHTTP (SplitHTTP) - включая секретный path, host, mode и extra
+					if xhttp, ok := ss["xhttpSettings"].(map[string]interface{}); ok {
+						if p, ok := xhttp["path"].(string); ok && p != "" {
+							node.Path = p
+						}
+						if h, ok := xhttp["host"].(string); ok && h != "" {
+							node.Host = h
+						}
+						if m, ok := xhttp["mode"].(string); ok && m != "" {
+							node.XHTTPMode = m
+						}
+						if extra, ok := xhttp["extra"].(map[string]interface{}); ok {
+							if pad, ok := extra["xPaddingBytes"].(string); ok && pad != "" {
+								node.XHTTPPadding = pad
+							}
+							if noSSE, ok := extra["noSSEHeader"].(bool); ok && noSSE {
+								node.XHTTPNoGRPC = true
+							}
+						}
+					}
+
+					// 2. Разбор gRPC
+					if grpc, ok := ss["grpcSettings"].(map[string]interface{}); ok {
+						if sName, ok := grpc["serviceName"].(string); ok && sName != "" {
+							node.Path = sName
+						}
+					}
+
+					// 3. Разбор WebSocket
+					if ws, ok := ss["wsSettings"].(map[string]interface{}); ok {
+						if p, ok := ws["path"].(string); ok && p != "" {
+							node.Path = p
+						}
+						if h, ok := ws["headers"].(map[string]interface{}); ok {
+							if hostH, ok := h["Host"].(string); ok {
+								node.Host = hostH
+							}
+						}
+					}
+
+					// 4. Разбор Reality
 					if reality, ok := ss["realitySettings"].(map[string]interface{}); ok {
 						if sni, ok := reality["serverName"].(string); ok {
 							node.SNI = sni
@@ -584,11 +625,12 @@ func parseXrayJSON(data []byte, targetHWID string, compiled []*regexp.Regexp, fi
 						if fp, ok := reality["fingerprint"].(string); ok {
 							node.Fingerprint = fp
 						}
-						if spx, ok := reality["spiderX"].(string); ok {
+						if spx, ok := reality["spiderX"].(string); ok && node.Path == "" {
 							node.Path = spx
 						}
 					}
 
+					// 5. Разбор стандартного TLS
 					if tls, ok := ss["tlsSettings"].(map[string]interface{}); ok {
 						if sni, ok := tls["serverName"].(string); ok {
 							node.SNI = sni

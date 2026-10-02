@@ -258,7 +258,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	// Направляем внешние домены в fakeip-dns
 	dnsRules = append(dnsRules, map[string]interface{}{
 		"action": "route",
 		"server": "fakeip-dns",
@@ -530,7 +529,7 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	if len(allNodeTags) > 0 {
 		urltestTag := "auto"
-		selectorTag := config.MainSelectorTag
+		selectorTag := "PROXY"
 
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":                        "urltest",
@@ -619,8 +618,8 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		targetOutbound := rp.Outbound
 		if strings.EqualFold(targetOutbound, "direct") {
 			targetOutbound = "direct-out"
-		} else if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, config.MainSelectorTag)) && configType != "urltest" {
-			targetOutbound = config.MainSelectorTag
+		} else if (strings.EqualFold(targetOutbound, "auto") || strings.EqualFold(targetOutbound, "PROXY")) && configType != "urltest" {
+			targetOutbound = "PROXY"
 		}
 
 		rpDomains := cleanTokens(rp.Domains)
@@ -775,7 +774,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
 		if !isGlobal {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
@@ -931,7 +929,7 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode, bindIface string) 
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			tr, err := buildXHTTPTransport(node)
+			tr, err := buildXHTTPTransport(node, b.binPath)
 			if err != nil {
 				return nil, err
 			}
@@ -989,7 +987,7 @@ func (b *Builder) buildNodeOutbound(node *config.GenericNode, bindIface string) 
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			tr, err := buildXHTTPTransport(node)
+			tr, err := buildXHTTPTransport(node, b.binPath)
 			if err != nil {
 				return nil, err
 			}

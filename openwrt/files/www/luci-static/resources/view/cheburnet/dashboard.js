@@ -258,6 +258,57 @@ return view.extend({
             document.head.appendChild(css);
         }
 
+        function setupMultiLineOption(opt, placeholder) {
+            opt.rows = 8;
+            opt.wrap = 'off';
+            if (placeholder) {
+                opt.placeholder = placeholder;
+            }
+
+            // Разбиваем любые разделители (запятые, пробелы, переводы строк) и выводим строго в столбик
+            opt.cfgvalue = function(section_id) {
+                var val = uci.get('cheburnet', section_id, this.option);
+                var items = [];
+
+                if (Array.isArray(val)) {
+                    val.forEach(function(entry) {
+                        if (typeof entry === 'string') {
+                            entry.split(/[,\s]+/).forEach(function(d) {
+                                var trimmed = d.trim();
+                                if (trimmed && items.indexOf(trimmed) === -1) {
+                                    items.push(trimmed);
+                                }
+                            });
+                        }
+                    });
+                } else if (typeof val === 'string') {
+                    val.split(/[,\s]+/).forEach(function(d) {
+                        var trimmed = d.trim();
+                        if (trimmed && items.indexOf(trimmed) === -1) {
+                            items.push(trimmed);
+                        }
+                    });
+                }
+                return items.join('\n');
+            };
+
+            // Сохраняем каждую непустую строчку отдельным элементом списка UCI
+            opt.write = function(section_id, formvalue) {
+                var raw = formvalue || '';
+                var tokens = raw.split(/[\r\n,\s]+/);
+                var cleanList = [];
+
+                tokens.forEach(function(token) {
+                    var trimmed = token.trim();
+                    if (trimmed.length > 0 && cleanList.indexOf(trimmed) === -1) {
+                        cleanList.push(trimmed);
+                    }
+                });
+
+                return uci.set('cheburnet', section_id, this.option, cleanList);
+            };
+        }
+
         window.cheburManageService = function(action) {
             var labels = {
                 'start': _('Запуск службы...'),
@@ -627,8 +678,10 @@ return view.extend({
         o.default = '07:00';
 
         // --- ВКЛАДКА МАРШРУТИЗАЦИИ СПИСКОВ ---
-        o = s.taboption('routing_rules', form.Flag, 'auto_learn_domains', _('Автоматическое добавление заблокированных сайтов (Domain Learning)'));
+        o = s.taboption('routing_rules', form.ListValue, 'auto_learn_domains', _('Автоматическое добавление сайтов (Domain Learning)'));
         o.description = _('Отслеживает разорванные прямые TCP-сессии (TCP RST / сброс пакетов). При регулярных сбоях домен автоматически добавляется в список обхода custom_domains.');
+        o.value('1', _('Включено'));
+        o.value('0', _('Отключено'));
         o.default = '0';
 
         o = s.taboption('routing_rules', form.Value, 'learn_threshold', _('Порог сбоев для автодобавления'));
@@ -652,12 +705,15 @@ return view.extend({
             o.value(cat.tag, cat.tag + ' — ' + cat.title);
         });
 
+        // Поля ввода списков в столбик
         o = s.taboption('routing_rules', form.TextValue, 'custom_domains', _('Список доменов'));
-        o.rows = 6;
+        setupMultiLineOption(o, 'example.com\nsub.domain.org\n*.google.com');
+
         o = s.taboption('routing_rules', form.TextValue, 'custom_subnets', _('Список подсетей'));
-        o.rows = 4;
+        setupMultiLineOption(o, '1.1.1.0/24\n8.8.8.8/32');
+
         o = s.taboption('routing_rules', form.TextValue, 'custom_ports', _('Список портов'));
-        o.rows = 4;
+        setupMultiLineOption(o, '443\n8080\n50000:65535');
 
         // --- ВКЛАДКА НАСТРОЕК DNS И СЕТИ ---
         o = s.taboption('dns_settings', form.ListValue, 'dns_protocol', _('Протокол DNS'));
@@ -895,7 +951,6 @@ return view.extend({
         o.value('', _('По умолчанию (PROXY / Основной)'));
         o.value('direct-out', _('Direct (Напрямую)'));
 
-        // Автоматическое добавление созданных групп классификации
         var uciGroups = uci.sections('cheburnet', 'node_group');
         if (Array.isArray(uciGroups)) {
             uciGroups.forEach(function(g) {
@@ -964,12 +1019,13 @@ return view.extend({
             })
             .catch(function() {});
 
+        // Дополнительные домены и подсети внутри Route Policies
         o = routeSec.option(form.TextValue, 'custom_domains', _('Дополнительные домены'));
-        o.rows = 4;
+        setupMultiLineOption(o, 'example.com\nsub.domain.org');
         o.modalonly = true;
 
         o = routeSec.option(form.TextValue, 'custom_subnets', _('Дополнительные подсети'));
-        o.rows = 4;
+        setupMultiLineOption(o, '1.1.1.0/24\n8.8.8.8/32');
         o.modalonly = true;
 
         return m.render().then(function(mapNode) {

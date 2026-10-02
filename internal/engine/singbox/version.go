@@ -21,24 +21,25 @@ type VersionInfo struct {
 }
 
 type Capabilities struct {
-	BinaryPath string
-	Major      int
-	Minor      int
-	Patch      int
-	IsLX       bool
-	IsExtended bool
-	HasXHTTP   bool
-	HasAWG     bool
-	Tags       map[string]bool
+	BinaryPath         string
+	Major              int
+	Minor              int
+	Patch              int
+	IsLX               bool
+	IsExtended         bool
+	SupportX25519MLKEM bool
+	HasXHTTP           bool
+	HasAWG             bool
+	Tags               map[string]bool
 }
 
 var (
-	capsMu       sync.RWMutex
-	activeBinary string
-	cachedCaps   = make(map[string]*Capabilities)
+	capsMu        sync.RWMutex
+	activeBinary  string
+	cachedCaps    = make(map[string]*Capabilities)
+	reExtendedVer = regexp.MustCompile(`-extended-(\d+)\.(\d+)(?:\.(\d+))?`)
 )
 
-// SetBinaryPath устанавливает путь к активному бинарнику, выбранному сервисом
 func SetBinaryPath(binPath string) {
 	capsMu.Lock()
 	defer capsMu.Unlock()
@@ -50,7 +51,9 @@ func resolveSingBoxBin(binPath string) string {
 		if resolved, err := exec.LookPath(binPath); err == nil {
 			return resolved
 		}
-		return binPath
+		if _, err := os.Stat(binPath); err == nil {
+			return binPath
+		}
 	}
 
 	capsMu.RLock()
@@ -61,8 +64,16 @@ func resolveSingBoxBin(binPath string) string {
 		return currentActive
 	}
 
-	// Проверяем стандартный sing-box с приоритетом перед кастомными форками
-	for _, candidate := range []string{"/usr/bin/sing-box", "sing-box", "/usr/bin/sing-box-lx", "sing-box-lx"} {
+	candidates := []string{
+		"/usr/bin/sing-box-extended",
+		"/usr/bin/sing-box-lx",
+		"/usr/bin/sing-box",
+		"sing-box-extended",
+		"sing-box-lx",
+		"sing-box",
+	}
+
+	for _, candidate := range candidates {
 		if resolved, err := exec.LookPath(candidate); err == nil {
 			return resolved
 		}
@@ -70,10 +81,55 @@ func resolveSingBoxBin(binPath string) string {
 			return candidate
 		}
 	}
-	return "sing-box"
+	return "/usr/bin/sing-box"
 }
 
-// InspectBinary производит глубокий анализ возможностей заданного ядра sing-box
+func ExtendedSupportsX25519MLKEM768(verStr string) bool {
+	clean := strings.TrimSpace(verStr)
+	if clean == "" {
+		return false
+	}
+
+	matches := reExtendedVer.FindStringSubmatch(clean)
+	if len(matches) < 3 {
+		return false
+	}
+
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return false
+	}
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return false
+	}
+	patch := 0
+	if len(matches) > 3 && matches[3] != "" {
+		if p, err := strconv.Atoi(matches[3]); err == nil {
+			patch = p
+		}
+	}
+
+	if major > 2 {
+		return true
+	}
+	if major == 2 {
+		if minor > 7 {
+			return true
+		}
+		if minor == 7 {
+			return patch >= 2
+		}
+	}
+	return false
+}
+
+func ResetCapabilitiesCache() {
+	capsMu.Lock()
+	defer capsMu.Unlock()
+	cachedCaps = make(map[string]*Capabilities)
+}
+
 func InspectBinary(binPath string) *Capabilities {
 	resolved := resolveSingBoxBin(binPath)
 
@@ -100,16 +156,10 @@ func InspectBinary(binPath string) *Capabilities {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, resolved, "version")
-	outBytes, err := cmd.CombinedOutput()
-	if err != nil && len(outBytes) == 0 {
-		cachedCaps[resolved] = caps
-		return caps
-	}
-
+	outBytes, _ := cmd.CombinedOutput()
 	output := string(outBytes)
 	lowerOutput := strings.ToLower(output)
 
-	// 1. Парсинг версии
 	re := regexp.MustCompile(`version\s+v?(\d+)\.(\d+)(?:\.(\d+))?`)
 	if matches := re.FindStringSubmatch(output); len(matches) >= 3 {
 		caps.Major, _ = strconv.Atoi(matches[1])
@@ -119,7 +169,22 @@ func InspectBinary(binPath string) *Capabilities {
 		}
 	}
 
-	// 2. Парсинг тегов Go
+	if caps.Major == 0 && caps.Minor == 0 {
+		if data, err := os.ReadFile("/etc/cheburnet/sing-box-version"); err == nil {
+			vStr := strings.TrimSpace(string(data))
+			output = vStr
+			lowerOutput = strings.ToLower(vStr)
+			reAlt := regexp.MustCompile(`(\d+)\.(\d+)(?:\.(\d+))?`)
+			if m := reAlt.FindStringSubmatch(vStr); len(m) >= 3 {
+				caps.Major, _ = strconv.Atoi(m[1])
+				caps.Minor, _ = strconv.Atoi(m[2])
+				if len(m) > 3 && m[3] != "" {
+					caps.Patch, _ = strconv.Atoi(m[3])
+				}
+			}
+		}
+	}
+
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "Tags:") {
@@ -143,7 +208,6 @@ func InspectBinary(binPath string) *Capabilities {
 		caps.IsLX = true
 	}
 
-	// 3. Анализ имени и суффиксов
 	if strings.Contains(lowerOutput, "extended") || strings.Contains(lowerOutput, "shtorm") {
 		caps.IsExtended = true
 	}
@@ -151,9 +215,20 @@ func InspectBinary(binPath string) *Capabilities {
 		caps.IsLX = true
 	}
 
-	// 4. Если поддержка xhttp не подтверждена тегами, выполняем dummy probe
+	if ExtendedSupportsX25519MLKEM768(output) {
+		caps.SupportX25519MLKEM = true
+	} else if data, err := os.ReadFile("/etc/cheburnet/sing-box-version"); err == nil {
+		if ExtendedSupportsX25519MLKEM768(string(data)) {
+			caps.SupportX25519MLKEM = true
+		}
+	}
+
 	if !caps.HasXHTTP {
-		caps.HasXHTTP = probeXHTTP(resolved)
+		if caps.Major > 1 || (caps.Major == 1 && caps.Minor >= 14) || caps.IsExtended || caps.IsLX {
+			caps.HasXHTTP = true
+		} else {
+			caps.HasXHTTP = probeXHTTP(resolved)
+		}
 	}
 
 	cachedCaps[resolved] = caps
@@ -161,9 +236,23 @@ func InspectBinary(binPath string) *Capabilities {
 }
 
 func probeXHTTP(binPath string) bool {
-	dummyJSON := `{"outbounds":[{"type":"vless","tag":"p","server":"127.0.0.1","server_port":443,"uuid":"00000000-0000-0000-0000-000000000000","transport":{"type":"xhttp","path":"/"}}]}`
+	dummyJSON := `{
+		"log": {"level": "panic"},
+		"outbounds": [{
+			"type": "vless",
+			"tag": "probe-xhttp",
+			"server": "127.0.0.1",
+			"server_port": 443,
+			"uuid": "a8098c1a-f86e-11da-bd1a-00112444be1e",
+			"transport": {
+				"type": "xhttp",
+				"path": "/",
+				"x_padding_bytes": "100-1000"
+			}
+		}]
+	}`
 
-	tmpFile, err := os.CreateTemp("", "sb-probe-*.json")
+	tmpFile, err := os.CreateTemp("/tmp", "sb-probe-*.json")
 	if err != nil {
 		return false
 	}
@@ -179,35 +268,57 @@ func probeXHTTP(binPath string) bool {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, binPath, "check", "-c", tmpFile.Name())
-	out, _ := cmd.CombinedOutput()
+	out, err := cmd.CombinedOutput()
+	outStr := string(out)
 
-	return !strings.Contains(string(out), "unknown transport type: xhttp")
+	if strings.Contains(outStr, "unknown transport type: xhttp") {
+		return false
+	}
+
+	return err == nil || !strings.Contains(outStr, "transport")
 }
 
-// SupportsXHTTP возвращает true, только если бинарник действительно поддерживает xhttp
 func SupportsXHTTP(binPath string) bool {
 	return InspectBinary(binPath).HasXHTTP
 }
 
-// IsLX возвращает true для сборок sing-box-lx
+func SupportsX25519MLKEM(binPath string) bool {
+	caps := InspectBinary(binPath)
+	return (caps.Major > 1 || (caps.Major == 1 && caps.Minor >= 14)) && caps.SupportX25519MLKEM
+}
+
 func IsLX(binPath string) bool {
 	return InspectBinary(binPath).IsLX
 }
 
-// IsExtended возвращает true для сборок sing-box-extended
 func IsExtended(binPath string) bool {
 	return InspectBinary(binPath).IsExtended
 }
 
-// buildXHTTPTransport собирает спецификацию блока transport для XHTTP (SplitHTTP)
-func buildXHTTPTransport(node *config.GenericNode) (map[string]interface{}, error) {
-	if !SupportsXHTTP("") {
-		return nil, fmt.Errorf("skipped: transport '%s' is not supported by current sing-box (requires sing-box-lx or extended with 'with_xhttp' tag)", node.Network)
+func buildXHTTPTransport(node *config.GenericNode, binPath string) (map[string]interface{}, error) {
+	if !SupportsXHTTP(binPath) {
+		return nil, fmt.Errorf("skipped: transport '%s' is not supported by current sing-box", node.Network)
 	}
 
+	tagLower := strings.ToLower(node.Tag)
+	addrLower := strings.ToLower(node.Address)
+	hostLower := strings.ToLower(node.Host)
+	sniLower := strings.ToLower(node.SNI)
+
+	isBridge := strings.Contains(tagLower, "bridge") ||
+		strings.Contains(addrLower, "bridge") ||
+		strings.Contains(hostLower, "bridge") ||
+		strings.Contains(sniLower, "bridge")
+
 	mode := strings.TrimSpace(node.XHTTPMode)
-	if mode == "" {
-		mode = "auto"
+	// В sing-box клиентский режим не может быть "auto":
+	// Для мостов с параметрами sc_* строго packet-up, для остальных - stream-up
+	if mode == "" || mode == "auto" {
+		if isBridge {
+			mode = "packet-up"
+		} else {
+			mode = "stream-up"
+		}
 	}
 
 	path := strings.TrimSpace(node.Path)
@@ -216,27 +327,48 @@ func buildXHTTPTransport(node *config.GenericNode) (map[string]interface{}, erro
 	}
 
 	padding := strings.TrimSpace(node.XHTTPPadding)
-	if padding == "" {
-		padding = "100-1000"
+	if padding == "" || padding == "0" || padding == "false" || padding == "none" {
+		if isBridge {
+			padding = "500-2000"
+		} else {
+			padding = "100-1000"
+		}
+	}
+
+	headers := make(map[string]string)
+	for k, v := range node.XHTTPHeaders {
+		headers[k] = v
+	}
+
+	// Передаем только max_concurrency, чтобы избежать конфликта с max_connections
+	xmuxConfig := map[string]interface{}{
+		"max_concurrency":     "16-32",
+		"c_max_reuse_times":   "300-600",
+		"h_max_request_times": "1000-2000",
+		"h_max_reusable_secs": "1200-2400",
+		"h_keep_alive_period": 0,
 	}
 
 	transport := map[string]interface{}{
 		"type":            "xhttp",
 		"mode":            mode,
 		"path":            path,
+		"headers":         headers,
+		"domain_strategy": "prefer_ipv4",
 		"x_padding_bytes": padding,
+		"no_grpc_header":  node.XHTTPNoGRPC,
+		"xmux":            xmuxConfig,
+	}
+
+	if mode == "packet-up" {
+		transport["sc_max_each_post_bytes"] = 1000000
+		transport["sc_min_posts_interval_ms"] = 30
 	}
 
 	if host := strings.TrimSpace(node.Host); host != "" {
 		transport["host"] = host
-	}
-
-	if node.XHTTPNoGRPC {
-		transport["no_grpc_header"] = true
-	}
-
-	if len(node.XHTTPHeaders) > 0 {
-		transport["headers"] = node.XHTTPHeaders
+	} else if node.SNI != "" {
+		transport["host"] = strings.TrimSpace(node.SNI)
 	}
 
 	return transport, nil

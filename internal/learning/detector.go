@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,10 @@ import (
 )
 
 var (
-	// Ловит ошибки сброса TCP и таймауты ядра на прямом выходе direct-out (ТСПУ RST / Blackhole)
 	logRstRegex        = regexp.MustCompile(`outbound\/direct\[direct-out\]:.*(?:dial|connect|read).*(?:connection reset by peer|i/o timeout|handshake failure|broken pipe|EOF)`)
-	domainExtractRegex = regexp.MustCompile(`([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z0-9][-a-zA-Z0-9.]+)`)
+	domainExtractRegex = regexp.MustCompile(`\b([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,24})\b`)
+	timeDurationRegex  = regexp.MustCompile(`^\d+(\.\d+)?(s|ms|us|ns|m|h)$`)
+	numericDotRegex    = regexp.MustCompile(`^\d+\.\d+`)
 )
 
 type DomainCandidate struct {
@@ -78,6 +80,15 @@ type clashConnectionsResponse struct {
 	Connections []clashConnectionItem `json:"connections"`
 }
 
+// Проверка, включена ли функция Domain Learning в конфигурации
+func (l *DomainLearner) isEnabled() bool {
+	if l.state == nil {
+		return false
+	}
+	cfg := l.state.Clone()
+	return cfg != nil && cfg.AutoLearnDomains
+}
+
 func (l *DomainLearner) StartLoop(ctx context.Context) {
 	connTicker := time.NewTicker(1500 * time.Millisecond)
 	logTicker := time.NewTicker(2000 * time.Millisecond)
@@ -89,15 +100,67 @@ func (l *DomainLearner) StartLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-connTicker.C:
+			// Если функция отключена, запросы на обучение не выполняются[cite: 3]
+			if !l.isEnabled() {
+				continue
+			}
 			l.auditActiveConnections(ctx)
 		case <-logTicker.C:
+			// Если функция отключена, запросы на обучение не выполняются[cite: 3]
+			if !l.isEnabled() {
+				continue
+			}
 			l.auditEngineLogs()
 		}
 	}
 }
 
-// Контур А: Анализ активных сессий Clash API (Silent Drop / таймаут ответа сервера)
+func isValidFQDN(d string) bool {
+	d = strings.TrimSpace(strings.ToLower(d))
+	if d == "" || len(d) > 255 {
+		return false
+	}
+
+	if timeDurationRegex.MatchString(d) || numericDotRegex.MatchString(d) {
+		return false
+	}
+
+	if net.ParseIP(d) != nil {
+		return false
+	}
+
+	for _, invalidSuffix := range []string{
+		".lan", ".local", ".arpa", ".internal", ".home",
+		"direct-out", "sing-box", "tproxy-in", "dns-in", "mixed-in",
+	} {
+		if strings.HasSuffix(d, invalidSuffix) {
+			return false
+		}
+	}
+
+	parts := strings.Split(d, ".")
+	if len(parts) < 2 {
+		return false
+	}
+
+	tld := parts[len(parts)-1]
+	if len(tld) < 2 || len(tld) > 24 {
+		return false
+	}
+	for i := 0; i < len(tld); i++ {
+		if tld[i] < 'a' || tld[i] > 'z' {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (l *DomainLearner) auditActiveConnections(ctx context.Context) {
+	if !l.isEnabled() {
+		return
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 	defer cancel()
 
@@ -126,11 +189,7 @@ func (l *DomainLearner) auditActiveConnections(ctx context.Context) {
 	now := time.Now()
 	for _, conn := range data.Connections {
 		host := strings.TrimSpace(conn.Metadata.Host)
-		if host == "" || net.ParseIP(host) != nil {
-			continue
-		}
-
-		if strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".arpa") {
+		if !isValidFQDN(host) {
 			continue
 		}
 
@@ -146,7 +205,6 @@ func (l *DomainLearner) auditActiveConnections(ctx context.Context) {
 			continue
 		}
 
-		// Запрос отправлен (Upload > 30 байт), прошло > 1.2 с, входящего трафика нет
 		duration := now.Sub(conn.Start)
 		if conn.Upload > 30 && conn.Download == 0 && duration > 1200*time.Millisecond {
 			l.recordFailure(host, conn.Metadata.ClientIP, "silent_timeout")
@@ -154,9 +212,8 @@ func (l *DomainLearner) auditActiveConnections(ctx context.Context) {
 	}
 }
 
-// Контур Б: Анализ мгновенных TCP RST через системный вывод ядра Sing-Box
 func (l *DomainLearner) auditEngineLogs() {
-	if l.logReader == nil {
+	if !l.isEnabled() || l.logReader == nil {
 		return
 	}
 
@@ -171,11 +228,8 @@ func (l *DomainLearner) auditEngineLogs() {
 		if logRstRegex.MatchString(line) {
 			matches := domainExtractRegex.FindAllString(line, -1)
 			for _, match := range matches {
-				matchLower := strings.ToLower(match)
-				if !strings.Contains(matchLower, ".") || net.ParseIP(matchLower) != nil {
-					continue
-				}
-				if strings.HasSuffix(matchLower, "direct-out") || strings.HasSuffix(matchLower, "sing-box") {
+				matchLower := strings.ToLower(strings.TrimSpace(match))
+				if !isValidFQDN(matchLower) {
 					continue
 				}
 				l.recordFailure(matchLower, "router/local", "tcp_rst_injected")
@@ -185,9 +239,17 @@ func (l *DomainLearner) auditEngineLogs() {
 }
 
 func (l *DomainLearner) recordFailure(rawHost, clientIP, reason string) {
-	host := strings.ToLower(rawHost)
+	if !l.isEnabled() {
+		return
+	}
+
+	host := strings.ToLower(strings.TrimSpace(rawHost))
 	if h, _, err := net.SplitHostPort(rawHost); err == nil {
-		host = strings.ToLower(h)
+		host = strings.ToLower(strings.TrimSpace(h))
+	}
+
+	if !isValidFQDN(host) {
+		return
 	}
 
 	if strings.Contains(host, "cloudflare") || strings.Contains(host, "gstatic") || strings.Contains(host, "yandex") {
@@ -208,7 +270,6 @@ func (l *DomainLearner) recordFailure(rawHost, clientIP, reason string) {
 			Reason:     reason,
 		}
 		l.candidates[host] = cand
-		log.Printf("[domain-learning] Captured blocked candidate: %s (reason: %s, client: %s)", host, reason, clientIP)
 	} else {
 		cand.FailCount++
 		cand.LastSeen = time.Now()
@@ -240,6 +301,7 @@ func (l *DomainLearner) promoteDomainToConfig(domain string) {
 	_, _ = l.state.Commit(candidate, false)
 }
 
+// Возвращает отсортированный список топ-10 доменов по количеству сбоев[cite: 3]
 func (l *DomainLearner) GetCandidates() []*DomainCandidate {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -249,6 +311,17 @@ func (l *DomainLearner) GetCandidates() []*DomainCandidate {
 		cp := *c
 		out = append(out, &cp)
 	}
+
+	// Сортировка по количеству ошибок (FailCount) по убыванию
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].FailCount > out[j].FailCount
+	})
+
+	// Ограничение до топ-10 элементов[cite: 3]
+	if len(out) > 10 {
+		out = out[:10]
+	}
+
 	return out
 }
 

@@ -8,6 +8,15 @@ return baseclass.extend({
         var self = this;
         var pollIntervalId = null;
 
+        // Проверяем реальное состояние опции в /etc/config/cheburnet
+        var isEnabled = (uci.get('cheburnet', 'main', 'auto_learn_domains') === '1' ||
+                         uci.get('cheburnet', 'main', 'domain_learning_enabled') === '1');
+
+        if (!isEnabled) {
+            // Если функция отключена, блок скрыт, фоновые сетевые запросы не создаются
+            return E('div', { 'style': 'display: none;' });
+        }
+
         function getAuthHeaders(customHeaders) {
             var headers = customHeaders || {};
             var apiToken = uci.get('cheburnet', 'main', 'api_token') || '';
@@ -62,10 +71,20 @@ return baseclass.extend({
         function renderCandidatesTable(candidates) {
             var tbody = document.getElementById('cb-learning-tbody');
             var counterEl = document.getElementById('cb-learning-count');
-            var emptyRow = document.getElementById('cb-learning-empty');
             if (!tbody) return;
 
-            var list = Array.isArray(candidates) ? candidates : [];
+            var list = Array.isArray(candidates) ? candidates.slice() : [];
+
+            // Сортировка по количеству сбоев по убыванию
+            list.sort(function(a, b) {
+                return (b.fail_count || 0) - (a.fail_count || 0);
+            });
+
+            // Ограничение ровно до top 10
+            if (list.length > 10) {
+                list = list.slice(0, 10);
+            }
+
             if (counterEl) {
                 counterEl.textContent = list.length;
             }
@@ -178,7 +197,7 @@ return baseclass.extend({
             }, [
                 E('div', { 'style': 'display: flex; align-items: center; gap: 8px;' }, [
                     E('span', { 'style': 'font-size: 15px;' }, '🧠'),
-                    E('span', { 'style': 'color: var(--cb-text-main);' }, _('Автоматическое обнаружение блокировок (Domain Learning)')),
+                    E('span', { 'style': 'color: var(--cb-text-main);' }, _('Автоматическое обнаружение блокировок (Top 10)')),
                     E('span', {
                         'id': 'cb-learning-count',
                         'style': 'font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--cb-card-active-bg); border: 1px solid var(--cb-card-active-border); color: var(--cb-text-accent); font-weight: bold;'

@@ -3,6 +3,8 @@
 set -e
 
 REPO_CHEBUR="ph4n70m1984/cheburnet"
+REPO_SB_EXTENDED="${REPO_SB_EXTENDED:-"shtorm-7/sing-box-extended"}"
+REPO_SB_LX="${REPO_SB_LX:-"Leadaxe/sing-box-lx"}"
 DEST_FILE="/usr/bin/sing-box"
 SERVICE_NAME="cheburnet"
 
@@ -12,7 +14,8 @@ Y="\033[1;33m"
 C="\033[1;36m"
 N="\033[0m"
 
-WORK_DIR=""
+WORK_DIR=$(mktemp -d /tmp/chebur_install.XXXXXX 2>/dev/null || echo "/tmp/chebur_install_$$")
+mkdir -p "$WORK_DIR"
 SERVICE_STOPPED="0"
 DNS_BACKED_UP="0"
 
@@ -149,7 +152,10 @@ case "$HOST_ARCH" in
 esac
 
 CURRENT_SB_VER=""
-if [ -f "$DEST_FILE" ]; then
+if [ -f "/etc/cheburnet/sing-box-version" ]; then
+    CURRENT_SB_VER=$(head -n 1 /etc/cheburnet/sing-box-version | tr -d '\r\n')
+fi
+if [ -z "$CURRENT_SB_VER" ] && [ -f "$DEST_FILE" ]; then
     CURRENT_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
 fi
 
@@ -219,35 +225,175 @@ case "$CHOICE_CHAN" in
         ;;
 esac
 
-# 5. Выбор действия для Sing-Box
+# 5. Функция установки сторонних форков (extended / lx)
+install_custom_singbox() {
+    PKG_NAME="$1"        # "sing-box-extended" или "sing-box-lx"
+    GH_REPO="$2"         # репозиторий GitHub
+    DISPLAY_NAME="$3"    # отображаемое имя
+
+    printf "${C}[*] Поиск релизов %s на GitHub (${GH_REPO})...${N}\n" "$DISPLAY_NAME"
+    SB_JSON=$(api_get "https://api.github.com/repos/${GH_REPO}/releases?per_page=10")
+
+    if [ -z "$SB_JSON" ] || echo "$SB_JSON" | grep -q '"message": *"Not Found"'; then
+        fail "Не удалось получить список релизов ${DISPLAY_NAME} из ${GH_REPO}."
+    fi
+
+    # Исключаем Android (SFA), Windows, macOS, ищем бинарный архив Linux
+    PARSED_SB=$(echo "$SB_JSON" | awk -v arch1="$ARCH_SUFFIX" -v arch2="$CHEBUR_ARCH" '
+        /"tag_name":/ {
+            t = $0
+            sub(/.*"tag_name":[[:space:]]*"/, "", t)
+            sub(/".*/, "", t)
+            cur_tag = t
+            is_draft = 0
+        }
+        /"draft":[[:space:]]*true/ { is_draft = 1 }
+        /"browser_download_url":/ {
+            u = $0
+            sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
+            sub(/".*/, "", u)
+            if (cur_tag != "" && !is_draft) {
+                u_low = tolower(u)
+
+                # Игнорируем Android APK (SFA), GUI-клиенты и посторонние ОС
+                if (u_low ~ "sfa" || u_low ~ "android" || u_low ~ "windows" || u_low ~ "\\.apk$" || u_low ~ "\\.exe$" || u_low ~ "darwin" || u_low ~ "macos") next
+
+                # Требуется linux-архив
+                if (u_low !~ "linux") next
+
+                a1 = tolower(arch1); a2 = tolower(arch2)
+                matched = 0
+
+                if (a1 != "" && u_low ~ ("linux-" a1)) matched = 1
+                if (!matched && a2 != "" && u_low ~ ("linux-" a2)) matched = 1
+                if (!matched && a1 != "" && u_low ~ a1) matched = 1
+
+                if (a1 ~ "softfloat" && u_low !~ "softfloat" && u_low ~ "mips") matched = 0
+                if (a1 == "arm64" && u_low ~ "armv") matched = 0
+
+                if (matched && !found_url) {
+                    found_url = u
+                    found_tag = cur_tag
+                }
+            }
+        }
+        END {
+            if (found_url != "") {
+                print found_tag "|" found_url
+            } else {
+                exit 1
+            }
+        }
+    ')
+
+    [ -z "$PARSED_SB" ] && fail "Не найден подходящий Linux-бинарник ${DISPLAY_NAME} под архитектуру ${ARCH_SUFFIX} в ${GH_REPO}."
+
+    TAG_VAL=$(echo "$PARSED_SB" | cut -d '|' -f 1)
+    URL_VAL=$(echo "$PARSED_SB" | cut -d '|' -f 2)
+    printf "  Целевой релиз %s: ${Y}%s${N} (%s)\n" "$DISPLAY_NAME" "$TAG_VAL" "$(basename "$URL_VAL")"
+
+    # ЭТАП 1: Скачивание во временную директорию (служба работает, есть сеть и прокси)
+    ARCHIVE_FILE="$WORK_DIR/$(basename "$URL_VAL")"
+    printf "${C}[*] Скачивание %s...${N}\n" "$DISPLAY_NAME"
+    $DOWNLOAD "$ARCHIVE_FILE" "$URL_VAL" || fail "Не удалось скачать ${DISPLAY_NAME}"
+
+    [ -s "$ARCHIVE_FILE" ] || fail "Скачанный файл ${DISPLAY_NAME} пуст или повреждён."
+
+    # ЭТАП 2: Остановка службы перед удалением и заменой бинарников
+    stop_cheburnet_service
+
+    # ЭТАП 3: Удаление старого ядра и ссылок
+    printf "${C}[*] Удаление предыдущей версии ядра sing-box...${N}\n"
+    rm -f "$DEST_FILE" /usr/bin/sing-box-extended /usr/bin/sing-box-lx 2>/dev/null || true
+
+    # ЭТАП 4: Распаковка и установка бинарника
+    printf "${C}[*] Установка нового ядра %s...${N}\n" "$DISPLAY_NAME"
+    EXTRACT_DIR="$WORK_DIR/extracted_${PKG_NAME}"
+    mkdir -p "$EXTRACT_DIR"
+
+    case "$ARCHIVE_FILE" in
+        *.tar.gz|*.tgz)
+            tar -xzf "$ARCHIVE_FILE" -C "$EXTRACT_DIR"
+            FOUND_BIN=$(find "$EXTRACT_DIR" -type f \( -name "sing-box" -o -name "$PKG_NAME" \) | head -n 1)
+            if [ -z "$FOUND_BIN" ]; then
+                FOUND_BIN=$(find "$EXTRACT_DIR" -type f -perm -111 | head -n 1)
+            fi
+            [ -z "$FOUND_BIN" ] && fail "Бинарный файл не найден внутри скачанного архива ${DISPLAY_NAME}."
+            cp -f "$FOUND_BIN" "$DEST_FILE"
+            ;;
+        *.gz)
+            gzip -dc "$ARCHIVE_FILE" > "$DEST_FILE" 2>/dev/null || gunzip -c "$ARCHIVE_FILE" > "$DEST_FILE" 2>/dev/null || fail "Ошибка распаковки gzip"
+            ;;
+        *)
+            cp -f "$ARCHIVE_FILE" "$DEST_FILE"
+            ;;
+    esac
+
+    chmod 755 "$DEST_FILE" 2>/dev/null || true
+
+    # Создаем симлинк под оригинальным именем форка
+    ln -sf "$DEST_FILE" "/usr/bin/${PKG_NAME}" 2>/dev/null || true
+
+    # Проверка работоспособности
+    NEW_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
+    if [ -z "$NEW_VER" ]; then
+        fail "Установленный бинарник $DEST_FILE не запускается (несовместимая архитектура)."
+    fi
+
+    mkdir -p /etc/cheburnet
+    echo "${NEW_VER:-$TAG_VAL}" > /etc/cheburnet/sing-box-version
+
+    printf "${G}[✓] %s успешно установлен: %s${N}\n\n" "$DISPLAY_NAME" "${NEW_VER:-$TAG_VAL}"
+}
+
+# 6. Выбор действия для Sing-Box
+DEF_SB_CHOICE="1"
+if [ -n "$CURRENT_SB_VER" ]; then
+    if echo "$CURRENT_SB_VER" | grep -qi "extended"; then
+        DEF_SB_CHOICE="2"
+    elif echo "$CURRENT_SB_VER" | grep -qi "lx"; then
+        DEF_SB_CHOICE="3"
+    fi
+fi
+
 echo "Операции с ядром Sing-Box:"
-echo "  1) Установить / Обновить из официального репозитория OpenWrt ($PKG_MANAGER)"
+echo "  1) Установить / Обновить официальный ванильный sing-box ($PKG_MANAGER)"
+echo "  2) Установить / Обновить sing-box-extended ($REPO_SB_EXTENDED с x25519mlkem768)"
+echo "  3) Установить / Обновить sing-box-lx ($REPO_SB_LX)"
 echo "  0) Пропустить обновление sing-box"
-printf "${C}[>] Ваш выбор [0-1] (по умолчанию 1): ${N}"
+printf "${C}[>] Ваш выбор [0-3] (по умолчанию %s): ${N}" "$DEF_SB_CHOICE"
 read_input 30
-CHOICE_SB="${READ_VALUE:-1}"
+CHOICE_SB="${READ_VALUE:-$DEF_SB_CHOICE}"
 
 case "$CHOICE_SB" in
     1)
-        printf "${C}[*] Установка/обновление sing-box через %s...${N}\n" "$PKG_MANAGER"
+        printf "${C}[*] Установка официального sing-box через %s...${N}\n" "$PKG_MANAGER"
+        stop_cheburnet_service
+        rm -f "$DEST_FILE" /usr/bin/sing-box-extended /usr/bin/sing-box-lx /etc/cheburnet/sing-box-version 2>/dev/null || true
         if [ "$PKG_MANAGER" = "apk" ]; then
             apk update && apk add --upgrade sing-box
         else
             opkg update && opkg install sing-box --force-reinstall
         fi
         NEW_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
-        printf "${G}[✓] sing-box успешно установлен/обновлен: %s${N}\n" "${NEW_SB_VER:-готово}"
+        printf "${G}[✓] Официальный sing-box успешно установлен: %s${N}\n\n" "${NEW_SB_VER:-готово}"
+        ;;
+    2)
+        install_custom_singbox "sing-box-extended" "$REPO_SB_EXTENDED" "sing-box-extended"
+        ;;
+    3)
+        install_custom_singbox "sing-box-lx" "$REPO_SB_LX" "sing-box-lx"
         ;;
     0)
-        printf "${Y}[*] Пропуск обновления sing-box.${N}\n"
+        printf "${Y}[*] Пропуск обновления sing-box.${N}\n\n"
         ;;
     *)
-        printf "${Y}[!] Неизвестный выбор. Пропуск sing-box.${N}\n"
+        printf "${Y}[!] Неизвестный выбор. Пропуск sing-box.${N}\n\n"
         ;;
 esac
 
-# 6. Проверка системных зависимостей
-printf "\n${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle, libcurl, curl)...${N}\n"
+# 7. Проверка системных зависимостей
+printf "${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle, libcurl, curl)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
     apk update
     apk add --no-cache --upgrade libcurl curl nftables kmod-nft-tproxy ip-full ca-bundle
@@ -257,7 +403,7 @@ else
     opkg install nftables kmod-nft-tproxy ip-full ca-bundle
 fi
 
-# 7. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала и SemVer
+# 8. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала и SemVer
 printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
 RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=25")
 [ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
@@ -331,18 +477,16 @@ if [ -n "$CURRENT_CHEBUR_VER" ] && [ "$CURRENT_CHEBUR_VER" = "$CHEBUR_CLEAN_VER"
 fi
 
 if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
-    # ШАГ 1: Скачивание (служба еще работает, сеть и резолвинг активны)
+    # Скачивание пакета Chebur.NET перед остановкой
     printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
     $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
 
-    # ШАГ 2: Остановка службы перед установкой
     stop_cheburnet_service
 
     if [ -f "/etc/config/cheburnet" ]; then
         cp -f "/etc/config/cheburnet" "/tmp/cheburnet_config_backup"
     fi
 
-    # ШАГ 3: Установка пакета
     printf "${C}[*] Установка пакета Chebur.NET...${N}\n"
     if [ "$PKG_MANAGER" = "apk" ]; then
         if ! apk add --allow-untrusted --force-overwrite "/tmp/cheburnet.apk" 2>/dev/null; then
@@ -360,18 +504,18 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 fi
 
-# 8. Фиксация выбранного канала в UCI
+# 9. Фиксация выбранного канала в UCI
 if command -v uci >/dev/null 2>&1 && [ -f "/etc/config/cheburnet" ]; then
     uci -q set cheburnet.main.update_channel="$SELECTED_CHANNEL" || true
     uci -q commit cheburnet || true
 fi
 
-# 9. ШАГ 4: Финализация прав, каталогов и запуск/перезапуск службы
+# 10. Финализация прав, каталогов и запуск службы
 mkdir -p /var/etc/cheburnet /var/run/cheburnet
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
 
-rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache/ "$WORK_DIR"
 
 if [ "$DNS_BACKED_UP" = "1" ]; then
     [ -f "/tmp/resolv.conf.bak" ] && mv -f "/tmp/resolv.conf.bak" "/tmp/resolv.conf" 2>/dev/null || true
@@ -385,6 +529,7 @@ SERVICE_STOPPED="0"
 printf "\n${G}====================================================${N}\n"
 printf "${G}  Chebur.NET и Sing-Box успешно настроены!          ${N}\n"
 printf "  Канал обновлений:  ${Y}%s${N}\n" "$SELECTED_CHANNEL"
+printf "  Версия ядра:       ${Y}%s${N}\n" "$("${DEST_FILE}" version 2>/dev/null | head -n 1 || echo "установлен")"
 printf "  Служба:            ${Y}cheburnet (active/running)${N}\n"
 printf "  Веб-интерфейс:     ${Y}LuCI -> Службы -> Chebur.NET${N}\n"
 printf "${G}====================================================${N}\n"

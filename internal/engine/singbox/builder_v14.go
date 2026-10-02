@@ -39,6 +39,10 @@ func NewBuilderV14WithBin(binPath string) *BuilderV14 {
 	return b
 }
 
+func (b *BuilderV14) supportsX25519MLKEM() bool {
+	return SupportsX25519MLKEM(b.binPath)
+}
+
 func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	clashController := "0.0.0.0:9090"
 
@@ -172,8 +176,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	// Направляем внешние домены в fakeip-dns. Неизвестные домены в rules-режиме
-	// получат Fake-IP и пойдут в direct-out, позволяя Sing-Box зафиксировать блокировку.
 	dnsRules = append(dnsRules, map[string]interface{}{
 		"server": "fakeip-dns",
 	})
@@ -336,6 +338,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	if skippedCount > 0 {
 		log.Printf("[INFO] [builder_v14] Successfully compiled %d/%d nodes into sing-box outbounds (%d unsupported nodes skipped)",
 			len(allNodeTags), len(cfg.Nodes), skippedCount)
+	} else {
+		log.Printf("[INFO] [builder_v14] Successfully compiled %d/%d nodes into sing-box outbounds",
+			len(allNodeTags), len(cfg.Nodes))
 	}
 
 	activeOutboundTag := "direct-out"
@@ -359,6 +364,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	if globalURLTestURL == "" {
 		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
 	}
+
+	createdGroups := make(map[string]bool)
 
 	if len(cfg.Groups) > 0 {
 		for _, grp := range cfg.Groups {
@@ -396,16 +403,18 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         targetURL,
 				"interval":                    interval,
 				"tolerance":                   tolerance,
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true,
 			})
 
 			selectorList := append([]string{urltestTag}, validGrpNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       grp.Tag,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         grp.Tag,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
+			createdGroups[grp.Tag] = true
 
 			if activeOutboundTag == "direct-out" {
 				activeOutboundTag = grp.Tag
@@ -438,16 +447,18 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         globalURLTestURL,
 				"interval":                    globalURLTestInterval,
 				"tolerance":                   globalURLTestTolerance,
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true,
 			})
 
 			selectorList := append([]string{urltestTag}, matchedNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       ng.Name,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         ng.Name,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
+			createdGroups[ng.Name] = true
 		}
 	}
 
@@ -462,23 +473,25 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"url":                         globalURLTestURL,
 			"interval":                    globalURLTestInterval,
 			"tolerance":                   globalURLTestTolerance,
-			"interrupt_exist_connections": false,
+			"interrupt_exist_connections": true,
 		})
 
 		if configType == "urltest" {
 			selectorList := append([]string{urltestTag}, allNodeTags...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       selectorTag,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         selectorTag,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
 		} else {
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       selectorTag,
-				"outbounds": allNodeTags,
-				"default":   allNodeTags[0],
+				"type":                        "selector",
+				"tag":                         selectorTag,
+				"outbounds":                   allNodeTags,
+				"default":                     allNodeTags[0],
+				"interrupt_exist_connections": true,
 			})
 		}
 
@@ -698,9 +711,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		// 3. ПЕРЕХВАТ ОСТАВШИХСЯ FAKE-IP
-		// Неизвестные домены направляются в direct-out. Sing-Box резолвит реальный IP,
-		// пытается подключиться напрямую и при сбое передает домен в DomainLearner.
 		if !isGlobal {
 			routeRules = append(routeRules, map[string]interface{}{
 				"action":   "route",
@@ -811,6 +821,16 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 		out["bind_interface"] = bindIface
 	}
 
+	tagLower := strings.ToLower(tag)
+	addrLower := strings.ToLower(addr)
+	hostLower := strings.ToLower(node.Host)
+	sniLower := strings.ToLower(node.SNI)
+
+	isBridge := strings.Contains(tagLower, "bridge") ||
+		strings.Contains(addrLower, "bridge") ||
+		strings.Contains(hostLower, "bridge") ||
+		strings.Contains(sniLower, "bridge")
+
 	switch proto {
 	case "vless", "vlite":
 		out["type"] = "vless"
@@ -820,11 +840,18 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 		}
 
 		sec := strings.ToLower(strings.TrimSpace(node.Security))
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+
 		if sec == "tls" || sec == "reality" || node.SNI != "" || node.PublicKey != "" {
+			isInsecure := node.Insecure
+			if isBridge {
+				isInsecure = true
+			}
+
 			tlsMap := map[string]interface{}{
 				"enabled":     true,
 				"server_name": strings.TrimSpace(node.SNI),
-				"insecure":    node.Insecure,
+				"insecure":    isInsecure,
 			}
 			if node.Fingerprint != "" {
 				tlsMap["utls"] = map[string]interface{}{
@@ -832,18 +859,25 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 					"fingerprint": strings.TrimSpace(node.Fingerprint),
 				}
 			}
+
+			if (netType == "xhttp" || netType == "splithttp") && !isBridge {
+				tlsMap["alpn"] = []string{"h2"}
+			}
+
 			if sec == "reality" || node.PublicKey != "" {
 				realityMap := map[string]interface{}{
 					"enabled":    true,
 					"public_key": strings.TrimSpace(node.PublicKey),
 					"short_id":   strings.TrimSpace(node.ShortID),
 				}
+				if b.supportsX25519MLKEM() {
+					realityMap["support_x25519mlkem768"] = true
+				}
 				tlsMap["reality"] = realityMap
 			}
 			out["tls"] = tlsMap
 		}
 
-		netType := strings.ToLower(strings.TrimSpace(node.Network))
 		if netType == "ws" {
 			out["transport"] = map[string]interface{}{
 				"type":    "ws",
@@ -856,11 +890,12 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			tr, err := buildXHTTPTransport(node)
+			tr, err := buildXHTTPTransport(node, b.binPath)
 			if err != nil {
 				return nil, err
 			}
 			out["transport"] = tr
+			out["packet_encoding"] = ""
 			delete(out, "flow")
 		}
 
@@ -895,13 +930,19 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 	case "trojan":
 		out["type"] = "trojan"
 		out["password"] = strings.TrimSpace(node.Password)
-		out["tls"] = map[string]interface{}{
+		netType := strings.ToLower(strings.TrimSpace(node.Network))
+		isBridge := strings.Contains(strings.ToLower(node.Tag), "bridge") || strings.Contains(strings.ToLower(node.Address), "bridge")
+
+		tlsMap := map[string]interface{}{
 			"enabled":     true,
 			"server_name": strings.TrimSpace(node.SNI),
-			"insecure":    node.Insecure,
+			"insecure":    node.Insecure || isBridge,
 		}
+		if (netType == "xhttp" || netType == "splithttp") && !isBridge {
+			tlsMap["alpn"] = []string{"h2"}
+		}
+		out["tls"] = tlsMap
 
-		netType := strings.ToLower(strings.TrimSpace(node.Network))
 		if netType == "ws" {
 			out["transport"] = map[string]interface{}{
 				"type":    "ws",
@@ -914,11 +955,12 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 				"service_name": node.Path,
 			}
 		} else if netType == "xhttp" || netType == "splithttp" {
-			tr, err := buildXHTTPTransport(node)
+			tr, err := buildXHTTPTransport(node, b.binPath)
 			if err != nil {
 				return nil, err
 			}
 			out["transport"] = tr
+			out["packet_encoding"] = ""
 		}
 
 	case "socks", "socks5":
