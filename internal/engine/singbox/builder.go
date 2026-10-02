@@ -472,15 +472,16 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         targetURL,
 				"interval":                    interval,
 				"tolerance":                   tolerance,
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true,
 			})
 
 			selectorList := append([]string{urltestTag}, validGrpNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       grp.Tag,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         grp.Tag,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
 
 			if activeOutboundTag == "direct-out" {
@@ -514,15 +515,16 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         globalURLTestURL,
 				"interval":                    globalURLTestInterval,
 				"tolerance":                   globalURLTestTolerance,
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true,
 			})
 
 			selectorList := append([]string{urltestTag}, matchedNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       ng.Name,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         ng.Name,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
 		}
 	}
@@ -538,23 +540,25 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			"url":                         globalURLTestURL,
 			"interval":                    globalURLTestInterval,
 			"tolerance":                   globalURLTestTolerance,
-			"interrupt_exist_connections": false,
+			"interrupt_exist_connections": true,
 		})
 
 		if configType == "urltest" {
 			selectorList := append([]string{urltestTag}, allNodeTags...)
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       selectorTag,
-				"outbounds": selectorList,
-				"default":   urltestTag,
+				"type":                        "selector",
+				"tag":                         selectorTag,
+				"outbounds":                   selectorList,
+				"default":                     urltestTag,
+				"interrupt_exist_connections": true,
 			})
 		} else {
 			outbounds = append(outbounds, map[string]interface{}{
-				"type":      "selector",
-				"tag":       selectorTag,
-				"outbounds": allNodeTags,
-				"default":   allNodeTags[0],
+				"type":                        "selector",
+				"tag":                         selectorTag,
+				"outbounds":                   allNodeTags,
+				"default":                     allNodeTags[0],
+				"interrupt_exist_connections": true,
 			})
 		}
 
