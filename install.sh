@@ -67,25 +67,17 @@ read_input() {
     READ_VALUE=$(echo "$READ_VALUE" | tr -d '\r\n ')
 }
 
-# 2. Сетевой транспорт
-if command -v curl >/dev/null 2>&1; then
-    FETCH_TYPE="curl"
-    FETCH="curl -sSL --insecure --connect-timeout 15"
-    DOWNLOAD="curl -fL --insecure --connect-timeout 15 --retry 3 --retry-delay 2 -m 120 -o"
-elif command -v wget >/dev/null 2>&1; then
-    FETCH_TYPE="wget"
-    FETCH="wget -qO- --no-check-certificate --timeout=15"
-    DOWNLOAD="wget -q --no-check-certificate --timeout=120 --tries=3 -O"
-else
-    fail "Не найден ни curl, ни wget. Установите один из них."
+# 2. Сетевой транспорт исключительно через wget
+if ! command -v wget >/dev/null 2>&1; then
+    fail "Утилита wget не найдена в системе."
 fi
+
+FETCH="wget -qO- --no-check-certificate --timeout=15"
+DOWNLOAD="wget -q --no-check-certificate --timeout=120 --tries=3 -O"
 
 api_get() {
     if [ -n "$GITHUB_TOKEN" ]; then
-        case "$FETCH_TYPE" in
-            curl) curl -sSL --insecure --connect-timeout 15 -H "Authorization: token $GITHUB_TOKEN" "$1" 2>/dev/null ;;
-            wget) wget -qO- --no-check-certificate --timeout=15 --header="Authorization: token $GITHUB_TOKEN" "$1" 2>/dev/null ;;
-        esac
+        wget -qO- --no-check-certificate --timeout=15 --header="Authorization: token $GITHUB_TOKEN" "$1" 2>/dev/null
     else
         $FETCH "$1" 2>/dev/null
     fi
@@ -238,7 +230,6 @@ install_custom_singbox() {
         fail "Не удалось получить список релизов ${DISPLAY_NAME} из ${GH_REPO}."
     fi
 
-    # Исключаем Android (SFA), Windows, macOS, ищем бинарный архив Linux
     PARSED_SB=$(echo "$SB_JSON" | awk -v arch1="$ARCH_SUFFIX" -v arch2="$CHEBUR_ARCH" '
         /"tag_name":/ {
             t = $0
@@ -255,10 +246,7 @@ install_custom_singbox() {
             if (cur_tag != "" && !is_draft) {
                 u_low = tolower(u)
 
-                # Игнорируем Android APK (SFA), GUI-клиенты и посторонние ОС
                 if (u_low ~ "sfa" || u_low ~ "android" || u_low ~ "windows" || u_low ~ "\\.apk$" || u_low ~ "\\.exe$" || u_low ~ "darwin" || u_low ~ "macos") next
-
-                # Требуется linux-архив
                 if (u_low !~ "linux") next
 
                 a1 = tolower(arch1); a2 = tolower(arch2)
@@ -292,7 +280,7 @@ install_custom_singbox() {
     URL_VAL=$(echo "$PARSED_SB" | cut -d '|' -f 2)
     printf "  Целевой релиз %s: ${Y}%s${N} (%s)\n" "$DISPLAY_NAME" "$TAG_VAL" "$(basename "$URL_VAL")"
 
-    # ЭТАП 1: Скачивание во временную директорию (служба работает, есть сеть и прокси)
+    # ЭТАП 1: Скачивание во временную директорию
     ARCHIVE_FILE="$WORK_DIR/$(basename "$URL_VAL")"
     printf "${C}[*] Скачивание %s...${N}\n" "$DISPLAY_NAME"
     $DOWNLOAD "$ARCHIVE_FILE" "$URL_VAL" || fail "Не удалось скачать ${DISPLAY_NAME}"
@@ -330,11 +318,8 @@ install_custom_singbox() {
     esac
 
     chmod 755 "$DEST_FILE" 2>/dev/null || true
-
-    # Создаем симлинк под оригинальным именем форка
     ln -sf "$DEST_FILE" "/usr/bin/${PKG_NAME}" 2>/dev/null || true
 
-    # Проверка работоспособности
     NEW_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
     if [ -z "$NEW_VER" ]; then
         fail "Установленный бинарник $DEST_FILE не запускается (несовместимая архитектура)."
@@ -392,14 +377,13 @@ case "$CHOICE_SB" in
         ;;
 esac
 
-# 7. Проверка системных зависимостей
-printf "${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle, libcurl, curl)...${N}\n"
+# 7. Проверка системных зависимостей (только необходимые компоненты для OpenWrt)
+printf "${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
     apk update
-    apk add --no-cache --upgrade libcurl curl nftables kmod-nft-tproxy ip-full ca-bundle
+    apk add --no-cache --upgrade nftables kmod-nft-tproxy ip-full ca-bundle
 else
     opkg update
-    opkg install --force-reinstall libcurl curl
     opkg install nftables kmod-nft-tproxy ip-full ca-bundle
 fi
 
@@ -477,7 +461,6 @@ if [ -n "$CURRENT_CHEBUR_VER" ] && [ "$CURRENT_CHEBUR_VER" = "$CHEBUR_CLEAN_VER"
 fi
 
 if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
-    # Скачивание пакета Chebur.NET перед остановкой
     printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
     $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
 

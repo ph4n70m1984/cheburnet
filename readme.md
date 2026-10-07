@@ -950,10 +950,10 @@ WebSocket используется для реактивного обновле�
 
 ## Быстрая установка / обновление
 
-На OpenWrt с установленным `curl`:
+На OpenWrt с установленным `wget`:
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/ph4n70m1984/cheburnet/main/install.sh)"
+sh -c "$(wget -qO- --no-check-certificate https://raw.githubusercontent.com/ph4n70m1984/cheburnet/main/install.sh)"
 ```
 
 Скрипт автоматически:
