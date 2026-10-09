@@ -403,7 +403,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         targetURL,
 				"interval":                    interval,
 				"tolerance":                   tolerance,
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 
 			selectorList := append([]string{urltestTag}, validGrpNodes...)
@@ -412,7 +412,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tag":                         grp.Tag,
 				"outbounds":                   selectorList,
 				"default":                     urltestTag,
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 			createdGroups[grp.Tag] = true
 
@@ -447,7 +447,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"url":                         globalURLTestURL,
 				"interval":                    globalURLTestInterval,
 				"tolerance":                   globalURLTestTolerance,
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 
 			selectorList := append([]string{urltestTag}, matchedNodes...)
@@ -456,7 +456,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tag":                         ng.Name,
 				"outbounds":                   selectorList,
 				"default":                     urltestTag,
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 			createdGroups[ng.Name] = true
 		}
@@ -473,7 +473,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"url":                         globalURLTestURL,
 			"interval":                    globalURLTestInterval,
 			"tolerance":                   globalURLTestTolerance,
-			"interrupt_exist_connections": true,
+			"interrupt_exist_connections": false,
 		})
 
 		if configType == "urltest" {
@@ -483,7 +483,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tag":                         selectorTag,
 				"outbounds":                   selectorList,
 				"default":                     urltestTag,
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 		} else {
 			outbounds = append(outbounds, map[string]interface{}{
@@ -491,7 +491,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tag":                         selectorTag,
 				"outbounds":                   allNodeTags,
 				"default":                     allNodeTags[0],
-				"interrupt_exist_connections": true,
+				"interrupt_exist_connections": false,
 			})
 		}
 
