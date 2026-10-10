@@ -27,10 +27,14 @@ type Capabilities struct {
 	Patch              int
 	IsLX               bool
 	IsExtended         bool
+	IsPodkop           bool
 	SupportX25519MLKEM bool
 	HasXHTTP           bool
 	HasAWG             bool
+	HasFallbacks       bool
+	HasVLESSEncrypt    bool
 	Tags               map[string]bool
+	Features           map[string]bool
 }
 
 var (
@@ -65,9 +69,11 @@ func resolveSingBoxBin(binPath string) string {
 	}
 
 	candidates := []string{
+		"/usr/bin/podkop-engine",
 		"/usr/bin/sing-box-extended",
 		"/usr/bin/sing-box-lx",
 		"/usr/bin/sing-box",
+		"podkop-engine",
 		"sing-box-extended",
 		"sing-box-lx",
 		"sing-box",
@@ -150,6 +156,7 @@ func InspectBinary(binPath string) *Capabilities {
 	caps := &Capabilities{
 		BinaryPath: resolved,
 		Tags:       make(map[string]bool),
+		Features:   make(map[string]bool),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -195,10 +202,28 @@ func InspectBinary(binPath string) *Capabilities {
 					caps.Tags[t] = true
 				}
 			}
+		} else if strings.HasPrefix(trimmed, "Features:") {
+			featStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "Features:"))
+			for _, f := range strings.Split(featStr, ",") {
+				f = strings.TrimSpace(f)
+				if f != "" {
+					caps.Features[f] = true
+				}
+			}
 		}
 	}
 
-	if caps.Tags["with_xhttp"] {
+	if strings.Contains(lowerOutput, "pdk") || strings.Contains(lowerOutput, "podkop") || strings.Contains(resolved, "podkop") {
+		caps.IsPodkop = true
+	}
+	if strings.Contains(lowerOutput, "extended") || strings.Contains(lowerOutput, "shtorm") {
+		caps.IsExtended = true
+	}
+	if strings.Contains(lowerOutput, "-lx") || strings.Contains(lowerOutput, " lx") || strings.Contains(lowerOutput, "sing-box-lx") {
+		caps.IsLX = true
+	}
+
+	if caps.Tags["with_xhttp"] || caps.Features["transport.xhttp"] || caps.Features["xhttp"] || caps.IsPodkop {
 		caps.HasXHTTP = true
 	}
 	if caps.Tags["with_awg"] || caps.Tags["with_amneziawg"] {
@@ -208,18 +233,20 @@ func InspectBinary(binPath string) *Capabilities {
 		caps.IsLX = true
 	}
 
-	if strings.Contains(lowerOutput, "extended") || strings.Contains(lowerOutput, "shtorm") {
-		caps.IsExtended = true
+	if caps.Features["urltest.fallbacks"] || strings.Contains(lowerOutput, "urltest.fallbacks") {
+		caps.HasFallbacks = true
 	}
-	if strings.Contains(lowerOutput, "-lx") || strings.Contains(lowerOutput, " lx") || strings.Contains(lowerOutput, "sing-box-lx") {
-		caps.IsLX = true
+	if caps.Features["vless-encryption"] || strings.Contains(lowerOutput, "vless-encryption") {
+		caps.HasVLESSEncrypt = true
 	}
 
-	if ExtendedSupportsX25519MLKEM768(output) {
-		caps.SupportX25519MLKEM = true
-	} else if data, err := os.ReadFile("/etc/cheburnet/sing-box-version"); err == nil {
-		if ExtendedSupportsX25519MLKEM768(string(data)) {
+	if !caps.IsPodkop {
+		if ExtendedSupportsX25519MLKEM768(output) {
 			caps.SupportX25519MLKEM = true
+		} else if data, err := os.ReadFile("/etc/cheburnet/sing-box-version"); err == nil {
+			if ExtendedSupportsX25519MLKEM768(string(data)) {
+				caps.SupportX25519MLKEM = true
+			}
 		}
 	}
 
@@ -284,7 +311,15 @@ func SupportsXHTTP(binPath string) bool {
 
 func SupportsX25519MLKEM(binPath string) bool {
 	caps := InspectBinary(binPath)
-	return (caps.Major > 1 || (caps.Major == 1 && caps.Minor >= 14)) && caps.SupportX25519MLKEM
+	return caps.SupportX25519MLKEM
+}
+
+func SupportsFallbacks(binPath string) bool {
+	return InspectBinary(binPath).HasFallbacks
+}
+
+func SupportsVLESSEncryption(binPath string) bool {
+	return InspectBinary(binPath).HasVLESSEncrypt
 }
 
 func IsLX(binPath string) bool {
@@ -295,9 +330,13 @@ func IsExtended(binPath string) bool {
 	return InspectBinary(binPath).IsExtended
 }
 
+func IsPodkop(binPath string) bool {
+	return InspectBinary(binPath).IsPodkop
+}
+
 func buildXHTTPTransport(node *config.GenericNode, binPath string) (map[string]interface{}, error) {
 	if !SupportsXHTTP(binPath) {
-		return nil, fmt.Errorf("skipped: transport '%s' is not supported by current sing-box", node.Network)
+		return nil, fmt.Errorf("skipped: transport '%s' is not supported by current core", node.Network)
 	}
 
 	tagLower := strings.ToLower(node.Tag)
@@ -311,13 +350,11 @@ func buildXHTTPTransport(node *config.GenericNode, binPath string) (map[string]i
 		strings.Contains(sniLower, "bridge")
 
 	mode := strings.TrimSpace(node.XHTTPMode)
-	// В sing-box клиентский режим не может быть "auto":
-	// Для мостов с параметрами sc_* строго packet-up, для остальных - stream-up
 	if mode == "" || mode == "auto" {
 		if isBridge {
 			mode = "packet-up"
 		} else {
-			mode = "stream-up"
+			mode = "auto"
 		}
 	}
 
@@ -340,27 +377,20 @@ func buildXHTTPTransport(node *config.GenericNode, binPath string) (map[string]i
 		headers[k] = v
 	}
 
-	// Передаем только max_concurrency, чтобы избежать конфликта с max_connections
-	xmuxConfig := map[string]interface{}{
-		"max_concurrency":     "16-32",
-		"c_max_reuse_times":   "300-600",
-		"h_max_request_times": "1000-2000",
-		"h_max_reusable_secs": "1200-2400",
-		"h_keep_alive_period": 0,
-	}
-
 	transport := map[string]interface{}{
 		"type":            "xhttp",
 		"mode":            mode,
 		"path":            path,
 		"headers":         headers,
-		"domain_strategy": "prefer_ipv4",
 		"x_padding_bytes": padding,
 		"no_grpc_header":  node.XHTTPNoGRPC,
-		"xmux":            xmuxConfig,
+		"xmux": map[string]interface{}{
+			"max_concurrency":     "16-32",
+			"h_max_request_times": "600-900",
+		},
 	}
 
-	if mode == "packet-up" {
+	if isBridge || mode == "packet-up" {
 		transport["sc_max_each_post_bytes"] = 1000000
 		transport["sc_min_posts_interval_ms"] = 30
 	}

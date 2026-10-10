@@ -39,8 +39,12 @@ func NewBuilderV14WithBin(binPath string) *BuilderV14 {
 	return b
 }
 
-func (b *BuilderV14) supportsX25519MLKEM() bool {
-	return SupportsX25519MLKEM(b.binPath)
+func (b *BuilderV14) supportsFallbacks() bool {
+	return SupportsFallbacks(b.binPath)
+}
+
+func (b *BuilderV14) supportsVLESSEncryption() bool {
+	return SupportsVLESSEncryption(b.binPath)
 }
 
 func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
@@ -365,6 +369,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
 	}
 
+	hasFallbacks := b.supportsFallbacks()
 	createdGroups := make(map[string]bool)
 
 	if len(cfg.Groups) > 0 {
@@ -396,7 +401,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				targetURL = globalURLTestURL
 			}
 
-			outbounds = append(outbounds, map[string]interface{}{
+			urltestObj := map[string]interface{}{
 				"type":                        "urltest",
 				"tag":                         urltestTag,
 				"outbounds":                   validGrpNodes,
@@ -404,7 +409,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"interval":                    interval,
 				"tolerance":                   tolerance,
 				"interrupt_exist_connections": false,
-			})
+			}
+			if hasFallbacks {
+				urltestObj["fallbacks"] = []string{"direct-out"}
+			}
+			outbounds = append(outbounds, urltestObj)
 
 			selectorList := append([]string{urltestTag}, validGrpNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
@@ -440,7 +449,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			}
 
 			urltestTag := fmt.Sprintf("%s-auto", ng.Name)
-			outbounds = append(outbounds, map[string]interface{}{
+			urltestObj := map[string]interface{}{
 				"type":                        "urltest",
 				"tag":                         urltestTag,
 				"outbounds":                   matchedNodes,
@@ -448,7 +457,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"interval":                    globalURLTestInterval,
 				"tolerance":                   globalURLTestTolerance,
 				"interrupt_exist_connections": false,
-			})
+			}
+			if hasFallbacks {
+				urltestObj["fallbacks"] = []string{"direct-out"}
+			}
+			outbounds = append(outbounds, urltestObj)
 
 			selectorList := append([]string{urltestTag}, matchedNodes...)
 			outbounds = append(outbounds, map[string]interface{}{
@@ -466,7 +479,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		urltestTag := "auto"
 		selectorTag := config.MainSelectorTag
 
-		outbounds = append(outbounds, map[string]interface{}{
+		urltestObj := map[string]interface{}{
 			"type":                        "urltest",
 			"tag":                         urltestTag,
 			"outbounds":                   allNodeTags,
@@ -474,7 +487,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"interval":                    globalURLTestInterval,
 			"tolerance":                   globalURLTestTolerance,
 			"interrupt_exist_connections": false,
-		})
+		}
+		if hasFallbacks {
+			urltestObj["fallbacks"] = []string{"direct-out"}
+		}
+		outbounds = append(outbounds, urltestObj)
 
 		if configType == "urltest" {
 			selectorList := append([]string{urltestTag}, allNodeTags...)
@@ -839,6 +856,14 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 			out["flow"] = strings.TrimSpace(node.Flow)
 		}
 
+		encCandidate := strings.TrimSpace(node.Password)
+		if encCandidate == "" {
+			encCandidate = strings.TrimSpace(node.UUID)
+		}
+		if b.supportsVLESSEncryption() && strings.HasPrefix(encCandidate, "mlkem768x25519plus.") {
+			out["encryption"] = encCandidate
+		}
+
 		sec := strings.ToLower(strings.TrimSpace(node.Security))
 		netType := strings.ToLower(strings.TrimSpace(node.Network))
 
@@ -870,9 +895,6 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 					"public_key": strings.TrimSpace(node.PublicKey),
 					"short_id":   strings.TrimSpace(node.ShortID),
 				}
-				if b.supportsX25519MLKEM() {
-					realityMap["support_x25519mlkem768"] = true
-				}
 				tlsMap["reality"] = realityMap
 			}
 			out["tls"] = tlsMap
@@ -896,7 +918,9 @@ func (b *BuilderV14) buildNodeOutbound(node *config.GenericNode, bindIface strin
 			}
 			out["transport"] = tr
 			out["packet_encoding"] = ""
-			delete(out, "flow")
+			if out["encryption"] == nil {
+				delete(out, "flow")
+			}
 		}
 
 	case "hysteria2", "hy2", "hysteria":

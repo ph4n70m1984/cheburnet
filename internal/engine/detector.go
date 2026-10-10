@@ -21,19 +21,23 @@ const (
 )
 
 type BinaryInfo struct {
-	Path       string
-	VersionRaw string
-	Major      int
-	Minor      int
-	Patch      int
-	IsExtended bool
-	IsLX       bool
-	HasXHTTP   bool
-	HasAWG     bool
-	Tags       []string
+	Path            string
+	VersionRaw      string
+	Major           int
+	Minor           int
+	Patch           int
+	IsExtended      bool
+	IsLX            bool
+	IsPodkop        bool
+	HasXHTTP        bool
+	HasAWG          bool
+	HasFallbacks    bool
+	HasVLESSEncrypt bool
+	Tags            []string
+	Features        []string
 }
 
-// CheckBinary валидирует наличие, исполняемость и детальные возможности бинарника sing-box
+// CheckBinary валидирует наличие, исполняемость и детальные возможности бинарника ядра
 func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 	fi, err := os.Stat(binPath)
 	if err != nil {
@@ -70,11 +74,11 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 		Path:       binPath,
 		VersionRaw: firstLine,
 		Tags:       make([]string, 0),
+		Features:   make([]string, 0),
 	}
 
 	lowerOutput := strings.ToLower(output)
 
-	// 1. Парсинг строки тегов скомпилированного Go-бинарника (Tags: with_clash_api,with_xhttp,...)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "Tags:") {
@@ -93,10 +97,31 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 					}
 				}
 			}
+		} else if strings.HasPrefix(trimmed, "Features:") {
+			featStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "Features:"))
+			for _, f := range strings.Split(featStr, ",") {
+				f = strings.TrimSpace(f)
+				if f != "" {
+					info.Features = append(info.Features, f)
+					switch f {
+					case "urltest.fallbacks":
+						info.HasFallbacks = true
+					case "vless-encryption":
+						info.HasVLESSEncrypt = true
+					case "xhttp":
+						info.HasXHTTP = true
+					}
+				}
+			}
 		}
 	}
 
-	// 2. Определение форков по именованию и выводу
+	if strings.Contains(lowerOutput, "podkop") || strings.Contains(binPath, "podkop") {
+		info.IsPodkop = true
+		info.HasFallbacks = true
+		info.HasVLESSEncrypt = true
+		info.HasXHTTP = true
+	}
 	if strings.Contains(lowerOutput, "extended") || strings.Contains(lowerOutput, "shtorm") {
 		info.IsExtended = true
 	}
@@ -104,12 +129,10 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 		info.IsLX = true
 	}
 
-	// 3. Если тег with_xhttp не был найден в явном виде, выполняем probe-тест ядра
 	if !info.HasXHTTP {
 		info.HasXHTTP = ProbeXHTTPSupport(binPath)
 	}
 
-	// 4. Парсинг семантической версии
 	re := regexp.MustCompile(`v?(\d+)\.(\d+)(?:\.(\d+))?`)
 	matches := re.FindStringSubmatch(output)
 	if len(matches) >= 3 {
@@ -126,13 +149,11 @@ func CheckBinary(binPath string, engine EngineType) (*BinaryInfo, error) {
 		return nil, err
 	}
 
-	// Синхронизируем активный проверенный бинарник с пакетом builder'а singbox
 	singbox.SetBinaryPath(binPath)
 
 	return info, nil
 }
 
-// ProbeXHTTPSupport проверяет реальную поддержку транспорта xhttp через sing-box check
 func ProbeXHTTPSupport(binPath string) bool {
 	dummyJSON := `{
   "outbounds": [
@@ -168,7 +189,6 @@ func ProbeXHTTPSupport(binPath string) bool {
 	cmd := exec.CommandContext(ctx, binPath, "check", "-c", tmpFile.Name())
 	out, _ := cmd.CombinedOutput()
 
-	// Если бинарник не поддерживает SplitHTTP/xhttp, он вернёт exit status 1 с явной ошибкой транспорта
 	if strings.Contains(string(out), "unknown transport type: xhttp") {
 		return false
 	}
@@ -178,12 +198,11 @@ func ProbeXHTTPSupport(binPath string) bool {
 
 func validateMinimumVersion(info *BinaryInfo) error {
 	if info.Major < 1 || (info.Major == 1 && info.Minor < 8) {
-		return fmt.Errorf("версия sing-box %d.%d.%d слишком старая (требуется >= 1.8.0)", info.Major, info.Minor, info.Patch)
+		return fmt.Errorf("версия ядра %d.%d.%d слишком старая (требуется >= 1.8.0)", info.Major, info.Minor, info.Patch)
 	}
 	return nil
 }
 
-// TestConfig выполняет предварительный smoke-тест сгенерированного файла конфигурации sing-box
 func TestConfig(binPath string, configPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -191,7 +210,7 @@ func TestConfig(binPath string, configPath string) error {
 	cmd := exec.CommandContext(ctx, binPath, "check", "-c", configPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("валидация конфига sing-box провалена: %w (вывод: %s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("валидация конфига провалена: %w (вывод: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
