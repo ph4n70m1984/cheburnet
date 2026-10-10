@@ -114,10 +114,9 @@ func (s *Server) authRequired() fiber.Handler {
 		cfg := s.state.Get()
 		expectedToken := strings.TrimSpace(cfg.APIToken)
 
+		// Если токен API не задан в конфигурации роутера, доступ открыт (без авторизации)
 		if expectedToken == "" {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"error": "api token is not configured on daemon",
-			})
+			return c.Next()
 		}
 
 		authHeader := c.Get("Authorization")

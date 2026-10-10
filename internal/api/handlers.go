@@ -53,6 +53,7 @@ func (s *Server) clashRequest(ctx context.Context, method, path string, body []b
 	}
 
 	cfg := s.state.Get()
+	// Если пароль не задан, заголовок Authorization не передаётся
 	if secret := strings.TrimSpace(cfg.ClashAPISecret); secret != "" {
 		req.Header.Set("Authorization", "Bearer "+secret)
 	}
