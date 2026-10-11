@@ -5,6 +5,7 @@ set -e
 REPO_CHEBUR="ph4n70m1984/cheburnet"
 REPO_SB_EXTENDED="${REPO_SB_EXTENDED:-"shtorm-7/sing-box-extended"}"
 REPO_SB_LX="${REPO_SB_LX:-"Leadaxe/sing-box-lx"}"
+REPO_PODKOP="${REPO_PODKOP:-"FiyeroT/podkop-engine"}"
 DEST_FILE="/usr/bin/sing-box"
 SERVICE_NAME="cheburnet"
 
@@ -170,12 +171,12 @@ if [ -z "$CURRENT_CHEBUR_VER" ] && [ -f /usr/bin/cheburnetd ]; then
 fi
 
 printf "\n${C}====================================================${N}\n"
-printf "${C}   Установка / Обновление Chebur.NET & Sing-Box     ${N}\n"
+printf "${C}   Установка / Обновление Chebur.NET & Ядра        ${N}\n"
 printf "${C}====================================================${N}\n"
 printf "  Архитектура хоста:    ${Y}%s (%s)${N}\n" "$HOST_ARCH" "$ARCH_SUFFIX"
 printf "  Таргет OpenWrt:       ${Y}%s${N}\n" "${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
 printf "  Пакетный менеджер:    ${Y}%s (%s)${N}\n" "$PKG_MANAGER" "$PKG_EXT"
-printf "  Текущий sing-box:     ${Y}%s${N}\n" "${CURRENT_SB_VER:-не установлен}"
+printf "  Текущее ядро:         ${Y}%s${N}\n" "${CURRENT_SB_VER:-не установлено}"
 printf "  Текущий Chebur.NET:   ${Y}%s${N}\n\n" "${CURRENT_CHEBUR_VER:-не установлен}"
 
 stop_cheburnet_service() {
@@ -217,18 +218,98 @@ case "$CHOICE_CHAN" in
         ;;
 esac
 
-# 5. Функция установки сторонних форков (extended / lx)
+# 5. Функция установки podkop-engine из официальных релизов (.ipk / .apk)
+install_podkop_engine() {
+    printf "${C}[*] Поиск релизов podkop-engine (${REPO_PODKOP})...${N}\n"
+    PODKOP_JSON=$(api_get "https://api.github.com/repos/${REPO_PODKOP}/releases?per_page=5")
+    [ -z "$PODKOP_JSON" ] && fail "Не удалось получить метаданные релизов ${REPO_PODKOP}."
+
+    TARGET_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
+
+    PARSED_PODKOP=$(echo "$PODKOP_JSON" | awk -v arch="$TARGET_ARCH" -v h_arch="$HOST_ARCH" -v ext="$PKG_EXT" '
+        /"tag_name":/ {
+            t = $0
+            sub(/.*"tag_name":[[:space:]]*"/, "", t)
+            sub(/".*/, "", t)
+            cur_tag = t
+            is_draft = 0
+        }
+        /"draft":[[:space:]]*true/ { is_draft = 1 }
+        /"browser_download_url":/ {
+            u = $0
+            sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
+            sub(/".*/, "", u)
+            if (cur_tag != "" && !is_draft && u ~ "\\." ext "$") {
+                if (u !~ "podkop-engine-full") next
+                u_low = tolower(u)
+                matched = 0
+
+                if (arch != "" && u_low ~ ("openwrt_" tolower(arch) "\\." ext)) matched = 2
+                else if (arch != "" && u_low ~ tolower(arch)) matched = 1
+                else if (h_arch != "" && u_low ~ tolower(h_arch)) matched = 1
+
+                if (matched > best_match) {
+                    best_match = matched
+                    found_url = u
+                    found_tag = cur_tag
+                }
+            }
+        }
+        END {
+            if (found_url != "") {
+                print found_tag "|" found_url
+            } else {
+                exit 1
+            }
+        }
+    ')
+
+    [ -z "$PARSED_PODKOP" ] && fail "Не найден подходящий пакет podkop-engine-full (.${PKG_EXT}) под архитектуру ${TARGET_ARCH}."
+
+    TAG_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 1)
+    URL_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 2)
+    PKG_FILE="$WORK_DIR/$(basename "$URL_VAL")"
+
+    printf "  Целевой пакет: ${Y}%s${N} (%s)\n" "$TAG_VAL" "$(basename "$URL_VAL")"
+    printf "${C}[*] Скачивание podkop-engine...${N}\n"
+    $DOWNLOAD "$PKG_FILE" "$URL_VAL" || fail "Не удалось скачать пакет podkop-engine"
+    [ -s "$PKG_FILE" ] || fail "Скачанный пакет пуст."
+
+    stop_cheburnet_service
+
+    printf "${C}[*] Установка пакета podkop-engine...${N}\n"
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        apk add --allow-untrusted "$PKG_FILE" '!podkop-engine' || fail "Ошибка установки podkop-engine через apk"
+    else
+        opkg remove --force-depends podkop-engine >/dev/null 2>&1 || true
+        opkg install --force-depends "$PKG_FILE" || fail "Ошибка установки podkop-engine через opkg"
+    fi
+
+    # Назначаем /usr/bin/podkop-engine как активный sing-box для демона
+    if [ -f "/usr/bin/podkop-engine" ]; then
+        rm -f "$DEST_FILE" 2>/dev/null || true
+        ln -sf /usr/bin/podkop-engine "$DEST_FILE"
+        chmod 755 /usr/bin/podkop-engine "$DEST_FILE"
+    fi
+
+    NEW_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
+    mkdir -p /etc/cheburnet
+    echo "${NEW_VER:-$TAG_VAL}" > /etc/cheburnet/sing-box-version
+
+    [ -f "/etc/init.d/podkop" ] && /etc/init.d/podkop restart >/dev/null 2>&1 || true
+
+    printf "${G}[✓] podkop-engine успешно установлен: %s${N}\n\n" "${NEW_VER:-$TAG_VAL}"
+}
+
+# 6. Функция установки сторонних форков бинарников (extended / lx)
 install_custom_singbox() {
-    PKG_NAME="$1"        # "sing-box-extended" или "sing-box-lx"
-    GH_REPO="$2"         # репозиторий GitHub
-    DISPLAY_NAME="$3"    # отображаемое имя
+    PKG_NAME="$1"
+    GH_REPO="$2"
+    DISPLAY_NAME="$3"
 
     printf "${C}[*] Поиск релизов %s на GitHub (${GH_REPO})...${N}\n" "$DISPLAY_NAME"
     SB_JSON=$(api_get "https://api.github.com/repos/${GH_REPO}/releases?per_page=10")
-
-    if [ -z "$SB_JSON" ] || echo "$SB_JSON" | grep -q '"message": *"Not Found"'; then
-        fail "Не удалось получить список релизов ${DISPLAY_NAME} из ${GH_REPO}."
-    fi
+    [ -z "$SB_JSON" ] && fail "Не удалось получить список релизов ${DISPLAY_NAME} из ${GH_REPO}."
 
     PARSED_SB=$(echo "$SB_JSON" | awk -v arch1="$ARCH_SUFFIX" -v arch2="$CHEBUR_ARCH" '
         /"tag_name":/ {
@@ -280,21 +361,16 @@ install_custom_singbox() {
     URL_VAL=$(echo "$PARSED_SB" | cut -d '|' -f 2)
     printf "  Целевой релиз %s: ${Y}%s${N} (%s)\n" "$DISPLAY_NAME" "$TAG_VAL" "$(basename "$URL_VAL")"
 
-    # ЭТАП 1: Скачивание во временную директорию
     ARCHIVE_FILE="$WORK_DIR/$(basename "$URL_VAL")"
     printf "${C}[*] Скачивание %s...${N}\n" "$DISPLAY_NAME"
     $DOWNLOAD "$ARCHIVE_FILE" "$URL_VAL" || fail "Не удалось скачать ${DISPLAY_NAME}"
-
     [ -s "$ARCHIVE_FILE" ] || fail "Скачанный файл ${DISPLAY_NAME} пуст или повреждён."
 
-    # ЭТАП 2: Остановка службы перед удалением и заменой бинарников
     stop_cheburnet_service
 
-    # ЭТАП 3: Удаление старого ядра и ссылок
     printf "${C}[*] Удаление предыдущей версии ядра sing-box...${N}\n"
     rm -f "$DEST_FILE" /usr/bin/sing-box-extended /usr/bin/sing-box-lx 2>/dev/null || true
 
-    # ЭТАП 4: Распаковка и установка бинарника
     printf "${C}[*] Установка нового ядра %s...${N}\n" "$DISPLAY_NAME"
     EXTRACT_DIR="$WORK_DIR/extracted_${PKG_NAME}"
     mkdir -p "$EXTRACT_DIR"
@@ -303,10 +379,8 @@ install_custom_singbox() {
         *.tar.gz|*.tgz)
             tar -xzf "$ARCHIVE_FILE" -C "$EXTRACT_DIR"
             FOUND_BIN=$(find "$EXTRACT_DIR" -type f \( -name "sing-box" -o -name "$PKG_NAME" \) | head -n 1)
-            if [ -z "$FOUND_BIN" ]; then
-                FOUND_BIN=$(find "$EXTRACT_DIR" -type f -perm -111 | head -n 1)
-            fi
-            [ -z "$FOUND_BIN" ] && fail "Бинарный файл не найден внутри скачанного архива ${DISPLAY_NAME}."
+            [ -z "$FOUND_BIN" ] && FOUND_BIN=$(find "$EXTRACT_DIR" -type f -perm -111 | head -n 1)
+            [ -z "$FOUND_BIN" ] && fail "Бинарный файл не найден внутри архива ${DISPLAY_NAME}."
             cp -f "$FOUND_BIN" "$DEST_FILE"
             ;;
         *.gz)
@@ -321,9 +395,7 @@ install_custom_singbox() {
     ln -sf "$DEST_FILE" "/usr/bin/${PKG_NAME}" 2>/dev/null || true
 
     NEW_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
-    if [ -z "$NEW_VER" ]; then
-        fail "Установленный бинарник $DEST_FILE не запускается (несовместимая архитектура)."
-    fi
+    [ -z "$NEW_VER" ] && fail "Установленный бинарник $DEST_FILE не запускается."
 
     mkdir -p /etc/cheburnet
     echo "${NEW_VER:-$TAG_VAL}" > /etc/cheburnet/sing-box-version
@@ -331,27 +403,33 @@ install_custom_singbox() {
     printf "${G}[✓] %s успешно установлен: %s${N}\n\n" "$DISPLAY_NAME" "${NEW_VER:-$TAG_VAL}"
 }
 
-# 6. Выбор действия для Sing-Box
+# 7. Выбор ядра
 DEF_SB_CHOICE="1"
 if [ -n "$CURRENT_SB_VER" ]; then
-    if echo "$CURRENT_SB_VER" | grep -qi "extended"; then
-        DEF_SB_CHOICE="2"
-    elif echo "$CURRENT_SB_VER" | grep -qi "lx"; then
+    if echo "$CURRENT_SB_VER" | grep -qi "pdk"; then
+        DEF_SB_CHOICE="1"
+    elif echo "$CURRENT_SB_VER" | grep -qi "extended"; then
         DEF_SB_CHOICE="3"
+    elif echo "$CURRENT_SB_VER" | grep -qi "lx"; then
+        DEF_SB_CHOICE="4"
     fi
 fi
 
-echo "Операции с ядром Sing-Box:"
-echo "  1) Установить / Обновить официальный ванильный sing-box ($PKG_MANAGER)"
-echo "  2) Установить / Обновить sing-box-extended ($REPO_SB_EXTENDED с x25519mlkem768)"
-echo "  3) Установить / Обновить sing-box-lx ($REPO_SB_LX)"
-echo "  0) Пропустить обновление sing-box"
-printf "${C}[>] Ваш выбор [0-3] (по умолчанию %s): ${N}" "$DEF_SB_CHOICE"
+echo "Операции с ядром маршрутизации:"
+echo "  1) Установить / Обновить podkop-engine (${REPO_PODKOP} r10/r11/r14)"
+echo "  2) Установить / Обновить официальный ванильный sing-box ($PKG_MANAGER)"
+echo "  3) Установить / Обновить sing-box-extended ($REPO_SB_EXTENDED)"
+echo "  4) Установить / Обновить sing-box-lx ($REPO_SB_LX)"
+echo "  0) Пропустить обновление ядра"
+printf "${C}[>] Ваш выбор [0-4] (по умолчанию %s): ${N}" "$DEF_SB_CHOICE"
 read_input 30
 CHOICE_SB="${READ_VALUE:-$DEF_SB_CHOICE}"
 
 case "$CHOICE_SB" in
     1)
+        install_podkop_engine
+        ;;
+    2)
         printf "${C}[*] Установка официального sing-box через %s...${N}\n" "$PKG_MANAGER"
         stop_cheburnet_service
         rm -f "$DEST_FILE" /usr/bin/sing-box-extended /usr/bin/sing-box-lx /etc/cheburnet/sing-box-version 2>/dev/null || true
@@ -363,21 +441,21 @@ case "$CHOICE_SB" in
         NEW_SB_VER=$("$DEST_FILE" version 2>/dev/null | head -n 1 | awk '{print $3}') || true
         printf "${G}[✓] Официальный sing-box успешно установлен: %s${N}\n\n" "${NEW_SB_VER:-готово}"
         ;;
-    2)
+    3)
         install_custom_singbox "sing-box-extended" "$REPO_SB_EXTENDED" "sing-box-extended"
         ;;
-    3)
+    4)
         install_custom_singbox "sing-box-lx" "$REPO_SB_LX" "sing-box-lx"
         ;;
     0)
-        printf "${Y}[*] Пропуск обновления sing-box.${N}\n\n"
+        printf "${Y}[*] Пропуск обновления ядра.${N}\n\n"
         ;;
     *)
-        printf "${Y}[!] Неизвестный выбор. Пропуск sing-box.${N}\n\n"
+        printf "${Y}[!] Неизвестный выбор. Пропуск ядра.${N}\n\n"
         ;;
 esac
 
-# 7. Проверка системных зависимостей (только необходимые компоненты для OpenWrt)
+# 8. Проверка системных зависимостей
 printf "${C}[*] Проверка зависимостей (nftables, kmod-nft-tproxy, ip-full, ca-bundle)...${N}\n"
 if [ "$PKG_MANAGER" = "apk" ]; then
     apk update
@@ -387,7 +465,7 @@ else
     opkg install nftables kmod-nft-tproxy ip-full ca-bundle
 fi
 
-# 8. Поиск и выбор релиза Chebur.NET на GitHub с учетом выбранного канала и SemVer
+# 9. Поиск и установка Chebur.NET
 printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
 RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=25")
 [ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
@@ -487,13 +565,13 @@ if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     fi
 fi
 
-# 9. Фиксация выбранного канала в UCI
+# 10. Фиксация выбранного канала в UCI
 if command -v uci >/dev/null 2>&1 && [ -f "/etc/config/cheburnet" ]; then
     uci -q set cheburnet.main.update_channel="$SELECTED_CHANNEL" || true
     uci -q commit cheburnet || true
 fi
 
-# 10. Финализация прав, каталогов и запуск службы
+# 11. Финализация прав, каталогов и запуск службы
 mkdir -p /var/etc/cheburnet /var/run/cheburnet
 [ -f /usr/bin/cheburnetd ] && chmod 755 /usr/bin/cheburnetd
 [ -f /etc/init.d/cheburnet ] && chmod 755 /etc/init.d/cheburnet
@@ -510,7 +588,7 @@ fi
 SERVICE_STOPPED="0"
 
 printf "\n${G}====================================================${N}\n"
-printf "${G}  Chebur.NET и Sing-Box успешно настроены!          ${N}\n"
+printf "${G}  Chebur.NET и ядро успешно настроены!              ${N}\n"
 printf "  Канал обновлений:  ${Y}%s${N}\n" "$SELECTED_CHANNEL"
 printf "  Версия ядра:       ${Y}%s${N}\n" "$("${DEST_FILE}" version 2>/dev/null | head -n 1 || echo "установлен")"
 printf "  Служба:            ${Y}cheburnet (active/running)${N}\n"
