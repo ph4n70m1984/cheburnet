@@ -244,11 +244,7 @@ install_podkop_engine() {
                 u_low = tolower(u)
                 score = 0
 
-                # Точное совпадение с таргетом пакетов OpenWrt
-                if (arch != "" && index(u_low, tolower(arch)) > 0) {
-                    score = 100
-                }
-                # Соответствия по семейству процессора
+                if (arch != "" && index(u_low, tolower(arch)) > 0) score = 100
                 else if (h_arch == "aarch64") {
                     if (index(u_low, "cortex-a53") > 0) score = 80
                     else if (index(u_low, "cortex-a72") > 0) score = 70
@@ -277,13 +273,10 @@ install_podkop_engine() {
             }
         }
         END {
-            if (found_url != "") {
-                print found_tag "|" found_url
-            }
+            if (found_url != "") print found_tag "|" found_url
         }
     ')
 
-    # Fallback, если GitHub API заблокирован rate limit
     if [ -z "$PARSED_PODKOP" ]; then
         FALLBACK_TAG="v1.14.2-r14"
         FALLBACK_VER="1.14.2-r14"
@@ -308,20 +301,20 @@ install_podkop_engine() {
 
     printf "  Целевой пакет: ${Y}%s${N} (%s)\n" "${TAG_VAL:-v1.14.2-r14}" "$(basename "$URL_VAL")"
     printf "${C}[*] Скачивание podkop-engine...${N}\n"
-    $DOWNLOAD "$PKG_FILE" "$URL_VAL" || fail "Не удалось скачать пакет podkop-engine по ссылке $URL_VAL"
+    $DOWNLOAD "$PKG_FILE" "$URL_VAL" || fail "Не удалось скачать пакет podkop-engine"
     [ -s "$PKG_FILE" ] || fail "Скачанный пакет пуст."
 
     stop_cheburnet_service
 
     printf "${C}[*] Установка пакета podkop-engine...${N}\n"
     if [ "$PKG_MANAGER" = "apk" ]; then
+        apk del sing-box sing-box-tiny podkop-engine 2>/dev/null || true
         apk add --allow-untrusted "$PKG_FILE" '!podkop-engine' || fail "Ошибка установки podkop-engine через apk"
     else
-        opkg remove --force-depends podkop-engine >/dev/null 2>&1 || true
+        opkg remove --force-depends sing-box sing-box-tiny podkop-engine >/dev/null 2>&1 || true
         opkg install --force-depends "$PKG_FILE" || fail "Ошибка установки podkop-engine через opkg"
     fi
 
-    # Назначаем /usr/bin/podkop-engine как активный sing-box для демона
     if [ -f "/usr/bin/podkop-engine" ]; then
         rm -f "$DEST_FILE" 2>/dev/null || true
         ln -sf /usr/bin/podkop-engine "$DEST_FILE"
@@ -383,11 +376,7 @@ install_custom_singbox() {
             }
         }
         END {
-            if (found_url != "") {
-                print found_tag "|" found_url
-            } else {
-                exit 1
-            }
+            if (found_url != "") print found_tag "|" found_url
         }
     ')
 
@@ -503,64 +492,101 @@ fi
 
 # 9. Поиск и установка Chebur.NET
 printf "\n${C}[*] Получение списка релизов Chebur.NET с GitHub...${N}\n"
+TARGET_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
 RELEASES_LIST_JSON=$(api_get "https://api.github.com/repos/${REPO_CHEBUR}/releases?per_page=25")
-[ -z "$RELEASES_LIST_JSON" ] && fail "Не удалось получить метаданные релизов Chebur.NET."
 
-MATCH_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
+PARSED_DATA=""
+if [ -n "$RELEASES_LIST_JSON" ] && ! echo "$RELEASES_LIST_JSON" | grep -q '"message":'; then
+    PARSED_DATA=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" -v arch="$TARGET_ARCH" -v h_arch="$HOST_ARCH" -v ext="$PKG_EXT" '
+        /"tag_name":/ {
+            t = $0
+            sub(/.*"tag_name":[[:space:]]*"/, "", t)
+            sub(/".*/, "", t)
+            gsub(/[v]/, "", t)
+            cur_tag = t
+            is_pre = 0
+            is_draft = 0
+        }
+        /"prerelease":[[:space:]]*true/ { is_pre = 1 }
+        /"draft":[[:space:]]*true/      { is_draft = 1 }
+        /"browser_download_url":/ {
+            u = $0
+            sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
+            sub(/".*/, "", u)
 
-PARSED_DATA=$(echo "$RELEASES_LIST_JSON" | awk -v chan="$SELECTED_CHANNEL" -v arch="$MATCH_ARCH" -v ext="$PKG_EXT" '
-    /"tag_name":/ {
-        t = $0
-        sub(/.*"tag_name":[[:space:]]*"/, "", t)
-        sub(/".*/, "", t)
-        gsub(/[v]/, "", t)
-        cur_tag = t
-        is_pre = 0
-        is_draft = 0
-    }
-    /"prerelease":[[:space:]]*true/ { is_pre = 1 }
-    /"draft":[[:space:]]*true/      { is_draft = 1 }
-    /"browser_download_url":/ {
-        u = $0
-        sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
-        sub(/".*/, "", u)
+            if (cur_tag != "" && !is_draft && u ~ "\\." ext "$") {
+                if (chan == "release" && is_pre) next
 
-        if (cur_tag != "" && !is_draft && u ~ "\\." ext "$") {
-            if (chan == "release" && is_pre) next
+                u_low = tolower(u)
+                score = 0
 
-            if (u ~ arch || u ~ "aarch64") {
-                if (!url[cur_tag]) {
-                    url[cur_tag] = u
-                    tags[++n] = cur_tag
+                if (arch != "" && index(u_low, tolower(arch)) > 0) score = 100
+                else if (u_low ~ "_all\\." || u_low ~ "-all\\.") score = 90
+                else if (h_arch == "aarch64") {
+                    if (index(u_low, "cortex-a53") > 0) score = 80
+                    else if (index(u_low, "arm64") > 0 || index(u_low, "aarch64") > 0) score = 70
+                }
+                else if (h_arch ~ "armv7" || h_arch ~ "arm") {
+                    if (index(u_low, "cortex-a7") > 0 || index(u_low, "armhf") > 0) score = 80
+                }
+                else if (h_arch ~ "mipsel" || h_arch ~ "mipsle") {
+                    if (index(u_low, "mipsel_24kc") > 0 || index(u_low, "mipsle") > 0) score = 80
+                }
+                else if (h_arch ~ "mips") {
+                    if (index(u_low, "mips_24kc") > 0 || index(u_low, "mips") > 0) score = 80
+                }
+
+                if (score > 0) {
+                    if (!best_score[cur_tag] || score > best_score[cur_tag]) {
+                        best_score[cur_tag] = score
+                        url[cur_tag] = u
+                        if (!seen[cur_tag]) {
+                            tags[++n] = cur_tag
+                            seen[cur_tag] = 1
+                        }
+                    }
                 }
             }
         }
-    }
-    END {
-        if (n == 0) exit 1
-        for (i = 1; i <= n; i++) {
-            for (j = i + 1; j <= n; j++) {
-                split(tags[i], a, "[-.]")
-                split(tags[j], b, "[-.]")
-                swap = 0
-                for (k = 1; k <= 4; k++) {
-                    va = a[k] + 0; vb = b[k] + 0
-                    if (vb > va) { swap = 1; break }
-                    if (va > vb) { break }
+        END {
+            if (n > 0) {
+                for (i = 1; i <= n; i++) {
+                    for (j = i + 1; j <= n; j++) {
+                        split(tags[i], a, "[-.]")
+                        split(tags[j], b, "[-.]")
+                        swap = 0
+                        for (k = 1; k <= 4; k++) {
+                            va = a[k] + 0; vb = b[k] + 0
+                            if (vb > va) { swap = 1; break }
+                            if (va > vb) { break }
+                        }
+                        if (swap) { t = tags[i]; tags[i] = tags[j]; tags[j] = t }
+                    }
                 }
-                if (swap) { t = tags[i]; tags[i] = tags[j]; tags[j] = t }
+                print tags[1] "|" url[tags[1]]
             }
         }
-        print tags[1] "|" url[tags[1]]
-    }
-')
+    ')
+fi
 
-[ -z "$PARSED_DATA" ] && fail "Не удалось найти подходящий пакет .$PKG_EXT под архитектуру $MATCH_ARCH для канала $SELECTED_CHANNEL."
+# Fallback с правильным именем архитектурного пакета
+if [ -z "$PARSED_DATA" ]; then
+    printf "${Y}[!] Превышен лимит запросов GitHub API. Используется fallback на актуальный релиз...${N}\n"
+    CHEBUR_CLEAN_VER="0.0.8.49-beta.5"
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        CHEBUR_PKG_NAME="luci-app-cheburnet-0.0.8_p49-r1.${TARGET_ARCH}.apk"
+        [ "$TARGET_ARCH" = "aarch64" ] && CHEBUR_PKG_NAME="luci-app-cheburnet-0.0.8_p49-r1.aarch64_cortex-a53.apk"
+    else
+        CHEBUR_PKG_NAME="luci-app-cheburnet_${CHEBUR_CLEAN_VER}_${TARGET_ARCH}.ipk"
+        [ "$TARGET_ARCH" = "aarch64" ] && CHEBUR_PKG_NAME="luci-app-cheburnet_${CHEBUR_CLEAN_VER}_aarch64_cortex-a53.ipk"
+    fi
+    CHEBUR_URL="https://github.com/${REPO_CHEBUR}/releases/download/v${CHEBUR_CLEAN_VER}/${CHEBUR_PKG_NAME}"
+else
+    CHEBUR_CLEAN_VER=$(echo "$PARSED_DATA" | cut -d '|' -f 1)
+    CHEBUR_URL=$(echo "$PARSED_DATA" | cut -d '|' -f 2)
+fi
 
-CHEBUR_CLEAN_VER=$(echo "$PARSED_DATA" | cut -d '|' -f 1)
-CHEBUR_URL=$(echo "$PARSED_DATA" | cut -d '|' -f 2)
 CHEBUR_LATEST_TAG="v${CHEBUR_CLEAN_VER}"
-
 printf "  Целевой релиз Chebur.NET (%s): ${Y}%s${N}\n" "$SELECTED_CHANNEL" "$CHEBUR_LATEST_TAG"
 
 NEED_UPDATE_CHEBUR="1"
@@ -576,7 +602,7 @@ fi
 
 if [ "$NEED_UPDATE_CHEBUR" = "1" ]; then
     printf "${C}[*] Скачивание %s...${N}\n" "$(basename "$CHEBUR_URL")"
-    $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET"
+    $DOWNLOAD "/tmp/cheburnet.${PKG_EXT}" "$CHEBUR_URL" || fail "Сбой при скачивании пакета Chebur.NET по ссылке $CHEBUR_URL"
 
     stop_cheburnet_service
 
