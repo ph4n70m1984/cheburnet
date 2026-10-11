@@ -74,7 +74,7 @@ if ! command -v wget >/dev/null 2>&1; then
 fi
 
 FETCH="wget -qO- --no-check-certificate --timeout=15"
-DOWNLOAD="wget -q --no-check-certificate --timeout=120 --tries=3 -O"
+DOWNLOAD="wget -q --no-check-certificate --timeout=120 -O"
 
 api_get() {
     if [ -n "$GITHUB_TOKEN" ]; then
@@ -221,10 +221,12 @@ esac
 # 5. Функция установки podkop-engine из официальных релизов (.ipk / .apk)
 install_podkop_engine() {
     printf "${C}[*] Поиск релизов podkop-engine (${REPO_PODKOP})...${N}\n"
-    PODKOP_JSON=$(api_get "https://api.github.com/repos/${REPO_PODKOP}/releases?per_page=5")
-    [ -z "$PODKOP_JSON" ] && fail "Не удалось получить метаданные релизов ${REPO_PODKOP}."
-
     TARGET_ARCH="${TARGET_PACKAGE_ARCH:-$CHEBUR_ARCH}"
+
+    PODKOP_JSON=$(api_get "https://api.github.com/repos/${REPO_PODKOP}/releases/latest")
+    if [ -z "$PODKOP_JSON" ] || echo "$PODKOP_JSON" | grep -q '"message":'; then
+        PODKOP_JSON=$(api_get "https://api.github.com/repos/${REPO_PODKOP}/releases?per_page=1")
+    fi
 
     PARSED_PODKOP=$(echo "$PODKOP_JSON" | awk -v arch="$TARGET_ARCH" -v h_arch="$HOST_ARCH" -v ext="$PKG_EXT" '
         /"tag_name":/ {
@@ -232,24 +234,43 @@ install_podkop_engine() {
             sub(/.*"tag_name":[[:space:]]*"/, "", t)
             sub(/".*/, "", t)
             cur_tag = t
-            is_draft = 0
         }
-        /"draft":[[:space:]]*true/ { is_draft = 1 }
         /"browser_download_url":/ {
             u = $0
             sub(/.*"browser_download_url":[[:space:]]*"/, "", u)
             sub(/".*/, "", u)
-            if (cur_tag != "" && !is_draft && u ~ "\\." ext "$") {
+            if (u ~ "\\." ext "$") {
                 if (u !~ "podkop-engine-full") next
                 u_low = tolower(u)
-                matched = 0
+                score = 0
 
-                if (arch != "" && u_low ~ ("openwrt_" tolower(arch) "\\." ext)) matched = 2
-                else if (arch != "" && u_low ~ tolower(arch)) matched = 1
-                else if (h_arch != "" && u_low ~ tolower(h_arch)) matched = 1
+                # Точное совпадение с таргетом пакетов OpenWrt
+                if (arch != "" && index(u_low, tolower(arch)) > 0) {
+                    score = 100
+                }
+                # Соответствия по семейству процессора
+                else if (h_arch == "aarch64") {
+                    if (index(u_low, "cortex-a53") > 0) score = 80
+                    else if (index(u_low, "cortex-a72") > 0) score = 70
+                    else if (index(u_low, "aarch64_generic") > 0) score = 60
+                }
+                else if (h_arch ~ "armv7" || h_arch ~ "arm") {
+                    if (index(u_low, "cortex-a7_neon") > 0) score = 80
+                    else if (index(u_low, "cortex-a9") > 0) score = 70
+                    else if (index(u_low, "arm_cortex-a7") > 0) score = 60
+                }
+                else if (h_arch ~ "mipsel" || h_arch ~ "mipsle") {
+                    if (index(u_low, "mipsel_24kc") > 0) score = 80
+                }
+                else if (h_arch ~ "mips") {
+                    if (index(u_low, "mips_24kc") > 0) score = 80
+                }
+                else if (h_arch == "x86_64") {
+                    if (index(u_low, "x86_64") > 0) score = 90
+                }
 
-                if (matched > best_match) {
-                    best_match = matched
+                if (score > best_score) {
+                    best_score = score
                     found_url = u
                     found_tag = cur_tag
                 }
@@ -258,21 +279,36 @@ install_podkop_engine() {
         END {
             if (found_url != "") {
                 print found_tag "|" found_url
-            } else {
-                exit 1
             }
         }
     ')
 
-    [ -z "$PARSED_PODKOP" ] && fail "Не найден подходящий пакет podkop-engine-full (.${PKG_EXT}) под архитектуру ${TARGET_ARCH}."
+    # Fallback, если GitHub API заблокирован rate limit
+    if [ -z "$PARSED_PODKOP" ]; then
+        FALLBACK_TAG="v1.14.2-r14"
+        FALLBACK_VER="1.14.2-r14"
+        FALLBACK_NAME=""
 
-    TAG_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 1)
-    URL_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 2)
+        case "$TARGET_ARCH" in
+            *a53*|aarch64*) FALLBACK_NAME="podkop-engine-full_${FALLBACK_VER}_openwrt_aarch64_cortex-a53.${PKG_EXT}" ;;
+            *a72*)          FALLBACK_NAME="podkop-engine-full_${FALLBACK_VER}_openwrt_aarch64_cortex-a72.${PKG_EXT}" ;;
+            *24kc*)         FALLBACK_NAME="podkop-engine-full_${FALLBACK_VER}_openwrt_mipsel_24kc.${PKG_EXT}" ;;
+            *x86_64*)       FALLBACK_NAME="podkop-engine-full_${FALLBACK_VER}_openwrt_x86_64.${PKG_EXT}" ;;
+            *)              FALLBACK_NAME="podkop-engine-full_${FALLBACK_VER}_openwrt_aarch64_generic.${PKG_EXT}" ;;
+        esac
+
+        URL_VAL="https://github.com/${REPO_PODKOP}/releases/download/${FALLBACK_TAG}/${FALLBACK_NAME}"
+        TAG_VAL="$FALLBACK_TAG"
+    else
+        TAG_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 1)
+        URL_VAL=$(echo "$PARSED_PODKOP" | cut -d '|' -f 2)
+    fi
+
     PKG_FILE="$WORK_DIR/$(basename "$URL_VAL")"
 
-    printf "  Целевой пакет: ${Y}%s${N} (%s)\n" "$TAG_VAL" "$(basename "$URL_VAL")"
+    printf "  Целевой пакет: ${Y}%s${N} (%s)\n" "${TAG_VAL:-v1.14.2-r14}" "$(basename "$URL_VAL")"
     printf "${C}[*] Скачивание podkop-engine...${N}\n"
-    $DOWNLOAD "$PKG_FILE" "$URL_VAL" || fail "Не удалось скачать пакет podkop-engine"
+    $DOWNLOAD "$PKG_FILE" "$URL_VAL" || fail "Не удалось скачать пакет podkop-engine по ссылке $URL_VAL"
     [ -s "$PKG_FILE" ] || fail "Скачанный пакет пуст."
 
     stop_cheburnet_service
