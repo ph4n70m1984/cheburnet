@@ -180,9 +180,42 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	dnsRules = append(dnsRules, map[string]interface{}{
-		"server": "fakeip-dns",
-	})
+	// Маршрутизация DNS-запросов:
+	// В глобальном режиме всё перенаправляется в Fake-IP.
+	// В выборочном режиме Fake-IP выдается ТОЛЬКО проксируемым ресурсам.
+	if isGlobal {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"action": "route",
+			"server": "fakeip-dns",
+		})
+	} else {
+		if len(cleanCustomDomains) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":        "route",
+				"domain_suffix": cleanCustomDomains,
+				"server":        "fakeip-dns",
+			})
+		}
+		if len(allRuleSets) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":   "route",
+				"rule_set": allRuleSets,
+				"server":   "fakeip-dns",
+			})
+		}
+		if len(customSRSTags) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":   "route",
+				"rule_set": customSRSTags,
+				"server":   "fakeip-dns",
+			})
+		}
+		// Все остальные домены получают реальный публичный IP через remote-dns
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"action": "route",
+			"server": "remote-dns",
+		})
+	}
 
 	remoteServerEntry := map[string]interface{}{
 		"tag":         "remote-dns",
@@ -214,10 +247,9 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			},
 			remoteServerEntry,
 		},
-		"rules":             dnsRules,
-		"final":             "remote-dns",
-		"strategy":          "ipv4_only",
-		"independent_cache": true,
+		"rules":    dnsRules,
+		"final":    "remote-dns",
+		"strategy": "ipv4_only",
 	}
 
 	clashAPIMap := map[string]interface{}{
@@ -728,21 +760,14 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		if !isGlobal {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  []string{"198.18.0.0/15"},
-				"outbound": "direct-out",
-			})
-		} else if activeOutboundTag != "direct-out" {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  []string{"198.18.0.0/15"},
-				"outbound": activeOutboundTag,
-			})
-		}
+		// Все перехваченные Fake-IP гарантированно направляются в прокси,
+		// так как Fake-IP выделяется исключительно заблокированным ресурсам.
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":   "route",
+			"inbound":  []string{"tproxy-in"},
+			"ip_cidr":  []string{"198.18.0.0/15"},
+			"outbound": activeOutboundTag,
+		})
 	}
 
 	routeRules = append(routeRules, map[string]interface{}{

@@ -220,17 +220,6 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 		}
 	}
 
-	dnsRules := []map[string]interface{}{
-		{
-			"action":     "reject",
-			"query_type": []string{"HTTPS"},
-		},
-		{
-			"action":        "reject",
-			"domain_suffix": []string{"use-application-dns.net"},
-		},
-	}
-
 	isGlobal := cfg.RoutingMode == "global"
 
 	activeRuleSetsMap := make(map[string]bool)
@@ -258,10 +247,51 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
-	dnsRules = append(dnsRules, map[string]interface{}{
-		"action": "route",
-		"server": "fakeip-dns",
-	})
+	dnsRules := []map[string]interface{}{
+		{
+			"action":     "reject",
+			"query_type": []string{"HTTPS"},
+		},
+		{
+			"action":        "reject",
+			"domain_suffix": []string{"use-application-dns.net"},
+		},
+	}
+
+	// Селективное назначение Fake-IP
+	if isGlobal {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"action": "route",
+			"server": "fakeip-dns",
+		})
+	} else {
+		if len(cleanCustomDomains) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":        "route",
+				"domain_suffix": cleanCustomDomains,
+				"server":        "fakeip-dns",
+			})
+		}
+		if len(allRuleSets) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":   "route",
+				"rule_set": allRuleSets,
+				"server":   "fakeip-dns",
+			})
+		}
+		if len(customSRSTags) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":   "route",
+				"rule_set": customSRSTags,
+				"server":   "fakeip-dns",
+			})
+		}
+		// Все остальные домены получают обычные реальные IP
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"action": "route",
+			"server": "remote-dns",
+		})
+	}
 
 	dnsConfig := map[string]interface{}{
 		"servers": []map[string]interface{}{
@@ -283,10 +313,9 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 				"server_port": remoteDNSPort,
 			},
 		},
-		"rules":             dnsRules,
-		"final":             "remote-dns",
-		"strategy":          "ipv4_only",
-		"independent_cache": true,
+		"rules":    dnsRules,
+		"final":    "remote-dns",
+		"strategy": "ipv4_only",
 	}
 
 	clashAPIMap := map[string]interface{}{
@@ -778,21 +807,13 @@ func (b *Builder) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		if !isGlobal {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  []string{"198.18.0.0/15"},
-				"outbound": "direct-out",
-			})
-		} else if activeOutboundTag != "direct-out" {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"ip_cidr":  []string{"198.18.0.0/15"},
-				"outbound": activeOutboundTag,
-			})
-		}
+		// Fake-IP выдается исключительно целевым доменам, поэтому все они направляются в прокси
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":   "route",
+			"inbound":  []string{"tproxy-in"},
+			"ip_cidr":  []string{"198.18.0.0/15"},
+			"outbound": activeOutboundTag,
+		})
 	}
 
 	routeRules = append(routeRules, map[string]interface{}{
