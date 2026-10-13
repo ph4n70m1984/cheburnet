@@ -265,7 +265,6 @@ return view.extend({
                 opt.placeholder = placeholder;
             }
 
-            // Разбиваем любые разделители (запятые, пробелы, переводы строк) и выводим строго в столбик
             opt.cfgvalue = function(section_id) {
                 var val = uci.get('cheburnet', section_id, this.option);
                 var items = [];
@@ -292,7 +291,6 @@ return view.extend({
                 return items.join('\n');
             };
 
-            // Сохраняем каждую непустую строчку отдельным элементом списка UCI
             opt.write = function(section_id, formvalue) {
                 var raw = formvalue || '';
                 var tokens = raw.split(/[\r\n,\s]+/);
@@ -1003,6 +1001,15 @@ return view.extend({
         o = routeSec.option(form.ListValue, 'outbound', _('Сервер выхода'));
         o.value('PROXY', _('PROXY / AUTO'));
         o.value('direct-out', _('Direct'));
+
+        // ДИНАМИЧЕСКИ ДОБАВЛЯЕМ ВСЕ СОЗДАННЫЕ NODE_GROUP ИЗ UCI
+        if (Array.isArray(uciGroups)) {
+            uciGroups.forEach(function(g) {
+                if (g.name) {
+                    o.value(g.name, _('Группа: ') + g.name);
+                }
+            });
+        }
         o.editable = true;
 
         var outboundSelect = o;
