@@ -84,7 +84,7 @@ func setSysctl(param, val string) error {
 	return nil
 }
 
-// ApplyNFTRules выполняет атомарное применение правил nftables для перехвата сетевого трафика через TProxy
+// ApplyNFTRules выполняет атомарное применение правил nftables для перехвата сетевого трафика через TProxy и Kill Switch
 func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tproxyPort int, isGlobalMode bool) error {
 	// Валидация TProxy порта
 	if tproxyPort <= 0 || tproxyPort > 65535 {
@@ -118,10 +118,12 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 	subnetElements := ""
 	bypassMangleRule := ""
 	bypassOutputRule := ""
+	killswitchSubnetRule := ""
 
 	if isGlobalMode {
 		bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr != @localv4 meta mark set %s counter", TableMark)
 		bypassOutputRule = fmt.Sprintf("ip daddr != @localv4 meta mark set %s counter", TableMark)
+		killswitchSubnetRule = "ip daddr != @localv4 counter drop"
 	} else if len(subnets) > 0 {
 		var validSubnets []string
 		for _, s := range subnets {
@@ -155,12 +157,15 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 
 			bypassMangleRule = fmt.Sprintf("iifname @interfaces ip daddr @bypass_subnets meta mark set %s counter", TableMark)
 			bypassOutputRule = fmt.Sprintf("ip daddr @bypass_subnets meta mark set %s counter", TableMark)
+			killswitchSubnetRule = "ip daddr @bypass_subnets counter drop"
 		}
 	}
 
 	// 3. Валидация IP-адресов клиентов Full-Proxy через строгий net.ParseIP (только IPv4)
 	clientSetElements := ""
 	clientMangleRule := ""
+	killswitchClientRule := ""
+
 	if len(fullProxyIPs) > 0 {
 		var validClients []string
 		for _, rawIP := range fullProxyIPs {
@@ -184,10 +189,11 @@ func ApplyNFTRules(ifaces []string, subnets []string, fullProxyIPs []string, tpr
 	}`, strings.Join(validClients, ", "))
 
 			clientMangleRule = fmt.Sprintf("iifname @interfaces ip saddr @full_proxy_clients ip daddr != @localv4 meta mark set %s counter", TableMark)
+			killswitchClientRule = "ip saddr @full_proxy_clients ip daddr != @localv4 counter drop"
 		}
 	}
 
-	// Атомарный Netlink batch[cite: 5]
+	// Атомарный Netlink batch c цепочкой Kill Switch[cite: 12]
 	tpl := `table inet %s
 delete table inet %s
 table inet %s {
@@ -222,6 +228,16 @@ table inet %s {
 		meta mark & %s == %s meta l4proto udp tproxy ip to 127.0.0.1:%d counter
 	}
 
+	chain killswitch {
+		type filter hook forward priority -5; policy accept;
+		# Блокировка утечки синтетических адресов Fake-IP в сторону провайдера
+		ip daddr 198.18.0.0/15 counter drop
+		# Блокировка целевого трафика обхода при падении прокси
+		%s
+		# Строгий Kill Switch для клиентов в режиме full_proxy
+		%s
+	}
+
 	chain mangle_output {
 		type route hook output priority -150; policy accept;
 		ip daddr @localv4 return
@@ -246,6 +262,8 @@ table inet %s {
 		TableMark,
 		TableMark, TableMark, tproxyPort,
 		TableMark, TableMark, tproxyPort,
+		killswitchSubnetRule,
+		killswitchClientRule,
 		SelfMark,
 		EmergencyDirectMark,
 		bypassOutputRule,

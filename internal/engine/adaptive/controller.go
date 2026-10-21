@@ -116,6 +116,90 @@ func (c *StateController) GetActiveGroupNodes() (string, []*config.GenericNode) 
 	return grp, out
 }
 
+func (c *StateController) GetLastActiveNode() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastActiveNode
+}
+
+func (c *StateController) SetLastActiveNode(tag string) {
+	c.mu.Lock()
+	c.lastActiveNode = tag
+	c.mu.Unlock()
+}
+
+// FindNodeByTag выполняет быстрый поиск ноды в пуле по тегу
+func (c *StateController) FindNodeByTag(tag string) *config.GenericNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, list := range c.classifiedPool {
+		for _, n := range list {
+			if n.Tag == tag {
+				return n
+			}
+		}
+	}
+	return nil
+}
+
+// CheckActiveNodeHealth проверяет жива ли конкретная нода через Prober
+func (c *StateController) CheckActiveNodeHealth(ctx context.Context, nodeTag string) bool {
+	if c.prober == nil || nodeTag == "" || nodeTag == "auto" || strings.HasSuffix(nodeTag, "-auto") {
+		return true
+	}
+
+	node := c.FindNodeByTag(nodeTag)
+	if node == nil {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 2200*time.Millisecond)
+	defer cancel()
+
+	best := c.prober.SelectBestNode(probeCtx, []*config.GenericNode{node})
+	return best != nil && best.HTTPRTT > 0
+}
+
+// ResetToAuto переключает селектор sing-box обратно в режим автовыбора urltest
+func (c *StateController) ResetToAuto(ctx context.Context) error {
+	c.groupSwitchMu.Lock()
+	defer c.groupSwitchMu.Unlock()
+
+	if c.prober == nil {
+		return ErrClashAPINotConfigured
+	}
+
+	switchCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	// 1. Пробуем переключить на общий "auto"
+	err := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, "auto")
+	if err == nil {
+		c.mu.Lock()
+		c.lastActiveNode = "auto"
+		c.mu.Unlock()
+		log.Printf("[controller] Selector '%s' reset to 'auto' (urltest)", config.MainSelectorTag)
+		return nil
+	}
+
+	// 2. Фолбэк на автовыбор активной группы (например, "general-auto")
+	c.mu.RLock()
+	grp := c.activeGroup
+	c.mu.RUnlock()
+
+	groupAutoTag := fmt.Sprintf("%s-auto", grp)
+	if fbErr := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, groupAutoTag); fbErr == nil {
+		c.mu.Lock()
+		c.lastActiveNode = groupAutoTag
+		c.mu.Unlock()
+		log.Printf("[controller] Selector '%s' reset to group auto '%s'", config.MainSelectorTag, groupAutoTag)
+		return nil
+	}
+
+	return err
+}
+
 func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason string, preferredNode ...string) error {
 	c.groupSwitchMu.Lock()
 	defer c.groupSwitchMu.Unlock()
@@ -178,6 +262,16 @@ func (c *StateController) SwitchGroup(ctx context.Context, targetGroup, reason s
 			}
 			lastErr = err
 		}
+	}
+
+	// 4. Если одиночные ноды не подошли, переключаем на автовыбор группы
+	if switchedNode == "" {
+		groupAutoTag := fmt.Sprintf("%s-auto", targetGroup)
+		switchCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+		if err := c.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, groupAutoTag); err == nil {
+			switchedNode = groupAutoTag
+		}
+		cancel()
 	}
 
 	if switchedNode != "" {
@@ -247,7 +341,7 @@ func (c *StateController) Reassert(ctx context.Context) {
 	c.mu.RUnlock()
 
 	if nodeTag == "" && len(nodes) > 0 {
-		nodeTag = nodes[0].Tag
+		nodeTag = "auto"
 	}
 	if nodeTag == "" {
 		return
@@ -259,7 +353,7 @@ func (c *StateController) Reassert(ctx context.Context) {
 	if err := c.prober.SwitchOutbound(reCtx, config.MainSelectorTag, nodeTag); err != nil {
 		log.Printf("[controller] WARN: Reassert selector '%s' to '%s' failed: %v, trying fallbacks...",
 			config.MainSelectorTag, nodeTag, err)
-		for _, fallbackTag := range []string{"proxy", "main-out", "auto"} {
+		for _, fallbackTag := range []string{"auto", fmt.Sprintf("%s-auto", grp), "proxy"} {
 			if fErr := c.prober.SwitchOutbound(reCtx, fallbackTag, nodeTag); fErr == nil {
 				log.Printf("[controller] Reassert fallback to selector '%s' succeeded", fallbackTag)
 				return

@@ -151,6 +151,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			activeRuleSetsMap[norm] = true
 		}
 	}
+
+	var allPolicyDomains []string
 	for _, rp := range cfg.RoutePolicies {
 		if rp.Enabled {
 			for _, rs := range rp.RuleSets {
@@ -159,6 +161,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 					activeRuleSetsMap[norm] = true
 				}
 			}
+			allPolicyDomains = append(allPolicyDomains, cleanTokens(rp.Domains)...)
 		}
 	}
 
@@ -181,8 +184,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	cleanCustomDomains := cleanTokens(cfg.CustomDomains)
 
 	// Маршрутизация DNS-запросов:
-	// В глобальном режиме всё перенаправляется в Fake-IP.
-	// В выборочном режиме Fake-IP выдается ТОЛЬКО проксируемым ресурсам.
+	// В глобальном режиме всё направляется в Fake-IP.
+	// В выборочном режиме Fake-IP выделяется для глобальных доменов, доменов из политик и всех списков.
 	if isGlobal {
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
@@ -193,6 +196,13 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			dnsRules = append(dnsRules, map[string]interface{}{
 				"action":        "route",
 				"domain_suffix": cleanCustomDomains,
+				"server":        "fakeip-dns",
+			})
+		}
+		if len(allPolicyDomains) > 0 {
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"action":        "route",
+				"domain_suffix": allPolicyDomains,
 				"server":        "fakeip-dns",
 			})
 		}
@@ -210,7 +220,8 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"server":   "fakeip-dns",
 			})
 		}
-		// Все остальные домены получают реальный публичный IP через remote-dns
+
+		// Все остальные открытые домены резолвятся напрямую через remote-dns
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"action": "route",
 			"server": "remote-dns",
@@ -311,6 +322,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		"experimental": experimentalConfig,
 	}
 
+	// Только гарантированно поддерживаемый outbound direct-out
 	outbounds := []map[string]interface{}{
 		{
 			"type": "direct",
@@ -401,7 +413,6 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 		globalURLTestURL = "http://cp.cloudflare.com/generate_204"
 	}
 
-	hasFallbacks := b.supportsFallbacks()
 	createdGroups := make(map[string]bool)
 
 	if len(cfg.Groups) > 0 {
@@ -442,9 +453,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tolerance":                   tolerance,
 				"interrupt_exist_connections": false,
 			}
-			if hasFallbacks {
-				urltestObj["fallbacks"] = []string{"direct-out"}
-			}
+			// Важно: fallbacks намеренно не задается, чтобы избежать утечки в прямой канал при падении прокси
 			outbounds = append(outbounds, urltestObj)
 
 			selectorList := append([]string{urltestTag}, validGrpNodes...)
@@ -490,9 +499,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tolerance":                   globalURLTestTolerance,
 				"interrupt_exist_connections": false,
 			}
-			if hasFallbacks {
-				urltestObj["fallbacks"] = []string{"direct-out"}
-			}
+			// Важно: fallbacks намеренно не задается, чтобы исключить падение в direct-out
 			outbounds = append(outbounds, urltestObj)
 
 			selectorList := append([]string{urltestTag}, matchedNodes...)
@@ -520,19 +527,17 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			"tolerance":                   globalURLTestTolerance,
 			"interrupt_exist_connections": false,
 		}
-		if hasFallbacks {
-			urltestObj["fallbacks"] = []string{"direct-out"}
-		}
+		// Убран fallbacks: ["direct-out"] для предотвращения утечки при отказе всех серверов
 		outbounds = append(outbounds, urltestObj)
 
-		if configType == "urltest" {
+		if configType == "urltest" || configType == "adaptive" {
 			selectorList := append([]string{urltestTag}, allNodeTags...)
 			outbounds = append(outbounds, map[string]interface{}{
 				"type":                        "selector",
 				"tag":                         selectorTag,
 				"outbounds":                   selectorList,
 				"default":                     urltestTag,
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true, // Сбрасывать зависшие сессии при переключении
 			})
 		} else {
 			outbounds = append(outbounds, map[string]interface{}{
@@ -540,7 +545,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 				"tag":                         selectorTag,
 				"outbounds":                   allNodeTags,
 				"default":                     allNodeTags[0],
-				"interrupt_exist_connections": false,
+				"interrupt_exist_connections": true,
 			})
 		}
 
@@ -660,13 +665,11 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	if isGlobal {
-		if activeOutboundTag != "direct-out" {
-			routeRules = append(routeRules, map[string]interface{}{
-				"action":   "route",
-				"inbound":  []string{"tproxy-in"},
-				"outbound": activeOutboundTag,
-			})
-		}
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":   "route",
+			"inbound":  []string{"tproxy-in"},
+			"outbound": activeOutboundTag,
+		})
 	} else {
 		if len(cleanCustomDomains) > 0 {
 			routeRules = append(routeRules, map[string]interface{}{
@@ -760,13 +763,20 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 			})
 		}
 
-		// Все перехваченные Fake-IP гарантированно направляются в прокси,
-		// так как Fake-IP выделяется исключительно заблокированным ресурсам.
+		// Все перехваченные Fake-IP направляются в активный селектор прокси
 		routeRules = append(routeRules, map[string]interface{}{
 			"action":   "route",
 			"inbound":  []string{"tproxy-in"},
 			"ip_cidr":  []string{"198.18.0.0/15"},
 			"outbound": activeOutboundTag,
+		})
+
+		// Защита от утечки: если Fake-IP не смог отправиться в прокси, сбрасываем пакет действием reject,
+		// полностью исключая его попадание в final: "direct-out"
+		routeRules = append(routeRules, map[string]interface{}{
+			"action":  "reject",
+			"inbound": []string{"tproxy-in"},
+			"ip_cidr": []string{"198.18.0.0/15"},
 		})
 	}
 
@@ -811,7 +821,7 @@ func (b *BuilderV14) Build(cfg *config.CheburConfig, outputPath string) error {
 	}
 
 	finalOutbound := "direct-out"
-	if isGlobal && activeOutboundTag != "direct-out" {
+	if isGlobal {
 		finalOutbound = activeOutboundTag
 	}
 

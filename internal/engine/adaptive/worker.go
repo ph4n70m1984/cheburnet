@@ -52,6 +52,10 @@ func (w *Worker) Start(ctx context.Context) {
 	case <-time.After(5 * time.Second):
 	}
 
+	// Запускаем фоновый легковесный сторожевой таймер (Watchdog) для активной ноды
+	go w.startActiveNodeWatchdog(ctx)
+
+	// Первичный подбор ноды при старте
 	w.checkAndSwitch(ctx)
 
 	for {
@@ -68,6 +72,54 @@ func (w *Worker) Start(ctx context.Context) {
 		case <-w.triggerChan:
 			timer.Stop()
 			w.checkAndSwitch(ctx)
+		}
+	}
+}
+
+// startActiveNodeWatchdog непрерывно следит за текущей выбранной нодой каждые 12 секунд.
+// Если активный сервер упал (2 сбоя подряд) — мгновенно сбрасывает селектор в 'auto'.
+func (w *Worker) startActiveNodeWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(12 * time.Second)
+	defer ticker.Stop()
+
+	failStreak := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cfg := w.state.Get()
+			if strings.ToLower(strings.TrimSpace(cfg.ConfigType)) != "adaptive" {
+				failStreak = 0
+				continue
+			}
+
+			activeNode := w.controller.GetLastActiveNode()
+			// Если мы уже в автовыборе — встроенный urltest ядра сам выбирает живой узел
+			if activeNode == "" || activeNode == "auto" || strings.HasSuffix(activeNode, "-auto") {
+				failStreak = 0
+				continue
+			}
+
+			// Быстрый замер активной ноды
+			isAlive := w.controller.CheckActiveNodeHealth(ctx, activeNode)
+			if !isAlive {
+				failStreak++
+				log.Printf("[adaptive-watchdog] Active node '%s' failed health check (%d/2)", activeNode, failStreak)
+			} else {
+				failStreak = 0
+			}
+
+			// Если активный сервер умер (2 сбоя подряд = ~24 сек) — мгновенный фолбэк на 'auto'
+			if failStreak >= 2 {
+				log.Printf("[adaptive-watchdog] Node '%s' is DEAD. Emergency fallback to 'auto' urltest!", activeNode)
+				if err := w.controller.ResetToAuto(ctx); err == nil {
+					failStreak = 0
+					// Запускаем внеочередной полный подбор новой рабочей ноды в фоне
+					w.Trigger()
+				}
+			}
 		}
 	}
 }
@@ -89,12 +141,22 @@ func (w *Worker) checkAndSwitch(ctx context.Context) {
 
 	w.prober.SetSecret(cfg.ClashAPISecret)
 
-	// Увеличиваем лимит времени на воронку замеров до 10 секунд
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 
 	best := w.prober.SelectBestNode(probeCtx, groupNodes)
-	if best == nil || best.Tag == "" {
+
+	// Аварийная защита: если ни один кандидат не признан живым — сбрасываем в auto,
+	// чтобы роутер не оставался висеть на мертвом сервере!
+	if best == nil || best.Tag == "" || best.HTTPRTT <= 0 {
+		log.Printf("[adaptive-worker] No healthy candidate found in group '%s', resetting selector to auto", groupName)
+		_ = w.controller.ResetToAuto(ctx)
+		return
+	}
+
+	// Защита от лишних переключений: если мы уже на этой ноде — ничего не делаем
+	currentActive := w.controller.GetLastActiveNode()
+	if currentActive == best.Tag {
 		return
 	}
 
@@ -111,10 +173,12 @@ func (w *Worker) checkAndSwitch(ctx context.Context) {
 	defer cancelSwitch()
 
 	if err := w.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, best.Tag); err != nil {
-		log.Printf("[adaptive-worker] Failed to switch outbound to '%s': %v", best.Tag, err)
+		log.Printf("[adaptive-worker] Failed to switch outbound to '%s': %v, falling back to auto", best.Tag, err)
+		_ = w.prober.SwitchOutbound(switchCtx, config.MainSelectorTag, "auto")
+		w.controller.SetLastActiveNode("auto")
 	} else {
-		w.controller.mu.Lock()
-		w.controller.lastActiveNode = best.Tag
-		w.controller.mu.Unlock()
+		w.controller.SetLastActiveNode(best.Tag)
+		log.Printf("[adaptive-worker] Switched best node: '%s' (RTT: %d ms, Jitter: %d ms)",
+			best.Tag, best.HTTPRTT, best.Jitter)
 	}
 }
